@@ -24,44 +24,47 @@ from utils.config import (
 
 def find_edge_profiles():
     """
-    Finds all Microsoft Edge user profiles.
+    Finds all available Microsoft Edge user profiles.
 
     Returns
     -------
     list[Path]
-        Full paths of all Edge profiles.
+        Sorted list of Edge profile directories.
     """
 
-    edge_root = EDGE_USER_DATA
+    if not EDGE_USER_DATA.exists():
+        raise FileNotFoundError(
+            "Microsoft Edge User Data folder not found."
+        )
 
     profiles = []
 
-    if not edge_root.exists():
-        raise FileNotFoundError("Microsoft Edge User Data folder not found.")
+    for folder in EDGE_USER_DATA.iterdir():
 
-    for folder in edge_root.iterdir():
-
-        if not folder.is_dir():
-            continue
-
-        if folder.name == "Default" or folder.name.startswith("Profile"):
+        if (
+            folder.is_dir()
+            and (
+                folder.name == "Default"
+                or folder.name.startswith("Profile")
+            )
+        ):
             profiles.append(folder)
 
     return sorted(profiles)
 
 async def launch_profile(profile_path):
     """
-    Launch a single Edge profile.
+    Launch a Microsoft Edge browser using the given profile.
 
     Parameters
     ----------
     profile_path : Path
+        Path to the Edge user profile.
 
     Returns
     -------
-    playwright
-    context
-    page
+    tuple
+        (playwright, context, page)
     """
 
     playwright = await async_playwright().start()
@@ -69,19 +72,19 @@ async def launch_profile(profile_path):
     context = await playwright.chromium.launch_persistent_context(
         user_data_dir=profile_path,
         channel=BROWSER_CHANNEL,
-        # headless=HEADLESS,
         headless=HEADLESS,
         slow_mo=300,
         no_viewport=True,
         args=[
-            "--start-maximized"
+            "--start-maximized",
         ],
     )
 
-    if context.pages:
-        page = context.pages[0]
-    else:
-        page = await context.new_page()
+    page = (
+        context.pages[0]
+        if context.pages
+        else await context.new_page()
+    )
 
     return playwright, context, page
 
@@ -114,30 +117,37 @@ async def launch_profile(profile_path):
 
 #     return email.strip()
 async def wait_for_dashboard(page):
-    """Wait until the Power BI report is rendered."""
+    """
+    Wait until the Power BI dashboard is fully rendered.
+
+    Parameters
+    ----------
+    page : Page
+        Playwright page instance.
+    """
 
     await page.wait_for_selector(
         ".visualContainer",
         timeout=PAGE_TIMEOUT,
     )
 
-    # Small buffer for any remaining animations
-    await page.wait_for_timeout(page)
+    # Allow any remaining animations or visual rendering to complete.
+    await page.wait_for_timeout(RENDER_WAIT)
 
 async def launch_browser(dashboard_url):
     """
-    Launch the configured Edge profile
-    and open the Power BI dashboard.
+    Launch the configured Microsoft Edge profile and open
+    the Power BI dashboard.
 
     Parameters
     ----------
     dashboard_url : str
+        URL of the Power BI dashboard.
 
     Returns
     -------
-    playwright
-    context
-    page
+    tuple
+        (playwright, context, page)
     """
 
     profiles = find_edge_profiles()
@@ -147,14 +157,15 @@ async def launch_browser(dashboard_url):
 
     print(f"\nFound {len(profiles)} Edge profile(s).\n")
 
-    # Use the first detected profile.
-    # Later you can change this to Profile 7 or a configurable profile.
+    # Currently using Profile 7.
+    # Later this can be moved to config.py.
     profile = next(
         (p for p in profiles if p.name == "Profile 7"),
-        None
+        None,
     )
+
     if profile is None:
-        raise RuntimeError("Profile 7 not found")
+        raise RuntimeError("Profile 7 not found.")
 
     print(f"Using profile: {profile.name}")
 
@@ -166,7 +177,7 @@ async def launch_browser(dashboard_url):
         timeout=PAGE_TIMEOUT,
     )
 
-    await page.wait_for_timeout(RENDER_WAIT)
+    await wait_for_dashboard(page)
 
     return playwright, context, page
 
