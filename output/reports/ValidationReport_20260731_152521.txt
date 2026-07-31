@@ -1,0 +1,31 @@
+======================================================================
+BROWSER METRICS VALIDATION REPORT
+======================================================================
+
+Dashboard Information
+----------------------------------------------------------------------
+Dashboard Name : HR Analytics Data Model
+Environment    : None
+URL            : https://app.powerbi.com/groups/c1bacf56-2795-4173-8cee-dd7dba5c7e06/reports/8bebcbe8-744a-42af-93f2-8ceec34939d5?ctid=e7c6f609-f63a-4ec7-b71e-6734c4c9d231&pbi_source=linkShare
+Timestamp      : 2026-07-31 15:25:21
+
+Performance Metrics
+----------------------------------------------------------------------
+Browser Launch Time : 11.664 sec
+Page Load Time      : 0.629 sec
+Dashboard Render    : 10.022 sec
+Screenshot Time     : 0.272 sec
+Total Execution     : 22.586999999999996 sec
+
+Network Metrics
+----------------------------------------------------------------------
+HTTP Status      : 200
+Requests         : 21
+Responses        : 19
+Failed Requests  : 0
+Console Messages : 0
+Page Errors      : 0
+
+
+======================================================================
+End of Report

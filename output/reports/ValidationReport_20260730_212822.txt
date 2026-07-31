@@ -1,0 +1,31 @@
+======================================================================
+BROWSER METRICS VALIDATION REPORT
+======================================================================
+
+Dashboard Information
+----------------------------------------------------------------------
+Dashboard Name : Item Movement Report
+Environment    : None
+URL            : https://app.powerbi.com/groups/fc07298b-68d9-4b15-8dbd-92e6fbc11c3a/reports/905cf596-95f2-4457-becc-86db5e117347?ctid=e7c6f609-f63a-4ec7-b71e-6734c4c9d231&pbi_source=linkShare
+Timestamp      : 2026-07-30 21:28:22
+
+Performance Metrics
+----------------------------------------------------------------------
+Browser Launch Time : 1.31 sec
+Page Load Time      : 2.656 sec
+Dashboard Render    : 10.007 sec
+Screenshot Time     : 1.416 sec
+Total Execution     : 15.389 sec
+
+Network Metrics
+----------------------------------------------------------------------
+HTTP Status      : 200
+Requests         : 70
+Responses        : 66
+Failed Requests  : 0
+Console Messages : 0
+Page Errors      : 0
+
+
+======================================================================
+End of Report

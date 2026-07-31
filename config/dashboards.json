@@ -1,0 +1,14 @@
+{
+    "dashboards": [
+        {
+            "name": "HR Analytics Data Model",
+            "environment": "QA",
+            "url": "https://app.powerbi.com/groups/c1bacf56-2795-4173-8cee-dd7dba5c7e06/reports/8bebcbe8-744a-42af-93f2-8ceec34939d5?ctid=e7c6f609-f63a-4ec7-b71e-6734c4c9d231&pbi_source=linkShare"
+        },
+        {
+            "name": "Sheet Cake Retail sales",
+            "environment": "QA",
+            "url": "https://app.powerbi.com/groups/fc07298b-68d9-4b15-8dbd-92e6fbc11c3a/reports/18a733b5-a984-4763-b581-fe8a52ccb25a?ctid=e7c6f609-f63a-4ec7-b71e-6734c4c9d231&pbi_source=linkShare"
+        }
+    ]
+}
