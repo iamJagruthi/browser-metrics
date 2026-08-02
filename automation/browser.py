@@ -14,7 +14,8 @@ from utils.config import (
     HEADLESS,
     PAGE_TIMEOUT,
     EDGE_USER_DATA,
-    RENDER_WAIT
+    RENDER_WAIT,
+    PROFILE_DIR,
 )
 
 # EXPECTED_DOMAIN = "@cswg.com"
@@ -136,8 +137,7 @@ async def wait_for_dashboard(page):
 
 async def launch_browser(dashboard_url):
     """
-    Launch the configured Microsoft Edge profile and open
-    the Power BI dashboard.
+    Automatically find a working Microsoft Edge Profile and open the powerbi dashbord
 
     Parameters
     ----------
@@ -151,35 +151,54 @@ async def launch_browser(dashboard_url):
     """
 
     profiles = find_edge_profiles()
-
     if not profiles:
         raise RuntimeError("No Edge profiles found.")
+    
+    print("\nDetected Edge profiles:")
 
+    for p in profiles:
+        print(f"  - '{p.name}'")
     print(f"\nFound {len(profiles)} Edge profile(s).\n")
 
-    # Currently using Profile 7.
-    # Later this can be moved to config.py.
-    profile = next(
-        (p for p in profiles if p.name == "Profile 7"),
-        None,
+    #tries default first then the remianing profiles
+    ordered_profiles = sorted(
+        profiles,
+        key=lambda p: p.name != "Default"
     )
 
-    if profile is None:
-        raise RuntimeError("Profile 7 not found.")
+    for profile in ordered_profiles:
 
-    print(f"Using profile: {profile.name}")
+        print(f"Trying profile: {profile.name}")
 
-    playwright, context, page = await launch_profile(profile)
+        playwright = None
+        context = None
 
-    await page.goto(
-        dashboard_url,
-        wait_until="domcontentloaded",
-        timeout=PAGE_TIMEOUT,
+        try:
+            playwright, context, page = await launch_profile(profile)
+
+            await page.goto(
+                dashboard_url,
+                wait_until="domcontentloaded",
+                timeout=PAGE_TIMEOUT,
+            )
+
+            await wait_for_dashboard(page)
+
+            print(f"Using profile: {profile.name}")
+
+            return playwright, context, page
+
+        except Exception as e:
+            print(f"✗ {profile.name} failed: {e}")
+
+            if context:
+                await context.close()
+            if playwright:
+                await playwright.stop()
+
+    raise RuntimeError(
+        "No Edge profile could open the dashboard."
     )
-
-    await wait_for_dashboard(page)
-
-    return playwright, context, page
 
 # async def validate_profile(page, dashboard_url):
 #     """

@@ -13,6 +13,9 @@ from .performance import PerformanceTimer
 from .metrics import build_metrics
 from .storage import initialize_storage, save_metrics
 from .report import generate_report
+from services.ocr_service import extract_dashboard_text
+from services.kpi_service import detect_kpis
+from services.comparison_service import compare_dashboard_kpis
 
 from utils.config import (
     DASHBOARD_CONFIG,
@@ -111,7 +114,17 @@ class DashboardValidator:
             http_status=response.status if response else None,
         )
 
-        return playwright, context, metrics
+        ocr_results = extract_dashboard_text(screenshot_path)
+
+        kpis = detect_kpis(ocr_results)
+
+        return (
+            playwright,
+            context,
+            metrics,
+            screenshot_path,
+            kpis
+        )
 
     async def run_all(self):
 
@@ -119,9 +132,18 @@ class DashboardValidator:
 
         headers_initialized = False
 
+        all_metrics = []
+        all_kpis = []
+
         for dashboard in dashboards:
 
-            playwright, context, metrics = await self.run_dashboard(dashboard)
+            (
+            playwright,
+            context,
+            metrics,
+            screenshot_path,
+            kpis
+        ) = await self.run_dashboard(dashboard)
 
             if not headers_initialized:
 
@@ -132,10 +154,32 @@ class DashboardValidator:
 
             generate_report(metrics)
 
+            all_metrics.append(metrics)
+            all_kpis.append(kpis)
+
+            print("Completed")
+
             await context.close()
             await playwright.stop()
 
-            print("Completed")
+        comparison = compare_dashboard_kpis(
+            all_kpis[0],
+            all_kpis[1]
+        )
+
+        print("\n" + "=" * 60)
+        print("KPI COMPARISON")
+        print("=" * 60)
+
+        for result in comparison["results"]:
+
+            print(f"\nKPI      : {result['kpi']}")
+            print(f"Source   : {result['source']}")
+            print(f"Target   : {result['target']}")
+            print(f"Status   : {result['status']}")
+
+        print("\n")
+        print(f"Match Percentage : {comparison['match_percentage']} %")
 
 
 async def main():

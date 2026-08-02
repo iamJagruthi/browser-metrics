@@ -37,12 +37,11 @@ DASHBOARD_CONFIG = PROJECT_ROOT / os.getenv(
 
 PAGE_TIMEOUT = int(os.getenv("PAGE_TIMEOUT", 120000))
 PAGE_TIMEOUT
-RENDER_WAIT = 5000
 # -----------------------------------
 # Browser
 # --------------------------------------------------
-PROFILE_DIR = os.getenv("PROFILE_DIR")
-
+PROFILE_DIR = os.getenv("PROFILE_DIR") or "Profile 7"
+print(f"PROFILE_DIR = '{PROFILE_DIR}'")
 EDGE_USER_DATA = (
     Path.home()
     / "AppData"

@@ -1,15 +1,23 @@
-from browser import launch_browser
-from metrics import build_metrics
-from network import capture_network
-from report import generate_report
+"""
+runner.py
 
-def main():
-    page = launch_browser()
+Application entry point.
+"""
 
-    metrics = collect_metrics(page)
-    network = capture_network(page)
+import asyncio
 
-    generate_report(metrics, network, console)
+from automation.validator import DashboardValidator
+
+
+async def main():
+    """
+    Execute complete dashboard validation.
+    """
+
+    validator = DashboardValidator()
+
+    await validator.run_all()
+
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

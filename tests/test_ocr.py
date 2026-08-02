@@ -1,7 +1,7 @@
 from pathlib import Path
 
-from .ocr import extract_text
-from .kpi_extractor import extract_kpis
+from ..extraction.ocr import extract_text
+from ..extraction.kpi_extractor import extract_kpis
 
 image_path = (
     Path(__file__).resolve().parent.parent
