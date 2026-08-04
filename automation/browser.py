@@ -15,7 +15,6 @@ from utils.config import (
     PAGE_TIMEOUT,
     EDGE_USER_DATA,
     RENDER_WAIT,
-    PROFILE_DIR,
 )
 
 
@@ -120,20 +119,25 @@ async def wait_for_dashboard(page):
         print(f"Error while waiting for dashboard to render: {e}")
         raise
 
+<<<<<<< Updated upstream
+=======
+    await page.wait_for_function("""
+    () => {
+        return document.querySelectorAll(".visualContainer").length > 0;
+    }
+    """)
+    # Allow any remaining animations or visual rendering to complete.
+    await page.wait_for_timeout(RENDER_WAIT)
+>>>>>>> Stashed changes
 
-async def launch_browser(dashboard_url):
+async def launch_browser():
     """
-    Automatically find a working Microsoft Edge Profile and open the powerbi dashbord
-
-    Parameters
-    ----------
-    dashboard_url : str
-        URL of the Power BI dashboard.
+    Launch a Microsoft Edge browser using the first available
+    working profile.
 
     Returns
     -------
-    tuple
-        (playwright, context, page)
+    (playwright, context, page)
     """
 
     profiles = find_edge_profiles()
@@ -162,13 +166,6 @@ async def launch_browser(dashboard_url):
         try:
             playwright, context, page = await launch_profile(profile)
 
-            await page.goto(
-                dashboard_url,
-                wait_until="domcontentloaded",
-                timeout=PAGE_TIMEOUT,
-            )
-
-            await wait_for_dashboard(page)
 
             print(f"Using profile: {profile.name}")
 
