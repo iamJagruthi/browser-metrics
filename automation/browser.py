@@ -119,8 +119,6 @@ async def wait_for_dashboard(page):
         print(f"Error while waiting for dashboard to render: {e}")
         raise
 
-<<<<<<< Updated upstream
-=======
     await page.wait_for_function("""
     () => {
         return document.querySelectorAll(".visualContainer").length > 0;
@@ -128,7 +126,6 @@ async def wait_for_dashboard(page):
     """)
     # Allow any remaining animations or visual rendering to complete.
     await page.wait_for_timeout(RENDER_WAIT)
->>>>>>> Stashed changes
 
 async def launch_browser():
     """
