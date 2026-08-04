@@ -106,7 +106,7 @@ def is_label(text):
         return False
 
     text = clean_value(text)
-
+    
     # Ignore values
     if is_value(text):
         return False
