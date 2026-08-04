@@ -56,56 +56,62 @@ class DashboardComparison:
         Compare two dashboard metric dictionaries.
         """
 
-        results = {}
+        try:
+            results = {}
 
-        score_a = 0
-        score_b = 0
+            score_a = 0
+            score_b = 0
 
-        for metric in self.metrics:
+            for metric in self.metrics:
 
-            value_a = dashboard_a.get(metric, 0)
-            value_b = dashboard_b.get(metric, 0)
+                value_a = dashboard_a.get(metric, 0)
+                value_b = dashboard_b.get(metric, 0)
 
-            winner = self.compare_metric(
-                metric,
-                value_a,
-                value_b
-            )
+                winner = self.compare_metric(
+                    metric,
+                    value_a,
+                    value_b
+                )
 
-            results[metric] = {
-                "dashboard_a": value_a,
-                "dashboard_b": value_b,
-                "winner": winner
+                results[metric] = {
+                    "dashboard_a": value_a,
+                    "dashboard_b": value_b,
+                    "winner": winner
+                }
+
+                if winner == "Dashboard A":
+                    score_a += 1
+
+                elif winner == "Dashboard B":
+                    score_b += 1
+
+            if score_a > score_b:
+                overall = dashboard_a["dashboard_name"]
+
+            elif score_b > score_a:
+                overall = dashboard_b["dashboard_name"]
+
+            else:
+                overall = "Tie"
+
+            return {
+
+                "dashboard_a": dashboard_a["dashboard_name"],
+                "dashboard_b": dashboard_b["dashboard_name"],
+
+                "score_a": score_a,
+                "score_b": score_b,
+
+                "overall_winner": overall,
+
+                "results": results
+
             }
 
-            if winner == "Dashboard A":
-                score_a += 1
+        except Exception as e:
+            print(f"Error comparing dashboard metrics: {e}")
+            raise
 
-            elif winner == "Dashboard B":
-                score_b += 1
-
-        if score_a > score_b:
-            overall = dashboard_a["dashboard_name"]
-
-        elif score_b > score_a:
-            overall = dashboard_b["dashboard_name"]
-
-        else:
-            overall = "Tie"
-
-        return {
-
-            "dashboard_a": dashboard_a["dashboard_name"],
-            "dashboard_b": dashboard_b["dashboard_name"],
-
-            "score_a": score_a,
-            "score_b": score_b,
-
-            "overall_winner": overall,
-
-            "results": results
-
-        }
     def compare_kpi_values(self, value_a, value_b):
         """
         Compare two KPI values.
@@ -118,31 +124,36 @@ class DashboardComparison:
             Mismatch
         """
 
-        value_a = self.normalize_value(value_a)
-        value_b = self.normalize_value(value_b)
-
-            # Exact match
-        if value_a == value_b:
-            return "Match"
-
-            # Try numeric comparison
         try:
-            num_a = float(value_a.replace("%", ""))
-            num_b = float(value_b.replace("%", ""))
+            value_a = self.normalize_value(value_a)
+            value_b = self.normalize_value(value_b)
 
-            if num_a == num_b:
+                # Exact match
+            if value_a == value_b:
                 return "Match"
 
-            difference = abs(num_a - num_b)
-            tolerance = max(abs(num_a), abs(num_b)) * 0.02
+                # Try numeric comparison
+            try:
+                num_a = float(value_a.replace("%", ""))
+                num_b = float(value_b.replace("%", ""))
 
-            if difference <= tolerance:
-                return "Near Match"
+                if num_a == num_b:
+                    return "Match"
 
-        except ValueError:
-            pass
+                difference = abs(num_a - num_b)
+                tolerance = max(abs(num_a), abs(num_b)) * 0.02
 
-        return "Mismatch"
+                if difference <= tolerance:
+                    return "Near Match"
+
+            except ValueError:
+                pass
+
+            return "Mismatch"
+
+        except Exception as e:
+            print(f"Error comparing KPI values '{value_a}' vs '{value_b}': {e}")
+            return "Mismatch"
 
     def calculate_match_percentage(
         self,
@@ -154,116 +165,131 @@ class DashboardComparison:
         Calculate the overall KPI match percentage.
         """
 
-        if total == 0:
+        try:
+            if total == 0:
+                return 0.0
+
+            score = matched + (near_matched * 0.5)
+
+            percentage = (score / total) * 100
+
+            return round(percentage, 2)
+
+        except Exception as e:
+            print(f"Error calculating match percentage: {e}")
             return 0.0
-
-        score = matched + (near_matched * 0.5)
-
-        percentage = (score / total) * 100
-
-        return round(percentage, 2)
 
     def normalize_value(self, value):
         """
         Normalize a KPI value before comparison.
         """
 
-        if value is None:
+        try:
+            if value is None:
+                return ""
+
+            value = str(value).strip().lower()
+
+            # Remove commas
+            value = value.replace(",", "")
+
+            # Remove currency symbols
+            value = re.sub(r"[$₹€£]", "", value)
+
+            # Remove extra spaces
+            value = " ".join(value.split())
+
+            # Convert "18 %" -> "18%"
+            value = value.replace(" %", "%")
+
+            return value
+
+        except Exception as e:
+            print(f"Error normalizing value '{value}': {e}")
             return ""
-
-        value = str(value).strip().lower()
-
-        # Remove commas
-        value = value.replace(",", "")
-
-        # Remove currency symbols
-        value = re.sub(r"[$₹€£]", "", value)
-
-        # Remove extra spaces
-        value = " ".join(value.split())
-
-        # Convert "18 %" -> "18%"
-        value = value.replace(" %", "%")
-
-        return value
 
     def compare_kpis(self, source_kpis, target_kpis):
         """
         Compare KPI lists from two dashboards.
         """
 
-        results = []
+        try:
+            results = []
 
-        matched = 0
-        near_matched = 0
-        mismatched = 0
+            matched = 0
+            near_matched = 0
+            mismatched = 0
 
-        source_lookup = {
-            kpi.name.lower(): kpi
-            for kpi in source_kpis
-        }
+            source_lookup = {
+                kpi.name.lower(): kpi
+                for kpi in source_kpis
+            }
 
-        target_lookup = {
-            kpi.name.lower(): kpi
-            for kpi in target_kpis
-        }
+            target_lookup = {
+                kpi.name.lower(): kpi
+                for kpi in target_kpis
+            }
 
-        all_names = sorted(
-            set(source_lookup.keys()) |
-            set(target_lookup.keys())
-        )
-
-        for name in all_names:
-
-            source = source_lookup.get(name)
-            target = target_lookup.get(name)
-
-            if source is None or target is None:
-
-                results.append({
-                    "kpi": name,
-                    "source": source.value if source else None,
-                    "target": target.value if target else None,
-                    "status": "Missing"
-                })
-
-                mismatched += 1
-                continue
-
-            status = self.compare_kpi_values(
-                source.value,
-                target.value
+            all_names = sorted(
+                set(source_lookup.keys()) |
+                set(target_lookup.keys())
             )
 
-            if status == "Match":
-                matched += 1
+            for name in all_names:
 
-            elif status == "Near Match":
-                near_matched += 1
+                source = source_lookup.get(name)
+                target = target_lookup.get(name)
 
-            else:
-                mismatched += 1
+                if source is None or target is None:
 
-            results.append({
-                "kpi": source.name,
-                "source": source.value,
-                "target": target.value,
-                "status": status
-            })
+                    results.append({
+                        "kpi": name,
+                        "source": source.value if source else None,
+                        "target": target.value if target else None,
+                        "status": "Missing"
+                    })
 
-        total = len(all_names)
+                    mismatched += 1
+                    continue
 
-        match_percentage = self.calculate_match_percentage(
-            matched,
-            near_matched,
-            total
-        )
+                status = self.compare_kpi_values(
+                    source.value,
+                    target.value
+                )
 
-        return {
-            "total_kpis": total,
-            "matched": matched,
-            "near_matched": near_matched,
-            "mismatched": mismatched,
-            "match_percentage": match_percentage,
-            "results": results
-        }
+                if status == "Match":
+                    matched += 1
+
+                elif status == "Near Match":
+                    near_matched += 1
+
+                else:
+                    mismatched += 1
+
+                results.append({
+                    "kpi": source.name,
+                    "source": source.value,
+                    "target": target.value,
+                    "status": status
+                })
+
+            total = len(all_names)
+
+            match_percentage = self.calculate_match_percentage(
+                matched,
+                near_matched,
+                total
+            )
+
+            return {
+                "total_kpis": total,
+                "matched": matched,
+                "near_matched": near_matched,
+                "mismatched": mismatched,
+                "match_percentage": match_percentage,
+                "results": results
+            }
+
+        except Exception as e:
+            print(f"Error comparing KPI lists: {e}")
+            raise

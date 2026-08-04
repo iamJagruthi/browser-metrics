@@ -12,4 +12,9 @@ def extract_dashboard_text(image_path):
     Extract OCR text from dashboard screenshot.
     """
 
-    return extract_text(image_path)
+    try:
+        return extract_text(image_path)
+
+    except Exception as e:
+        print(f"Error extracting text from '{image_path}': {e}")
+        raise

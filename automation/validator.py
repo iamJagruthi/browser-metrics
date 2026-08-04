@@ -32,99 +32,198 @@ class DashboardValidator:
 
     def load_dashboards(self):
 
-        with open(DASHBOARD_CONFIG, "r", encoding="utf-8") as file:
-            return json.load(file)["dashboards"]
+        try:
+            with open(DASHBOARD_CONFIG, "r", encoding="utf-8") as file:
+                return json.load(file)["dashboards"]
+
+        except Exception as e:
+            print(f"Error loading dashboard config: {e}")
+            raise
 
     async def run_dashboard(self, dashboard):
 
         print(f"\nRunning Dashboard: {dashboard['name']}")
 
-        clear()
+        try:
+            clear()
 
-        self.timer.reset()
+            self.timer.reset()
 
-        # ---------------- Browser ----------------
+            # ---------------- Browser ----------------
 
-        self.timer.start("browser_launch")
+            self.timer.start("browser_launch")
 
-        playwright, context, page = await launch_browser(dashboard["url"])
+            playwright, context, page = await launch_browser(dashboard["url"])
 
-        self.timer.stop("browser_launch")
+            self.timer.stop("browser_launch")
 
-        await register(page)
+            await register(page)
 
-        page.set_default_timeout(PAGE_TIMEOUT)
+            page.set_default_timeout(PAGE_TIMEOUT)
 
-        # ---------------- Page Load ----------------
+            # ---------------- Page Load ----------------
 
-        self.timer.start("page_load")
+            self.timer.start("page_load")
 
-        response = await page.goto(
-            dashboard["url"],
-            wait_until="domcontentloaded",
-        )
+            response = await page.goto(
+                dashboard["url"],
+                wait_until="domcontentloaded",
+            )
 
-        self.timer.stop("page_load")
+            self.timer.stop("page_load")
 
-        # ---------------- Render ----------------
+            # ---------------- Render ----------------
 
-        self.timer.start("dashboard_render")
+            self.timer.start("dashboard_render")
 
-        await page.wait_for_timeout(RENDER_WAIT)
+            await page.wait_for_timeout(RENDER_WAIT)
 
-        self.timer.stop("dashboard_render")
+            self.timer.stop("dashboard_render")
 
-        # ---------------- Screenshot ----------------
+            # ---------------- Screenshot ----------------
 
-        self.timer.start("screenshot")
+            self.timer.start("screenshot")
 
-        screenshot_path = (
-            SCREENSHOT_DIR /
-            f"{dashboard['name']}.png"
-        )
+            screenshot_path = (
+                SCREENSHOT_DIR /
+                f"{dashboard['name']}.png"
+            )
 
-        await page.screenshot(
-            path=str(screenshot_path),
-            full_page=True
-        )
+            await page.screenshot(
+                path=str(screenshot_path),
+                full_page=True
+            )
 
-        self.timer.stop("screenshot")
+            self.timer.stop("screenshot")
 
-        # ---------------- Total ----------------
+            # ---------------- Total ----------------
 
-        total_execution = (
-            self.timer.get("browser_launch")
-            + self.timer.get("page_load")
-            + self.timer.get("dashboard_render")
-            + self.timer.get("screenshot")
-        )
+            total_execution = (
+                self.timer.get("browser_launch")
+                + self.timer.get("page_load")
+                + self.timer.get("dashboard_render")
+                + self.timer.get("screenshot")
+            )
 
-        timers = self.timer.summary()
-        timers["total_execution"] = total_execution
+            timers = self.timer.summary()
+            timers["total_execution"] = total_execution
 
-        network_summary = summary()
+            network_summary = summary()
 
-        metrics = build_metrics(
-            dashboard_name=dashboard["name"],
-            dashboard_url=dashboard["url"],
-            timers=timers,
-            network_summary=network_summary,
-            page_title=await page.title(),
-            final_url=page.url,
-            http_status=response.status if response else None,
-        )
+            metrics = build_metrics(
+                dashboard_name=dashboard["name"],
+                dashboard_url=dashboard["url"],
+                timers=timers,
+                network_summary=network_summary,
+                page_title=await page.title(),
+                final_url=page.url,
+                http_status=response.status if response else None,
+            )
 
-        ocr_results = extract_dashboard_text(screenshot_path)
+            ocr_results = extract_dashboard_text(screenshot_path)
 
-        kpis = detect_kpis(ocr_results)
+            kpis = detect_kpis(ocr_results)
 
-        return (
-            playwright,
-            context,
-            metrics,
-            screenshot_path,
-            kpis
-        )
+            return (
+                playwright,
+                context,
+                metrics,
+                screenshot_path,
+                kpis
+            )
+
+        except Exception as e:
+            print(f"Error running dashboard '{dashboard.get('name')}': {e}")
+            raise
+
+    async def run_links(self, links):
+        """
+        Run validation for a dynamically supplied list of dashboards
+        (used by the API instead of the JSON config file).
+
+        Parameters
+        ----------
+        links : list[dict]
+            Each item must be {"name": str, "url": str}.
+
+        Returns
+        -------
+        dict
+            JSON-serializable result containing per-dashboard metrics,
+            KPIs, and the source-vs-target comparison (if both succeeded).
+        """
+
+        headers_initialized = False
+
+        all_metrics = []
+        all_kpis = []
+
+        for dashboard in links:
+
+            playwright = None
+            context = None
+
+            try:
+                (
+                    playwright,
+                    context,
+                    metrics,
+                    screenshot_path,
+                    kpis
+                ) = await self.run_dashboard(dashboard)
+
+                if not headers_initialized:
+
+                    initialize_storage(list(metrics.keys()))
+                    headers_initialized = True
+
+                save_metrics(metrics)
+
+                generate_report(metrics)
+
+                metrics_with_screenshot = dict(metrics)
+                metrics_with_screenshot["screenshot_path"] = str(screenshot_path)
+
+                all_metrics.append(metrics_with_screenshot)
+                all_kpis.append(kpis)
+
+                print("Completed")
+
+            except Exception as e:
+                print(f"Skipping dashboard '{dashboard.get('name')}' due to error: {e}")
+                all_metrics.append(None)
+                all_kpis.append([])
+
+            finally:
+                try:
+                    if context:
+                        await context.close()
+                    if playwright:
+                        await playwright.stop()
+                except Exception as cleanup_error:
+                    print(f"Error during browser cleanup: {cleanup_error}")
+
+        comparison = None
+
+        if len(all_kpis) >= 2 and all_metrics[0] and all_metrics[1]:
+
+            try:
+                comparison = compare_dashboard_kpis(
+                    all_kpis[0],
+                    all_kpis[1]
+                )
+
+            except Exception as e:
+                print(f"Error comparing dashboard KPIs: {e}")
+
+        return {
+            "metrics": all_metrics,
+            "kpis": [
+                [{"name": kpi.name, "value": kpi.value} for kpi in kpi_list]
+                for kpi_list in all_kpis
+            ],
+            "comparison": comparison,
+        }
 
     async def run_all(self):
 
@@ -137,49 +236,66 @@ class DashboardValidator:
 
         for dashboard in dashboards:
 
-            (
-            playwright,
-            context,
-            metrics,
-            screenshot_path,
-            kpis
-        ) = await self.run_dashboard(dashboard)
+            playwright = None
+            context = None
 
-            if not headers_initialized:
+            try:
+                (
+                    playwright,
+                    context,
+                    metrics,
+                    screenshot_path,
+                    kpis
+                ) = await self.run_dashboard(dashboard)
 
-                initialize_storage(list(metrics.keys()))
-                headers_initialized = True
+                if not headers_initialized:
 
-            save_metrics(metrics)
+                    initialize_storage(list(metrics.keys()))
+                    headers_initialized = True
 
-            generate_report(metrics)
+                save_metrics(metrics)
 
-            all_metrics.append(metrics)
-            all_kpis.append(kpis)
+                generate_report(metrics)
 
-            print("Completed")
+                all_metrics.append(metrics)
+                all_kpis.append(kpis)
 
-            await context.close()
-            await playwright.stop()
+                print("Completed")
 
-        comparison = compare_dashboard_kpis(
-            all_kpis[0],
-            all_kpis[1]
-        )
+            except Exception as e:
+                print(f"Skipping dashboard '{dashboard.get('name')}' due to error: {e}")
 
-        print("\n" + "=" * 60)
-        print("KPI COMPARISON")
-        print("=" * 60)
+            finally:
+                try:
+                    if context:
+                        await context.close()
+                    if playwright:
+                        await playwright.stop()
+                except Exception as cleanup_error:
+                    print(f"Error during browser cleanup: {cleanup_error}")
 
-        for result in comparison["results"]:
+        try:
+            comparison = compare_dashboard_kpis(
+                all_kpis[0],
+                all_kpis[1]
+            )
 
-            print(f"\nKPI      : {result['kpi']}")
-            print(f"Source   : {result['source']}")
-            print(f"Target   : {result['target']}")
-            print(f"Status   : {result['status']}")
+            print("\n" + "=" * 60)
+            print("KPI COMPARISON")
+            print("=" * 60)
 
-        print("\n")
-        print(f"Match Percentage : {comparison['match_percentage']} %")
+            for result in comparison["results"]:
+
+                print(f"\nKPI      : {result['kpi']}")
+                print(f"Source   : {result['source']}")
+                print(f"Target   : {result['target']}")
+                print(f"Status   : {result['status']}")
+
+            print("\n")
+            print(f"Match Percentage : {comparison['match_percentage']} %")
+
+        except Exception as e:
+            print(f"Error comparing dashboard KPIs: {e}")
 
 
 async def main():

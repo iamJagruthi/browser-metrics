@@ -12,12 +12,17 @@ async def capture_dashboard(dashboard_url):
     Launch browser and capture dashboard.
     """
 
-    playwright, context, page = await launch_browser(
-        dashboard_url
-    )
+    try:
+        playwright, context, page = await launch_browser(
+            dashboard_url
+        )
 
-    return {
-        "playwright": playwright,
-        "context": context,
-        "page": page
-    }
+        return {
+            "playwright": playwright,
+            "context": context,
+            "page": page
+        }
+
+    except Exception as e:
+        print(f"Error capturing dashboard '{dashboard_url}': {e}")
+        raise
