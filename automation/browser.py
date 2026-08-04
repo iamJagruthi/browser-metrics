@@ -16,7 +16,14 @@ from utils.config import (
     EDGE_USER_DATA,
     RENDER_WAIT,
 )
+import logging
 
+logger = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
 
 def find_edge_profiles():
     """
@@ -50,7 +57,7 @@ def find_edge_profiles():
         return sorted(profiles)
 
     except Exception as e:
-        print(f"Error while finding Edge profiles: {e}")
+        logger.exception(f"Error while finding Edge profiles: {e}")
         raise
 
 
@@ -92,7 +99,7 @@ async def launch_profile(profile_path):
         return playwright, context, page
 
     except Exception as e:
-        print(f"Error launching profile '{profile_path}': {e}")
+        logger.exception(f"Error launching profile '{profile_path}': {e}")
         raise
 
 
@@ -116,19 +123,16 @@ async def wait_for_dashboard(page):
         await page.wait_for_timeout(RENDER_WAIT)
 
     except Exception as e:
-        print(f"Error while waiting for dashboard to render: {e}")
+        logger.exception(f"Error while waiting for dashboard to render: {e}")
         raise
 
-<<<<<<< Updated upstream
-=======
-    await page.wait_for_function("""
-    () => {
-        return document.querySelectorAll(".visualContainer").length > 0;
-    }
-    """)
-    # Allow any remaining animations or visual rendering to complete.
-    await page.wait_for_timeout(RENDER_WAIT)
->>>>>>> Stashed changes
+    # await page.wait_for_function("""
+    # () => {
+    #     return document.querySelectorAll(".visualContainer").length > 0;
+    # }
+    # """)
+    # # Allow any remaining animations or visual rendering to complete.
+    # await page.wait_for_timeout(RENDER_WAIT)
 
 async def launch_browser():
     """
@@ -144,11 +148,11 @@ async def launch_browser():
     if not profiles:
         raise RuntimeError("No Edge profiles found.")
 
-    print("\nDetected Edge profiles:")
+    logger.info("\nDetected Edge profiles:")
 
     for p in profiles:
-        print(f"  - '{p.name}'")
-    print(f"\nFound {len(profiles)} Edge profile(s).\n")
+        logger.info(f"  - '{p.name}'")
+    logger.info(f"\nFound {len(profiles)} Edge profile(s).\n")
 
     # Tries default first, then the remaining profiles.
     ordered_profiles = sorted(
@@ -158,7 +162,7 @@ async def launch_browser():
 
     for profile in ordered_profiles:
 
-        print(f"Trying profile: {profile.name}")
+        logger.info(f"Trying profile: {profile.name}")
 
         playwright = None
         context = None
@@ -167,12 +171,12 @@ async def launch_browser():
             playwright, context, page = await launch_profile(profile)
 
 
-            print(f"Using profile: {profile.name}")
+            logger.info(f"Using profile: {profile.name}")
 
             return playwright, context, page
 
         except Exception as e:
-            print(f"✗ {profile.name} failed: {e}")
+            logger.exception(f"✗ {profile.name} failed: {e}")
 
             try:
                 if context:
@@ -180,7 +184,7 @@ async def launch_browser():
                 if playwright:
                     await playwright.stop()
             except Exception as cleanup_error:
-                print(f"Error cleaning up profile '{profile.name}': {cleanup_error}")
+                logger.exception(f"Error cleaning up profile '{profile.name}': {cleanup_error}")
 
     raise RuntimeError(
         "No Edge profile could open the dashboard."
