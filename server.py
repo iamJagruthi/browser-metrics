@@ -64,7 +64,7 @@ async def validate(request: ValidateRequest):
             {"name": "Dashboard A", "url": request.source_url.strip()},
             {"name": "Dashboard B", "url": request.target_url.strip()},
         ]
-
+        print(links,"surya")
         result = await validator.run_links(links)
 
         return result

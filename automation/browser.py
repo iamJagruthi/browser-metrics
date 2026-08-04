@@ -15,15 +15,9 @@ from utils.config import (
     PAGE_TIMEOUT,
     EDGE_USER_DATA,
     RENDER_WAIT,
+    PROFILE_DIR,
 )
-import logging
 
-logger = logging.getLogger(__name__)
-logger = logging.getLogger(__name__)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
 
 def find_edge_profiles():
     """
@@ -57,7 +51,7 @@ def find_edge_profiles():
         return sorted(profiles)
 
     except Exception as e:
-        logger.exception(f"Error while finding Edge profiles: {e}")
+        print(f"Error while finding Edge profiles: {e}")
         raise
 
 
@@ -99,7 +93,7 @@ async def launch_profile(profile_path):
         return playwright, context, page
 
     except Exception as e:
-        logger.exception(f"Error launching profile '{profile_path}': {e}")
+        print(f"Error launching profile '{profile_path}': {e}")
         raise
 
 
@@ -123,36 +117,34 @@ async def wait_for_dashboard(page):
         await page.wait_for_timeout(RENDER_WAIT)
 
     except Exception as e:
-        logger.exception(f"Error while waiting for dashboard to render: {e}")
+        print(f"Error while waiting for dashboard to render: {e}")
         raise
 
-    # await page.wait_for_function("""
-    # () => {
-    #     return document.querySelectorAll(".visualContainer").length > 0;
-    # }
-    # """)
-    # # Allow any remaining animations or visual rendering to complete.
-    # await page.wait_for_timeout(RENDER_WAIT)
 
-async def launch_browser():
+async def launch_browser(dashboard_url):
     """
-    Launch a Microsoft Edge browser using the first available
-    working profile.
+    Automatically find a working Microsoft Edge Profile and open the powerbi dashbord
+
+    Parameters
+    ----------
+    dashboard_url : str
+        URL of the Power BI dashboard.
 
     Returns
     -------
-    (playwright, context, page)
+    tuple
+        (playwright, context, page)
     """
 
     profiles = find_edge_profiles()
     if not profiles:
         raise RuntimeError("No Edge profiles found.")
 
-    logger.info("\nDetected Edge profiles:")
+    print("\nDetected Edge profiles:")
 
     for p in profiles:
-        logger.info(f"  - '{p.name}'")
-    logger.info(f"\nFound {len(profiles)} Edge profile(s).\n")
+        print(f"  - '{p.name}'")
+    print(f"\nFound {len(profiles)} Edge profile(s).\n")
 
     # Tries default first, then the remaining profiles.
     ordered_profiles = sorted(
@@ -162,7 +154,7 @@ async def launch_browser():
 
     for profile in ordered_profiles:
 
-        logger.info(f"Trying profile: {profile.name}")
+        print(f"Trying profile: {profile.name}")
 
         playwright = None
         context = None
@@ -170,13 +162,20 @@ async def launch_browser():
         try:
             playwright, context, page = await launch_profile(profile)
 
+            await page.goto(
+                dashboard_url,
+                wait_until="domcontentloaded",
+                timeout=PAGE_TIMEOUT,
+            )
 
-            logger.info(f"Using profile: {profile.name}")
+            await wait_for_dashboard(page)
+
+            print(f"Using profile: {profile.name}")
 
             return playwright, context, page
 
         except Exception as e:
-            logger.exception(f"✗ {profile.name} failed: {e}")
+            print(f"✗ {profile.name} failed: {e}")
 
             try:
                 if context:
@@ -184,7 +183,7 @@ async def launch_browser():
                 if playwright:
                     await playwright.stop()
             except Exception as cleanup_error:
-                logger.exception(f"Error cleaning up profile '{profile.name}': {cleanup_error}")
+                print(f"Error cleaning up profile '{profile.name}': {cleanup_error}")
 
     raise RuntimeError(
         "No Edge profile could open the dashboard."
