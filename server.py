@@ -10,26 +10,11 @@ Frontend (Vite/React dev server on http://localhost:5173) posts two
 dashboard URLs to POST /api/validate and receives metrics + comparison.
 """
 
-import asyncio
-import sys
-
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from automation.validator import DashboardValidator
-
-# --------------------------------------------------
-# Windows requires the Proactor event loop for asyncio
-# to be able to spawn subprocesses (which is how Playwright
-# launches the browser). Uvicorn defaults to the Selector
-# loop on Windows, which raises NotImplementedError for any
-# subprocess call. This must run before uvicorn creates its
-# event loop, so it stays at module import time, above the
-# FastAPI app instance below.
-# --------------------------------------------------
-if sys.platform == "win32":
-    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 app = FastAPI(title="Browser Metrics Validator API")
 
