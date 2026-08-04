@@ -1,0 +1,31 @@
+======================================================================
+BROWSER METRICS VALIDATION REPORT
+======================================================================
+
+Dashboard Information
+----------------------------------------------------------------------
+Dashboard Name : Dashboard B
+Environment    : None
+URL            : https://app.powerbi.com/groups/5e460a68-6f15-41f3-a1fa-d7fbf7245850/reports/6af27fd3-971c-40e1-a8af-321942bf73a5/0a05895d0eb1d076c78b?ctid=e7c6f609-f63a-4ec7-b71e-6734c4c9d231&experience=power-bi
+Timestamp      : 2026-08-04 12:58:27
+
+Performance Metrics
+----------------------------------------------------------------------
+Browser Launch Time : 20.816 sec
+Page Load Time      : 0.575 sec
+Dashboard Render    : 10.01 sec
+Screenshot Time     : 0.13 sec
+Total Execution     : 31.530999999999995 sec
+
+Network Metrics
+----------------------------------------------------------------------
+HTTP Status      : 200
+Requests         : 142
+Responses        : 138
+Failed Requests  : 4
+Console Messages : 4
+Page Errors      : 0
+
+
+======================================================================
+End of Report
