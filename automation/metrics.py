@@ -35,66 +35,71 @@ def build_metrics(
         Dictionary containing all browser metrics.
     """
 
-    return {
+    try:
+        return {
 
-        # ----------------------------
-        # Run Information
-        # ----------------------------
+            # ----------------------------
+            # Run Information
+            # ----------------------------
 
-        "run_id": str(uuid.uuid4()),
+            "run_id": str(uuid.uuid4()),
 
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
 
-        # ----------------------------
-        # Dashboard Information
-        # ----------------------------
+            # ----------------------------
+            # Dashboard Information
+            # ----------------------------
 
-        "dashboard_name": dashboard_name,
+            "dashboard_name": dashboard_name,
 
-        "dashboard_url": dashboard_url,
+            "dashboard_url": dashboard_url,
 
-        "page_title": page_title,
+            "page_title": page_title,
 
-        "final_url": final_url,
+            "final_url": final_url,
 
-        "http_status": http_status,
+            "http_status": http_status,
 
-        # ----------------------------
-        # Performance Metrics
-        # ----------------------------
+            # ----------------------------
+            # Performance Metrics
+            # ----------------------------
 
-        "browser_launch_seconds":
-            timers.get("browser_launch", 0),
+            "browser_launch_seconds":
+                timers.get("browser_launch", 0),
 
-        "page_load_seconds":
-            timers.get("page_load", 0),
+            "page_load_seconds":
+                timers.get("page_load", 0),
 
-        "dashboard_render_seconds":
-            timers.get("dashboard_render", 0),
+            "dashboard_render_seconds":
+                timers.get("dashboard_render", 0),
 
-        "screenshot_seconds":
-            timers.get("screenshot", 0),
+            "screenshot_seconds":
+                timers.get("screenshot", 0),
 
-        "total_execution_seconds":
-            timers.get("total_execution", 0),
+            "total_execution_seconds":
+                timers.get("total_execution", 0),
 
-        # ----------------------------
-        # Network Metrics
-        # ----------------------------
+            # ----------------------------
+            # Network Metrics
+            # ----------------------------
 
-        "total_requests":
-            network_summary.get("total_requests", 0),
+            "total_requests":
+                network_summary.get("total_requests", 0),
 
-        "total_responses":
-            network_summary.get("total_responses", 0),
+            "total_responses":
+                network_summary.get("total_responses", 0),
 
-        "failed_requests":
-            network_summary.get("failed_requests", 0),
+            "failed_requests":
+                network_summary.get("failed_requests", 0),
 
-        "console_messages":
-            network_summary.get("console_messages", 0),
+            "console_messages":
+                network_summary.get("console_messages", 0),
 
-        "page_errors":
-            network_summary.get("page_errors", 0)
+            "page_errors":
+                network_summary.get("page_errors", 0)
 
-    }
+        }
+
+    except Exception as e:
+        print(f"Error building metrics for '{dashboard_name}': {e}")
+        raise

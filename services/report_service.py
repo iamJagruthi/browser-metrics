@@ -6,10 +6,15 @@ Service layer for report generation.
 
 from automation.report import generate_report
 
-# i have code lsjdflkjsdf
+
 def build_report(results):
     """
     Generate validation report.
     """
 
-    return generate_report(results)
+    try:
+        return generate_report(results)
+
+    except Exception as e:
+        print(f"Error building report: {e}")
+        raise

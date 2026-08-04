@@ -18,7 +18,12 @@ def compare_dashboard_kpis(
     Compare KPI lists.
     """
 
-    return comparison.compare_kpis(
-        source_kpis,
-        target_kpis
-    )
+    try:
+        return comparison.compare_kpis(
+            source_kpis,
+            target_kpis
+        )
+
+    except Exception as e:
+        print(f"Error comparing dashboard KPIs: {e}")
+        raise

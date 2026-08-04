@@ -20,11 +20,14 @@ def clear():
     """
     Clears all collected network data before every execution.
     """
-    requests.clear()
-    responses.clear()
-    failed_requests.clear()
-    console_logs.clear()
-    page_errors.clear()
+    try:
+        requests.clear()
+        responses.clear()
+        failed_requests.clear()
+        console_logs.clear()
+        page_errors.clear()
+    except Exception as e:
+        print(f"Error clearing network data: {e}")
 
 
 async def register(page):
@@ -38,61 +41,83 @@ async def register(page):
     # Requests
     # ----------------------------
     def handle_request(request):
-        requests.append({
-            "method": request.method,
-            "url": request.url,
-            "resource_type": request.resource_type,
-        })
+        try:
+            requests.append({
+                "method": request.method,
+                "url": request.url,
+                "resource_type": request.resource_type,
+            })
+        except Exception as e:
+            print(f"Error handling request event: {e}")
 
     # ----------------------------
     # Responses
     # ----------------------------
     def handle_response(response):
+        try:
+            data = {
+                "url": response.url,
+                "status": response.status,
+                "status_text": response.status_text,
+                "ok": response.ok,
+            }
 
-        data = {
-            "url": response.url,
-            "status": response.status,
-            "status_text": response.status_text,
-            "ok": response.ok,
-        }
+            responses.append(data)
 
-        responses.append(data)
+            if response.status >= 400:
+                failed_requests.append(data)
 
-        if response.status >= 400:
-            failed_requests.append(data)
+        except Exception as e:
+            print(f"Error handling response event: {e}")
 
     # ----------------------------
     # Console Logs
     # ----------------------------
     def handle_console(message):
-
-        console_logs.append({
-            "type": message.type,
-            "text": message.text,
-        })
+        try:
+            console_logs.append({
+                "type": message.type,
+                "text": message.text,
+            })
+        except Exception as e:
+            print(f"Error handling console event: {e}")
 
     # ----------------------------
     # JavaScript Errors
     # ----------------------------
     def handle_page_error(error):
+        try:
+            page_errors.append(str(error))
+        except Exception as e:
+            print(f"Error handling page error event: {e}")
 
-        page_errors.append(str(error))
-
-    page.on("request", handle_request)
-    page.on("response", handle_response)
-    page.on("console", handle_console)
-    page.on("pageerror", handle_page_error)
+    try:
+        page.on("request", handle_request)
+        page.on("response", handle_response)
+        page.on("console", handle_console)
+        page.on("pageerror", handle_page_error)
+    except Exception as e:
+        print(f"Error registering network listeners: {e}")
 
 
 def summary():
     """
     Returns a summarized view of network activity.
     """
-
-    return {
-        "total_requests": len(requests),
-        "total_responses": len(responses),
-        "failed_requests": len(failed_requests),
-        "console_messages": len(console_logs),
-        "page_errors": len(page_errors),
-    }
+    try:
+        return {
+            "total_requests": len(requests),
+            "total_responses": len(responses),
+            "failed_requests": len(failed_requests),
+            "console_messages": len(console_logs),
+            "page_errors": len(page_errors),
+        }
+    except Exception as e:
+        print(f"Error building network summary: {e}")
+        return {
+            "total_requests": 0,
+            "total_responses": 0,
+            "failed_requests": 0,
+            "console_messages": 0,
+            "page_errors": 0,
+        }

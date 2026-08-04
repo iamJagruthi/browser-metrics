@@ -16,8 +16,14 @@ async def main():
 
     validator = DashboardValidator()
 
-    await validator.run_all()
+    try:
+        await validator.run_all()
+    except Exception as e:
+        print(f"Fatal error during validation run: {e}")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        print(f"Failed to start application: {e}")
