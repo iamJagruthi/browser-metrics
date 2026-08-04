@@ -7,7 +7,7 @@ Main orchestration module for Browser Metrics Validator.
 import json
 import asyncio
 
-from .browser import launch_browser
+from .browser import (launch_browser, wait_for_dashboard,)
 from .network import register, summary, clear
 from .performance import PerformanceTimer
 from .metrics import build_metrics
@@ -53,7 +53,11 @@ class DashboardValidator:
 
             self.timer.start("browser_launch")
 
+<<<<<<< Updated upstream
             playwright, context, page = await launch_browser(dashboard["url"])
+=======
+        playwright, context, page = await launch_browser()
+>>>>>>> Stashed changes
 
             self.timer.stop("browser_launch")
 
@@ -76,7 +80,11 @@ class DashboardValidator:
 
             self.timer.start("dashboard_render")
 
+<<<<<<< Updated upstream
             await page.wait_for_timeout(RENDER_WAIT)
+=======
+        await wait_for_dashboard(page)
+>>>>>>> Stashed changes
 
             self.timer.stop("dashboard_render")
 
@@ -120,6 +128,7 @@ class DashboardValidator:
                 http_status=response.status if response else None,
             )
 
+<<<<<<< Updated upstream
             ocr_results = extract_dashboard_text(screenshot_path)
 
             kpis = detect_kpis(ocr_results)
@@ -224,6 +233,35 @@ class DashboardValidator:
             ],
             "comparison": comparison,
         }
+=======
+        try:
+            dashboard_data = extract_dashboard_text(
+                screenshot_path
+            )
+
+            print(
+                f"Dashboard Title : {dashboard_data['title']}"
+            )
+
+            print(
+                f"Refresh Date    : {dashboard_data['refresh_date']}"
+            )
+
+            kpis = detect_kpis(
+                dashboard_data["ocr"]
+            )
+
+        except Exception as e:
+            print(f"OCR failed: {e}")
+            kpis = []
+        return (
+            playwright,
+            context,
+            metrics,
+            screenshot_path,
+            kpis
+        )
+>>>>>>> Stashed changes
 
     async def run_all(self):
 

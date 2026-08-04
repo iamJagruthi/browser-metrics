@@ -41,7 +41,8 @@ PAGE_TIMEOUT
 # Browser
 # --------------------------------------------------
 PROFILE_DIR = os.getenv("PROFILE_DIR") or "Profile 7"
-print(f"PROFILE_DIR = '{PROFILE_DIR}'")
+
+# print(f"PROFILE_DIR = '{PROFILE_DIR}'")
 EDGE_USER_DATA = (
     Path.home()
     / "AppData"
