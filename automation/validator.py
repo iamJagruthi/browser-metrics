@@ -15,7 +15,7 @@ from .storage import initialize_storage, save_metrics
 from .report import generate_report
 from services.ocr_service import extract_dashboard_text
 from services.kpi_service import detect_kpis
-from services.comparison_service import compare_dashboard_kpis
+from extraction.comparison import compare_kpis
 
 from utils.config import (
     DASHBOARD_CONFIG,
@@ -93,6 +93,9 @@ class DashboardValidator:
                 path=str(screenshot_path),
                 full_page=True
             )
+
+            ocr_results = extract_dashboard_text(screenshot_path)
+            kpis = detect_kpis(ocr_results)
 
             self.timer.stop("screenshot")
 
@@ -208,7 +211,7 @@ class DashboardValidator:
         if len(all_kpis) >= 2 and all_metrics[0] and all_metrics[1]:
 
             try:
-                comparison = compare_dashboard_kpis(
+                comparison = compare_kpis(
                     all_kpis[0],
                     all_kpis[1]
                 )
@@ -275,7 +278,7 @@ class DashboardValidator:
                     print(f"Error during browser cleanup: {cleanup_error}")
 
         try:
-            comparison = compare_dashboard_kpis(
+            comparison = compare_kpis(
                 all_kpis[0],
                 all_kpis[1]
             )
