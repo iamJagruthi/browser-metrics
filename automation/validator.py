@@ -7,7 +7,7 @@ Main orchestration module for Browser Metrics Validator.
 import json
 import asyncio
 
-from .browser import launch_browser
+from .browser import launch_browser,wait_for_dashboard
 from .network import register, summary, clear
 from .performance import PerformanceTimer
 from .metrics import build_metrics
@@ -20,7 +20,6 @@ from services.comparison_service import compare_dashboard_kpis
 from utils.config import (
     DASHBOARD_CONFIG,
     PAGE_TIMEOUT,
-    RENDER_WAIT,
     SCREENSHOT_DIR,
 )
 
@@ -53,7 +52,7 @@ class DashboardValidator:
 
             self.timer.start("browser_launch")
 
-            playwright, context, page = await launch_browser(dashboard["url"])
+            playwright, context, page = await launch_browser()
 
             self.timer.stop("browser_launch")
 
@@ -68,6 +67,7 @@ class DashboardValidator:
             response = await page.goto(
                 dashboard["url"],
                 wait_until="domcontentloaded",
+                timeout=PAGE_TIMEOUT,
             )
 
             self.timer.stop("page_load")
@@ -76,7 +76,7 @@ class DashboardValidator:
 
             self.timer.start("dashboard_render")
 
-            await page.wait_for_timeout(RENDER_WAIT)
+            await wait_for_dashboard(page)
 
             self.timer.stop("dashboard_render")
 
