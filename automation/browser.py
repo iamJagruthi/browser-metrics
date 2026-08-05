@@ -121,14 +121,9 @@ async def wait_for_dashboard(page):
         raise
 
 
-async def launch_browser(dashboard_url):
+async def launch_browser():
     """
-    Automatically find a working Microsoft Edge Profile and open the powerbi dashbord
-
-    Parameters
-    ----------
-    dashboard_url : str
-        URL of the Power BI dashboard.
+    Launch Microsoft Edge using the first available profile.
 
     Returns
     -------
@@ -137,54 +132,57 @@ async def launch_browser(dashboard_url):
     """
 
     profiles = find_edge_profiles()
+
     if not profiles:
         raise RuntimeError("No Edge profiles found.")
 
     print("\nDetected Edge profiles:")
 
-    for p in profiles:
-        print(f"  - '{p.name}'")
+    for profile in profiles:
+        print(f"  - {profile.name}")
+
     print(f"\nFound {len(profiles)} Edge profile(s).\n")
 
-    # Tries default first, then the remaining profiles.
+    # Try Default profile first, then the remaining profiles.
     ordered_profiles = sorted(
         profiles,
-        key=lambda p: p.name != "Default"
+        key=lambda profile: profile.name != "Default"
     )
 
     for profile in ordered_profiles:
-
-        print(f"Trying profile: {profile.name}")
 
         playwright = None
         context = None
 
         try:
+            print(f"Trying profile: {profile.name}")
+
             playwright, context, page = await launch_profile(profile)
-
-            await page.goto(
-                dashboard_url,
-                wait_until="domcontentloaded",
-                timeout=PAGE_TIMEOUT,
-            )
-
-            await wait_for_dashboard(page)
 
             print(f"Using profile: {profile.name}")
 
-            return playwright, context, page
+            return (
+                playwright,
+                context,
+                page,
+            )
 
-        except Exception as e:
-            print(f"✗ {profile.name} failed: {e}")
+        except Exception as error:
+
+            print(
+                f"✗ Failed to launch '{profile.name}': {error}"
+            )
 
             try:
                 if context:
                     await context.close()
+
                 if playwright:
                     await playwright.stop()
-            except Exception as cleanup_error:
-                print(f"Error cleaning up profile '{profile.name}': {cleanup_error}")
+
+            except Exception:
+                pass
 
     raise RuntimeError(
-        "No Edge profile could open the dashboard."
+        "Unable to launch Microsoft Edge using any available profile."
     )
