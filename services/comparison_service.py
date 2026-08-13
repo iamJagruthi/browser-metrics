@@ -5,7 +5,7 @@ Service layer for KPI comparison.
 """
 
 from automation.comparison import DashboardComparison
-
+from extraction.comparison import compare_kpis
 
 comparison = DashboardComparison()
 

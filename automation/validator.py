@@ -7,7 +7,7 @@ Main orchestration module for Browser Metrics Validator.
 import json
 import asyncio
 
-from .browser import launch_browser,wait_for_dashboard
+from .browser import launch_browser
 from .network import register, summary, clear
 from .performance import PerformanceTimer
 from .metrics import build_metrics
@@ -15,12 +15,13 @@ from .storage import initialize_storage, save_metrics
 from .report import generate_report
 from services.ocr_service import extract_dashboard_text
 from services.kpi_service import detect_kpis
-from services.comparison_service import compare_dashboard_kpis
+from extraction.comparison import compare_kpis
 
 from utils.config import (
     DASHBOARD_CONFIG,
     PAGE_TIMEOUT,
     SCREENSHOT_DIR,
+    RENDER_WAIT,
 )
 
 
@@ -45,10 +46,17 @@ class DashboardValidator:
 
         try:
             clear()
-
             self.timer.reset()
 
-            # ---------------- Browser ----------------
+            # --------------------------------------------------
+            # Total Validation
+            # --------------------------------------------------
+
+            self.timer.start("total_execution")
+
+            # --------------------------------------------------
+            # Browser Launch
+            # --------------------------------------------------
 
             self.timer.start("browser_launch")
 
@@ -60,7 +68,9 @@ class DashboardValidator:
 
             page.set_default_timeout(PAGE_TIMEOUT)
 
-            # ---------------- Page Load ----------------
+            # --------------------------------------------------
+            # Page Load
+            # --------------------------------------------------
 
             self.timer.start("page_load")
 
@@ -72,15 +82,25 @@ class DashboardValidator:
 
             self.timer.stop("page_load")
 
-            # ---------------- Render ----------------
+            # --------------------------------------------------
+            # Dashboard Render
+            # --------------------------------------------------
 
             self.timer.start("dashboard_render")
 
-            await wait_for_dashboard(page)
+            await page.wait_for_selector(".visualContainer")
 
             self.timer.stop("dashboard_render")
 
-            # ---------------- Screenshot ----------------
+            # --------------------------------------------------
+            # Stabilization (Not Timed)
+            # --------------------------------------------------
+
+            await page.wait_for_timeout(RENDER_WAIT)
+
+            # --------------------------------------------------
+            # Screenshot
+            # --------------------------------------------------
 
             self.timer.start("screenshot")
 
@@ -91,22 +111,44 @@ class DashboardValidator:
 
             await page.screenshot(
                 path=str(screenshot_path),
-                full_page=True
+                full_page=True,
             )
 
             self.timer.stop("screenshot")
 
-            # ---------------- Total ----------------
+            # --------------------------------------------------
+            # OCR
+            # --------------------------------------------------
 
-            total_execution = (
-                self.timer.get("browser_launch")
-                + self.timer.get("page_load")
-                + self.timer.get("dashboard_render")
-                + self.timer.get("screenshot")
+            self.timer.start("ocr")
+
+            ocr_results = extract_dashboard_text(
+                screenshot_path
             )
 
+            self.timer.stop("ocr")
+
+            # --------------------------------------------------
+            # KPI Extraction
+            # --------------------------------------------------
+
+            self.timer.start("kpi_detection")
+
+            kpis = detect_kpis(ocr_results)
+
+            self.timer.stop("kpi_detection")
+
+            # --------------------------------------------------
+            # Total Validation
+            # --------------------------------------------------
+
+            self.timer.stop("total_execution")
+
+            # --------------------------------------------------
+            # Metrics
+            # --------------------------------------------------
+
             timers = self.timer.summary()
-            timers["total_execution"] = total_execution
 
             network_summary = summary()
 
@@ -120,20 +162,18 @@ class DashboardValidator:
                 http_status=response.status if response else None,
             )
 
-            ocr_results = extract_dashboard_text(screenshot_path)
-
-            kpis = detect_kpis(ocr_results)
-
             return (
                 playwright,
                 context,
                 metrics,
                 screenshot_path,
-                kpis
+                kpis,
             )
 
         except Exception as e:
-            print(f"Error running dashboard '{dashboard.get('name')}': {e}")
+            print(
+                f"Error running dashboard '{dashboard.get('name')}': {e}"
+            )
             raise
 
     async def run_links(self, links):
@@ -171,7 +211,6 @@ class DashboardValidator:
                     screenshot_path,
                     kpis
                 ) = await self.run_dashboard(dashboard)
-                print(links,"links")
                 if not headers_initialized:
 
                     initialize_storage(list(metrics.keys()))
@@ -208,7 +247,7 @@ class DashboardValidator:
         if len(all_kpis) >= 2 and all_metrics[0] and all_metrics[1]:
 
             try:
-                comparison = compare_dashboard_kpis(
+                comparison = compare_kpis(
                     all_kpis[0],
                     all_kpis[1]
                 )
@@ -275,7 +314,7 @@ class DashboardValidator:
                     print(f"Error during browser cleanup: {cleanup_error}")
 
         try:
-            comparison = compare_dashboard_kpis(
+            comparison = compare_kpis(
                 all_kpis[0],
                 all_kpis[1]
             )
