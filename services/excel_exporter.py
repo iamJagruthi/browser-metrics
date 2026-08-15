@@ -1292,6 +1292,82 @@ def _create_browser_metrics_sheet(
     _auto_fit(ws)
 
 
+def _visual_key(visual):
+    return " ".join(str(visual.get("title") or visual.get("id") or "").lower().split())
+
+
+def build_visual_data_comparison(visual_data):
+    """Compare rendered Power BI table cells, visual by visual and row by row."""
+    source = visual_data.get("Source", {}).get("visuals", [])
+    target = visual_data.get("Target", {}).get("visuals", [])
+    source_map = {_visual_key(item): item for item in source if _visual_key(item)}
+    target_map = {_visual_key(item): item for item in target if _visual_key(item)}
+    summaries, cells = [], []
+    for key in sorted(set(source_map) | set(target_map)):
+        left, right = source_map.get(key), target_map.get(key)
+        if not left or not right:
+            summaries.append({"visual": (left or right).get("title"), "status": "Missing in Target" if left else "Missing in Source", "source_rows": len((left or {}).get("data", {}).get("rows", [])), "target_rows": len((right or {}).get("data", {}).get("rows", [])), "matched_cells": 0, "mismatched_cells": 0})
+            continue
+        left_rows, right_rows = left.get("data", {}).get("rows", []), right.get("data", {}).get("rows", [])
+        left_columns = left.get("data", {}).get("columns", [])
+        right_columns = right.get("data", {}).get("columns", [])
+        matched = mismatched = 0
+        for row_number in range(max(len(left_rows), len(right_rows))):
+            left_row = left_rows[row_number] if row_number < len(left_rows) else []
+            right_row = right_rows[row_number] if row_number < len(right_rows) else []
+            for col_number in range(max(len(left_row), len(right_row))):
+                source_value = left_row[col_number] if col_number < len(left_row) else None
+                target_value = right_row[col_number] if col_number < len(right_row) else None
+                status = "Match" if source_value == target_value else ("Missing in Source" if source_value is None else "Missing in Target" if target_value is None else "Mismatch")
+                matched += status == "Match"
+                mismatched += status != "Match"
+                cells.append({"visual": left.get("title"), "row_number": row_number + 1, "column": left_columns[col_number] if col_number < len(left_columns) else right_columns[col_number] if col_number < len(right_columns) else f"Column {col_number + 1}", "source_value": source_value, "target_value": target_value, "status": status})
+        summaries.append({"visual": left.get("title"), "status": "Match" if not mismatched else "Mismatch", "source_rows": len(left_rows), "target_rows": len(right_rows), "matched_cells": matched, "mismatched_cells": mismatched})
+    return {"summary": summaries, "cells": cells}
+
+
+def _create_visual_data_sheets(wb, visual_data):
+    """Create one visual summary plus raw rows and cell-level comparison tables."""
+    if not visual_data:
+        return {"summary": [], "cells": []}
+    comparison = build_visual_data_comparison(visual_data)
+    summary = wb.create_sheet("Visual Data Summary")
+    _format_header(summary, ["Visual", "Status", "Source Rows", "Target Rows", "Matched Cells", "Mismatched Cells"])
+    for row_idx, item in enumerate(comparison["summary"], start=2):
+        for col_idx, value in enumerate([item["visual"], item["status"], item["source_rows"], item["target_rows"], item["matched_cells"], item["mismatched_cells"]], start=1):
+            _style_cell(summary.cell(row=row_idx, column=col_idx, value=value))
+        if item["status"] != "Match":
+            for col_idx in range(1, 7):
+                summary.cell(row=row_idx, column=col_idx).fill = PatternFill(fill_type="solid", fgColor="FCE4D6")
+    _auto_fit(summary)
+
+    # Keep raw source and target values apart so reviewers can inspect each
+    # table independently before using the cell-level comparison sheet.
+    for dashboard in ("Source", "Target"):
+        payload = visual_data.get(dashboard, {})
+        max_cells = max((len(row) for visual in payload.get("visuals", []) for row in visual.get("data", {}).get("rows", [])), default=0)
+        raw = wb.create_sheet(f"{dashboard} Visual Data")
+        _format_header(raw, ["Visual ID", "Visual Title", "Row Number"] + [f"Column {index}" for index in range(1, max_cells + 1)])
+        row_idx = 2
+        for visual in payload.get("visuals", []):
+            for row_number, row in enumerate(visual.get("data", {}).get("rows", []), start=1):
+                for col_idx, value in enumerate([visual.get("id"), visual.get("title"), row_number] + row, start=1):
+                    _style_cell(raw.cell(row=row_idx, column=col_idx, value=value))
+                row_idx += 1
+        _auto_fit(raw)
+
+    cells = wb.create_sheet("Visual Data Comparison")
+    _format_header(cells, ["Visual", "Row Number", "Column", "Source Value", "Target Value", "Status"])
+    for row_idx, item in enumerate(comparison["cells"], start=2):
+        for col_idx, value in enumerate([item["visual"], item["row_number"], item["column"], item["source_value"], item["target_value"], item["status"]], start=1):
+            _style_cell(cells.cell(row=row_idx, column=col_idx, value=value))
+        if item["status"] != "Match":
+            for col_idx in range(1, 7):
+                cells.cell(row=row_idx, column=col_idx).fill = PatternFill(fill_type="solid", fgColor="FCE4D6")
+    _auto_fit(cells)
+    return comparison
+
+
 # ---------------------------------------------------------
 # Main Export Function
 # ---------------------------------------------------------
@@ -1306,6 +1382,7 @@ def export_validation_workbook(
     comparison_summary,
     metrics,
     output_directory,
+    visual_data=None,
 ):
     """
     Create one Excel workbook for the complete validation run.
@@ -1408,6 +1485,8 @@ def export_validation_workbook(
             metrics,
         )
 
+        _create_visual_data_sheets(wb, visual_data)
+
         # -------------------------------------------------
         # Save workbook
         # -------------------------------------------------
@@ -1435,8 +1514,11 @@ def calculate_match_percentage(results: list) -> float:
     Calculate percentage of comparison items with status 'Match'.
     """
 
+    # An absent comparison is not evidence of a perfect match.  Callers can
+    # distinguish it from a genuinely empty successful comparison via the
+    # extraction status carried in the API result.
     if not results:
-        return 100.0
+        return 0.0
 
     matches = sum(
         1

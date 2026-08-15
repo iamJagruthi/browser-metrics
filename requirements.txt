@@ -1,8 +1,17 @@
-playwright
-pandas
-openpyxl
-python-dotenv
-Pillow
-easyocr
-opencv-python
-numpy
+# Browser automation
+playwright==1.55.0
+
+# AI / Gemini
+google-genai==2.18.0
+
+# Data validation / structured Gemini responses
+pydantic==2.12.5
+
+# Environment variables
+python-dotenv==1.1.1
+
+# Excel workbook generation
+openpyxl==3.1.5
+
+# Word validation report
+python-docx==1.2.0
