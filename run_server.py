@@ -6,18 +6,11 @@ through the `uvicorn` CLI.
 
 Why this exists:
 -----------------
-Playwright launches the Edge browser as a subprocess. On Windows,
-asyncio can only spawn subprocesses under the ProactorEventLoop —
-the SelectorEventLoop raises NotImplementedError for any subprocess
-call.
-
-The old fix was `asyncio.set_event_loop_policy(...)`, but that API
-is deprecated as of Python 3.14 and will be removed in 3.16. Its
-replacement is passing `loop_factory` directly to `asyncio.run()`
-(available since Python 3.12). The `uvicorn server:app` CLI calls
-`asyncio.run()` internally and gives us no way to pass `loop_factory`
-to it — so instead we call `uvicorn.Server.serve()` ourselves, inside
-our own `asyncio.run(..., loop_factory=...)`.
+Playwright launches Edge as a subprocess. On supported Windows Python
+versions, ``asyncio.run()`` uses the required default Proactor loop.
+Keeping the launcher free of an explicit loop class also avoids startup
+failures on Python versions where ``asyncio.ProactorEventLoop`` is no
+longer exposed as a public attribute.
 
 Usage
 -----
@@ -32,14 +25,19 @@ and wrap this script's call in a `watchfiles.run_process(...)` call.
 """
 
 import asyncio
+import logging
 import sys
 
 import uvicorn
+from server import app  # Re-export the FastAPI application as the frontend/backend bridge.
+
+
+logger = logging.getLogger(__name__)
 
 
 async def run():
     config = uvicorn.Config(
-        "server:app",
+        app,
         host="127.0.0.1",
         port=8000,
         log_level="info",
@@ -50,10 +48,8 @@ async def run():
 
 if __name__ == "__main__":
     try:
-        if sys.platform == "win32":
-            asyncio.run(run(), loop_factory=asyncio.ProactorEventLoop)
-        else:
-            asyncio.run(run())
+        asyncio.run(run())
 
-    except Exception as e:
-        print(f"Failed to start server: {e}")
+    except Exception:
+        logger.exception("Failed to start API server")
+        raise

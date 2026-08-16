@@ -7,6 +7,8 @@ Responsible for:
 3. Validating whether the profile has Power BI access
 4. Returning the first working profile
 """
+import logging
+
 from playwright.async_api import async_playwright
 
 from utils.config import (
@@ -17,6 +19,9 @@ from utils.config import (
     RENDER_WAIT,
     PROFILE_DIR,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 def find_edge_profiles():
@@ -113,8 +118,31 @@ async def wait_for_dashboard(page):
             timeout=PAGE_TIMEOUT,
         )
 
-        # Allow any remaining animations or visual rendering to complete.
-        await page.wait_for_timeout(RENDER_WAIT)
+        # Power BI often creates the visual containers before their data is
+        # painted.  A fixed sleep captured loading placeholders and led to
+        # duplicate/partial visual extraction.  Require a quiet, non-loading
+        # interval before the screenshot and DOM collection begin.
+        stable_samples = 0
+        previous_signature = None
+        for _ in range(max(3, RENDER_WAIT // 500)):
+            signature = await page.locator(".visualContainer").evaluate_all(
+                """nodes => nodes.map(node => (node.innerText || '').trim())
+                    .filter(Boolean).join('\\n').slice(0, 50000)"""
+            )
+            loading_count = await page.locator(
+                ".loading, [aria-label*='loading' i], [aria-busy='true']"
+            ).count()
+            if signature == previous_signature and loading_count == 0:
+                stable_samples += 1
+                if stable_samples >= 3:
+                    logger.info("Dashboard visuals are stable")
+                    return
+            else:
+                stable_samples = 0
+            previous_signature = signature
+            await page.wait_for_timeout(500)
+
+        logger.warning("Dashboard did not reach a fully stable state; continuing after timeout")
 
     except Exception as e:
         print(f"Error while waiting for dashboard to render: {e}")

@@ -1,6 +1,10 @@
 # Browser automation
 playwright==1.55.0
 
+# HTTP API server
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0
+
 # AI / Gemini
 google-genai==2.18.0
 

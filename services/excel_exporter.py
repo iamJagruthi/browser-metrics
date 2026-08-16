@@ -14,6 +14,7 @@ Creates one Excel workbook containing:
 """
 
 import logging
+import re
 from pathlib import Path
 
 import openpyxl
@@ -23,6 +24,42 @@ from openpyxl.utils import get_column_letter
 
 
 logger = logging.getLogger(__name__)
+
+
+def _kpi_key(name):
+    """Canonicalise a KPI label without deleting business terms."""
+    return " ".join(re.sub(r"[^a-z0-9%]+", " ", str(name or "").casefold()).split())
+
+
+def _normalise_comparison_value(value):
+    return re.sub(r"\s+", "", str(value or "")).replace(",", "").casefold()
+
+
+def _match_abbreviated_kpis(source_map, target_map):
+    """Pair only unambiguous abbreviated KPI labels.
+
+    A shorter label is eligible only when its tokens are a strict subset of
+    the longer label's tokens, the values match, and it has one candidate.
+    Thus ``30 Days`` can pair with ``30 Days Retention``, but ``30 Days
+    Turnover`` can never be mistaken for it.
+    """
+    matched = {}
+    source_only = set(source_map) - set(target_map)
+    target_only = set(target_map) - set(source_map)
+    for target_key in target_only:
+        target_tokens = set(target_key.split())
+        target_value = _normalise_comparison_value(target_map[target_key].get("value"))
+        candidates = [
+            source_key for source_key in source_only
+            if target_tokens and target_tokens < set(source_key.split())
+            and target_value
+            and target_value == _normalise_comparison_value(source_map[source_key].get("value"))
+        ]
+        if len(candidates) == 1:
+            source_key = candidates[0]
+            matched[source_key] = target_map[target_key]
+            source_only.remove(source_key)
+    return matched
 
 
 # ---------------------------------------------------------
@@ -731,16 +768,27 @@ def compare_kpis(source_data: dict, target_data: dict) -> list:
         # --------------------------------------------------
 
         source_map = {
-            kpi.get("name"): kpi
+            _kpi_key(kpi.get("name")): kpi
             for kpi in source_kpis
             if kpi.get("name")
         }
 
         target_map = {
-            kpi.get("name"): kpi
+            _kpi_key(kpi.get("name")): kpi
             for kpi in target_kpis
             if kpi.get("name")
         }
+
+        # Preserve every business word for exact matching first.  Only then
+        # resolve a unique, value-backed abbreviated label such as a dashboard
+        # that omits the final word from an otherwise identical KPI caption.
+        for source_key, target_kpi in _match_abbreviated_kpis(source_map, target_map).items():
+            for target_key, candidate in list(target_map.items()):
+                if candidate is target_kpi:
+                    del target_map[target_key]
+                    break
+            target_map[source_key] = target_kpi
+            logger.info("Matched abbreviated KPI label | source=%s | target=%s", source_key, target_kpi.get("name"))
 
         results = []
 
@@ -780,29 +828,12 @@ def compare_kpis(source_data: dict, target_data: dict) -> list:
 
             else:
 
-                source_value = str(
-                    source.get("value", "")
-                ).strip()
-
-                target_value = str(
-                    target.get("value", "")
-                ).strip()
-
-                source_previous = str(
-                    source.get("previous_value", "")
-                ).strip()
-
-                target_previous = str(
-                    target.get("previous_value", "")
-                ).strip()
-
-                source_variance = str(
-                    source.get("variance", "")
-                ).strip()
-
-                target_variance = str(
-                    target.get("variance", "")
-                ).strip()
+                source_value = _normalise_comparison_value(source.get("value"))
+                target_value = _normalise_comparison_value(target.get("value"))
+                source_previous = _normalise_comparison_value(source.get("previous_value"))
+                target_previous = _normalise_comparison_value(target.get("previous_value"))
+                source_variance = _normalise_comparison_value(source.get("variance"))
+                target_variance = _normalise_comparison_value(target.get("variance"))
 
                 # ------------------------------------------
                 # KPI Match
@@ -851,7 +882,9 @@ def compare_kpis(source_data: dict, target_data: dict) -> list:
             # --------------------------------------------------
 
             result = {
-                "kpi": name,
+                "kpi": source.get("name") if source else target.get("name"),
+                "source_kpi_name": source.get("name") if source else None,
+                "target_kpi_name": target.get("name") if target else None,
 
                 # IMPORTANT:
                 # These names match excel_exporter.py
@@ -1012,6 +1045,8 @@ def _create_visual_details_sheet(
     wb,
     source_data,
     target_data,
+    visual_comparison=None,
+    table_comparison=None,
 ):
     """Create Visual Details worksheet."""
 
@@ -1030,6 +1065,7 @@ def _create_visual_details_sheet(
         "Title",
         "Data",
         "Confidence",
+        "Comparison Status",
     ]
 
     _format_header(
@@ -1037,6 +1073,15 @@ def _create_visual_details_sheet(
         headers,
     )
 
+    status_by_visual = {
+        str(item.get("visual_id")): item.get("status", "Not Compared")
+        for item in (visual_comparison or [])
+        if item.get("visual_id")
+    }
+    table_status_by_title = {
+        " ".join(str(item.get("visual", "")).casefold().split()): item.get("status", "Not Compared")
+        for item in (table_comparison or {}).get("summary", [])
+    }
     row = 2
 
     for dashboard_name, data in [
@@ -1081,6 +1126,7 @@ def _create_visual_details_sheet(
                     )
                 ),
                 confidence,
+                status_by_visual.get(str(chart.get("visual_id")), "Not Compared"),
             ]
 
             for col_idx, value in enumerate(
@@ -1114,13 +1160,15 @@ def _create_visual_details_sheet(
                     "table_title",
                     "Table",
                 ),
-                _values_to_string(
-                    table.get(
-                        "rows",
-                        [],
-                    )
+                (
+                    f"{len(table.get('rows', []))} rows × "
+                    f"{len(table.get('columns', []))} columns; see Table Data"
                 ),
                 "N/A",
+                table_status_by_title.get(
+                    " ".join(str(table.get("table_title", "")).casefold().split()),
+                    "Not Compared",
+                ),
             ]
 
             for col_idx, value in enumerate(
@@ -1296,8 +1344,26 @@ def _visual_key(visual):
     return " ".join(str(visual.get("title") or visual.get("id") or "").lower().split())
 
 
+def _column_key(value):
+    return " ".join(str(value or "").casefold().split())
+
+
+def _table_columns(visual):
+    """Return an ordered, non-empty column list for a rendered visual."""
+    columns = visual.get("data", {}).get("columns", [])
+    if columns:
+        return [str(column) for column in columns]
+    width = max((len(row) for row in visual.get("data", {}).get("rows", [])), default=0)
+    return [f"Column {index}" for index in range(1, width + 1)]
+
+
 def build_visual_data_comparison(visual_data):
-    """Compare rendered Power BI table cells, visual by visual and row by row."""
+    """Compare every rendered table column and row, visual by visual.
+
+    Column names—not the temporary horizontal viewport position—are used as
+    the comparison key.  This avoids the previous behaviour where only the
+    first few visible columns of a Power BI matrix were compared.
+    """
     source = visual_data.get("Source", {}).get("visuals", [])
     target = visual_data.get("Target", {}).get("visuals", [])
     source_map = {_visual_key(item): item for item in source if _visual_key(item)}
@@ -1309,25 +1375,33 @@ def build_visual_data_comparison(visual_data):
             summaries.append({"visual": (left or right).get("title"), "status": "Missing in Target" if left else "Missing in Source", "source_rows": len((left or {}).get("data", {}).get("rows", [])), "target_rows": len((right or {}).get("data", {}).get("rows", [])), "matched_cells": 0, "mismatched_cells": 0})
             continue
         left_rows, right_rows = left.get("data", {}).get("rows", []), right.get("data", {}).get("rows", [])
-        left_columns = left.get("data", {}).get("columns", [])
-        right_columns = right.get("data", {}).get("columns", [])
+        left_columns, right_columns = _table_columns(left), _table_columns(right)
+        if not left_rows and not right_rows and not left_columns and not right_columns:
+            summaries.append({"visual": left.get("title"), "status": "No table data captured", "source_rows": 0, "target_rows": 0, "matched_cells": 0, "mismatched_cells": 0})
+            continue
+        left_column_map = {_column_key(name): index for index, name in enumerate(left_columns)}
+        right_column_map = {_column_key(name): index for index, name in enumerate(right_columns)}
+        column_keys = list(dict.fromkeys([_column_key(name) for name in left_columns + right_columns]))
         matched = mismatched = 0
         for row_number in range(max(len(left_rows), len(right_rows))):
             left_row = left_rows[row_number] if row_number < len(left_rows) else []
             right_row = right_rows[row_number] if row_number < len(right_rows) else []
-            for col_number in range(max(len(left_row), len(right_row))):
-                source_value = left_row[col_number] if col_number < len(left_row) else None
-                target_value = right_row[col_number] if col_number < len(right_row) else None
+            for column_key in column_keys:
+                source_column = left_column_map.get(column_key)
+                target_column = right_column_map.get(column_key)
+                source_value = left_row[source_column] if source_column is not None and source_column < len(left_row) else None
+                target_value = right_row[target_column] if target_column is not None and target_column < len(right_row) else None
                 status = "Match" if source_value == target_value else ("Missing in Source" if source_value is None else "Missing in Target" if target_value is None else "Mismatch")
                 matched += status == "Match"
                 mismatched += status != "Match"
-                cells.append({"visual": left.get("title"), "row_number": row_number + 1, "column": left_columns[col_number] if col_number < len(left_columns) else right_columns[col_number] if col_number < len(right_columns) else f"Column {col_number + 1}", "source_value": source_value, "target_value": target_value, "status": status})
+                display_column = left_columns[source_column] if source_column is not None else right_columns[target_column]
+                cells.append({"visual": left.get("title"), "row_number": row_number + 1, "column": display_column, "source_value": source_value, "target_value": target_value, "status": status})
         summaries.append({"visual": left.get("title"), "status": "Match" if not mismatched else "Mismatch", "source_rows": len(left_rows), "target_rows": len(right_rows), "matched_cells": matched, "mismatched_cells": mismatched})
     return {"summary": summaries, "cells": cells}
 
 
 def _create_visual_data_sheets(wb, visual_data):
-    """Create one visual summary plus raw rows and cell-level comparison tables."""
+    """Create side-by-side table blocks plus complete cell-level comparisons."""
     if not visual_data:
         return {"summary": [], "cells": []}
     comparison = build_visual_data_comparison(visual_data)
@@ -1341,20 +1415,42 @@ def _create_visual_data_sheets(wb, visual_data):
                 summary.cell(row=row_idx, column=col_idx).fill = PatternFill(fill_type="solid", fgColor="FCE4D6")
     _auto_fit(summary)
 
-    # Keep raw source and target values apart so reviewers can inspect each
-    # table independently before using the cell-level comparison sheet.
-    for dashboard in ("Source", "Target"):
-        payload = visual_data.get(dashboard, {})
-        max_cells = max((len(row) for visual in payload.get("visuals", []) for row in visual.get("data", {}).get("rows", [])), default=0)
-        raw = wb.create_sheet(f"{dashboard} Visual Data")
-        _format_header(raw, ["Visual ID", "Visual Title", "Row Number"] + [f"Column {index}" for index in range(1, max_cells + 1)])
-        row_idx = 2
-        for visual in payload.get("visuals", []):
-            for row_number, row in enumerate(visual.get("data", {}).get("rows", []), start=1):
-                for col_idx, value in enumerate([visual.get("id"), visual.get("title"), row_number] + row, start=1):
-                    _style_cell(raw.cell(row=row_idx, column=col_idx, value=value))
-                row_idx += 1
-        _auto_fit(raw)
+    # One sheet holds each matched pair beside each other.  Individual visual
+    # blocks preserve their own real headers, which makes the raw data usable
+    # without jumping between Source and Target worksheets.
+    raw = wb.create_sheet("Table Data")
+    source_visuals = {_visual_key(item): item for item in visual_data.get("Source", {}).get("visuals", []) if _visual_key(item)}
+    target_visuals = {_visual_key(item): item for item in visual_data.get("Target", {}).get("visuals", []) if _visual_key(item)}
+    row_idx = 1
+    for key in sorted(set(source_visuals) | set(target_visuals)):
+        source_visual, target_visual = source_visuals.get(key), target_visuals.get(key)
+        source_columns = _table_columns(source_visual) if source_visual else []
+        target_columns = _table_columns(target_visual) if target_visual else []
+        source_width = max(1, len(source_columns))
+        target_start = source_width + 3
+        raw.cell(row=row_idx, column=1, value=f"Source: {(source_visual or target_visual).get('title')}")
+        raw.cell(row=row_idx, column=target_start, value=f"Target: {(target_visual or source_visual).get('title')}")
+        for cell in (raw.cell(row=row_idx, column=1), raw.cell(row=row_idx, column=target_start)):
+            cell.font = SUBHEADER_FONT
+        row_idx += 1
+        for index, column in enumerate(source_columns, start=1):
+            _style_cell(raw.cell(row=row_idx, column=index, value=column), ALIGN_CENTER)
+            raw.cell(row=row_idx, column=index).font = HEADER_FONT
+            raw.cell(row=row_idx, column=index).fill = HEADER_FILL
+        for index, column in enumerate(target_columns, start=target_start):
+            _style_cell(raw.cell(row=row_idx, column=index, value=column), ALIGN_CENTER)
+            raw.cell(row=row_idx, column=index).font = HEADER_FONT
+            raw.cell(row=row_idx, column=index).fill = HEADER_FILL
+        row_idx += 1
+        height = max(len((source_visual or {}).get("data", {}).get("rows", [])), len((target_visual or {}).get("data", {}).get("rows", [])))
+        for data_row in range(height):
+            for index, value in enumerate(((source_visual or {}).get("data", {}).get("rows", []) or [[]])[data_row] if data_row < len((source_visual or {}).get("data", {}).get("rows", [])) else [], start=1):
+                _style_cell(raw.cell(row=row_idx, column=index, value=value))
+            for index, value in enumerate(((target_visual or {}).get("data", {}).get("rows", []) or [[]])[data_row] if data_row < len((target_visual or {}).get("data", {}).get("rows", [])) else [], start=target_start):
+                _style_cell(raw.cell(row=row_idx, column=index, value=value))
+            row_idx += 1
+        row_idx += 2
+    _auto_fit(raw)
 
     cells = wb.create_sheet("Visual Data Comparison")
     _format_header(cells, ["Visual", "Row Number", "Column", "Source Value", "Target Value", "Status"])
@@ -1366,6 +1462,23 @@ def _create_visual_data_sheets(wb, visual_data):
                 cells.cell(row=row_idx, column=col_idx).fill = PatternFill(fill_type="solid", fgColor="FCE4D6")
     _auto_fit(cells)
     return comparison
+
+
+def _create_slicer_test_sheet(wb, scenarios):
+    """Record the matched-slicer run and its visual comparison result."""
+    if not scenarios:
+        return
+    ws = wb.create_sheet("Slicer Test")
+    _format_header(ws, ["Slicer", "Selected Value", "Source Applied", "Target Applied", "Visual", "Status", "Matching Cells", "Different Cells", "AI Analysis Error"])
+    row = 2
+    for scenario in scenarios:
+        visual_results = scenario.get("visual_comparison") or [{}]
+        for visual in visual_results:
+            values = [scenario.get("slicer"), scenario.get("value"), scenario.get("source_applied"), scenario.get("target_applied"), visual.get("visual"), visual.get("status", scenario.get("status", "completed")), visual.get("matched_cells"), visual.get("mismatched_cells"), scenario.get("ai_analysis_error")]
+            for col_idx, value in enumerate(values, start=1):
+                _style_cell(ws.cell(row=row, column=col_idx, value=value))
+            row += 1
+    _auto_fit(ws)
 
 
 # ---------------------------------------------------------
@@ -1383,6 +1496,7 @@ def export_validation_workbook(
     metrics,
     output_directory,
     visual_data=None,
+    slicer_scenarios=None,
 ):
     """
     Create one Excel workbook for the complete validation run.
@@ -1469,15 +1583,28 @@ def export_validation_workbook(
             kpi_comparison,
         )
 
+        table_comparison = build_visual_data_comparison(visual_data or {})
+        combined_visual_comparison = list(visual_comparison or []) + [
+            {
+                "visual": item.get("visual"),
+                "source": f"{item.get('source_rows', 0)} rows / {item.get('matched_cells', 0)} matching cells",
+                "target": f"{item.get('target_rows', 0)} rows / {item.get('mismatched_cells', 0)} differing cells",
+                "status": item.get("status", "Not Compared"),
+            }
+            for item in table_comparison.get("summary", [])
+        ]
+
         _create_visual_details_sheet(
             wb,
             source_data,
             target_data,
+            visual_comparison,
+            table_comparison,
         )
 
         _create_visual_comparison_sheet(
             wb,
-            visual_comparison,
+            combined_visual_comparison,
         )
 
         _create_browser_metrics_sheet(
@@ -1486,6 +1613,7 @@ def export_validation_workbook(
         )
 
         _create_visual_data_sheets(wb, visual_data)
+        _create_slicer_test_sheet(wb, slicer_scenarios or [])
 
         # -------------------------------------------------
         # Save workbook

@@ -1,6 +1,7 @@
 """Word report for a completed source-versus-target validation run."""
 
 from pathlib import Path
+import logging
 
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -13,6 +14,7 @@ from services.excel_exporter import build_visual_data_comparison
 
 LIGHT_RED = "FCE4D6"
 DARK_RED = "9C0006"
+logger = logging.getLogger(__name__)
 
 
 def _shade(cell, color):
@@ -37,6 +39,14 @@ def _table(document, headers, rows):
         for index, value in enumerate(row):
             cells[index].text = "" if value is None else str(value)
     return table
+
+
+def _status_brief(items, label):
+    """Create a plain-language matching/mismatching synopsis for a report."""
+    total = len(items)
+    matches = sum(1 for item in items if item.get("status") == "Match")
+    differences = total - matches
+    return f"{label}: {matches} matching and {differences} mismatching or missing out of {total} compared item(s)."
 
 
 def generate_validation_document(run_id, executions, comparison, output_directory):
@@ -90,6 +100,7 @@ def generate_validation_document(run_id, executions, comparison, output_director
             (item.get("kpi"), item.get("source"), item.get("target"), item.get("status"))
             for item in comparison.get("kpis", [])
         ])
+        document.add_paragraph(_status_brief(comparison.get("kpis", []), "KPI result"))
 
     visual_comparison = build_visual_data_comparison({"Source": executions[0]["visual_data"], "Target": executions[1]["visual_data"]})
     document.add_heading("Visual Data Analysis", level=1)
@@ -98,7 +109,21 @@ def generate_validation_document(run_id, executions, comparison, output_director
         (item["visual"], item["status"], item["source_rows"], item["target_rows"], item["matched_cells"], item["mismatched_cells"])
         for item in visual_comparison["summary"]
     ])
+    document.add_paragraph(_status_brief(visual_comparison["summary"], "Table and visual result"))
+
+    scenarios = comparison.get("slicer_scenarios", [])
+    if scenarios:
+        document.add_heading("Matched Slicer Test", level=1)
+        document.add_paragraph("The same randomly selected common slicer value was applied to both dashboards before a fresh screenshot and AI analysis were captured.")
+        _table(document, ["Slicer", "Value", "Applied to Source", "Applied to Target", "Result"], [
+            (item.get("slicer"), item.get("value"), item.get("source_applied"), item.get("target_applied"), item.get("status", "completed"))
+            for item in scenarios
+        ])
+        for item in scenarios:
+            if item.get("visual_comparison"):
+                document.add_paragraph(_status_brief(item["visual_comparison"], f"Slicer test ({item.get('value')})"))
 
     path = output_directory / f"{run_id}_dashboard_validation.docx"
     document.save(path)
+    logger.info("Word validation report generated | %s", path)
     return path

@@ -29,7 +29,7 @@ from dotenv import load_dotenv
 # ---------------------------------------------------------------------------
 # Gemini Configuration
 # ---------------------------------------------------------------------------
-GEMINI_MODEL = "gemini-3.5-flash"
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 
 def initialize_gemini():
 
@@ -70,7 +70,9 @@ def initialize_gemini():
         raise
 
 
-client = initialize_gemini()
+# Initialise only when extraction is requested.  This lets the browser/DOME
+# collector and its table comparison complete even if an API key is absent.
+client = None
 
 #updated metadata for refreshdate, pagennumber and pagename
 class Metadata(BaseModel):
@@ -259,6 +261,8 @@ def extract_dashboard_json(image_path: Path) -> dict:
     Extract structured dashboard information from an image
     using Gemini.
     """
+
+    global client
 
     logger.info(
         "Starting dashboard extraction: %s",
@@ -458,6 +462,17 @@ def extract_dashboard_json(image_path: Path) -> dict:
         KPI EXTRACTION
         ==========================================================
 
+        Identify EVERY visible KPI card before extracting any charts. A KPI
+        card is a compact label/value visual such as "Total Sales 1,250" or a
+        card with a prior value/variance; it is not an axis label, legend,
+        tooltip, table cell, chart title, navigation control, or slicer value.
+
+        Work left-to-right and top-to-bottom. First count the KPI cards and
+        then return one kpi_cards object per card. Keep the label and value
+        paired from the same card. If a value cannot be read sharply, leave it
+        null rather than borrowing a nearby chart value. Preserve display
+        punctuation, currency symbols, percentage symbols, and suffixes.
+
         Identify visible KPI cards and extract:
 
         - KPI name
@@ -507,6 +522,8 @@ def extract_dashboard_json(image_path: Path) -> dict:
                     GEMINI_MODEL,
                 )
 
+                if client is None:
+                    client = initialize_gemini()
                 response = client.models.generate_content(
                     model=GEMINI_MODEL,
                     contents=[
@@ -770,6 +787,40 @@ def compare_filters(
             for f in target_filters
             if f.get("filter_name")
         }
+
+        # Dashboards may rename a parameter control (for example, a visual
+        # title can become "Table 1 View By") while exposing exactly the same
+        # selectable options.  Match those controls by a normalized option
+        # fingerprint only when there is one unambiguous candidate.  This is
+        # deliberately not based on dashboard-specific names.
+        def option_fingerprint(filter_data):
+            return frozenset(
+                " ".join(str(value).casefold().split())
+                for value in filter_data.get("available_values", [])
+                if str(value).strip()
+            )
+
+        source_only = [name for name in source_map if name not in target_map]
+        target_only = [name for name in target_map if name not in source_map]
+        for source_name in source_only:
+            source_filter = source_map[source_name]
+            fingerprint = option_fingerprint(source_filter)
+            candidates = [
+                target_name for target_name in target_only
+                if fingerprint
+                and fingerprint == option_fingerprint(target_map[target_name])
+                and str(source_filter.get("filter_type", "")).casefold()
+                == str(target_map[target_name].get("filter_type", "")).casefold()
+            ]
+            if len(candidates) == 1:
+                target_name = candidates[0]
+                target_map[source_name] = target_map.pop(target_name)
+                target_only.remove(target_name)
+                logger.info(
+                    "Matched renamed filter by options | source=%s | target=%s",
+                    source_name,
+                    target_name,
+                )
 
         results = []
 
