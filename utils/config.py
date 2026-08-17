@@ -71,6 +71,17 @@ RENDER_WAIT = int(
 )
 
 # --------------------------------------------------
+# Table comparison config (Jagruthi: pandas table diff key strategy)
+# --------------------------------------------------
+
+TABLE_COMPARE_KEY_STRATEGY = os.getenv("TABLE_COMPARE_KEY_STRATEGY", "auto")
+TABLE_COMPARE_KEY_COLUMNS = [
+    column.strip()
+    for column in os.getenv("TABLE_COMPARE_KEY_COLUMNS", "").split(",")
+    if column.strip()
+]
+
+# --------------------------------------------------
 # Storage
 # --------------------------------------------------
 

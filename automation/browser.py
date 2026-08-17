@@ -6,7 +6,13 @@ Responsible for:
 2. Launching an Edge profile
 3. Validating whether the profile has Power BI access
 4. Returning the first working profile
+
+Jagruthi — features:
+- Dashboard stability wait until loading placeholders clear
+- Safer signature polling via page.evaluate (not evaluate_all)
 """
+import logging
+
 from playwright.async_api import async_playwright
 
 from utils.config import (
@@ -15,15 +21,12 @@ from utils.config import (
     PAGE_TIMEOUT,
     EDGE_USER_DATA,
     RENDER_WAIT,
+    PROFILE_DIR,
 )
-import logging
+
 
 logger = logging.getLogger(__name__)
-logger = logging.getLogger(__name__)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
+
 
 def find_edge_profiles():
     """
@@ -57,7 +60,7 @@ def find_edge_profiles():
         return sorted(profiles)
 
     except Exception as e:
-        logger.exception(f"Error while finding Edge profiles: {e}")
+        print(f"Error while finding Edge profiles: {e}")
         raise
 
 
@@ -99,7 +102,7 @@ async def launch_profile(profile_path):
         return playwright, context, page
 
     except Exception as e:
-        logger.exception(f"Error launching profile '{profile_path}': {e}")
+        print(f"Error launching profile '{profile_path}': {e}")
         raise
 
 
@@ -119,73 +122,114 @@ async def wait_for_dashboard(page):
             timeout=PAGE_TIMEOUT,
         )
 
-        # Allow any remaining animations or visual rendering to complete.
-        await page.wait_for_timeout(RENDER_WAIT)
+        # Power BI often creates the visual containers before their data is
+        # painted.  A fixed sleep captured loading placeholders and led to
+        # duplicate/partial visual extraction.  Require a quiet, non-loading
+        # interval before the screenshot and DOM collection begin.
+        # Jagruthi: wait until loading placeholders clear, not only DOM text stability.
+        stable_samples = 0
+        previous_signature = None
+        for _ in range(max(6, RENDER_WAIT // 500)):
+            signature = await page.evaluate(
+                """() => [...document.querySelectorAll('.visualContainer')]
+                    .map(node => (node.innerText || '').trim())
+                    .filter(Boolean)
+                    .join('\\n')
+                    .slice(0, 50000)"""
+            )
+            loading_count = await page.locator(
+                ".loading, [aria-label*='loading' i], [aria-busy='true']"
+            ).count()
+            has_loading_placeholder = await page.evaluate(
+                """() => [...document.querySelectorAll('.visualContainer')].some(node =>
+                    /\\bvisuals?\\s+are\\s+loading\\b/i.test((node.innerText || '').trim())
+                    || /\\bvisuals?\\s+are\\s+loading\\b/i.test(
+                        (node.querySelector('.visualTitle, [class*="visualTitle"]')?.innerText || '').trim()
+                    ))"""
+            )
+            if (
+                signature == previous_signature
+                and loading_count == 0
+                and not has_loading_placeholder
+            ):
+                stable_samples += 1
+                if stable_samples >= 3:
+                    logger.info("Dashboard visuals are ready for extraction")
+                    return
+            else:
+                stable_samples = 0
+            previous_signature = signature
+            await page.wait_for_timeout(500)
+
+        logger.warning("Dashboard did not reach a fully stable state; continuing after timeout")
 
     except Exception as e:
-        logger.exception(f"Error while waiting for dashboard to render: {e}")
+        print(f"Error while waiting for dashboard to render: {e}")
         raise
 
-    # await page.wait_for_function("""
-    # () => {
-    #     return document.querySelectorAll(".visualContainer").length > 0;
-    # }
-    # """)
-    # # Allow any remaining animations or visual rendering to complete.
-    # await page.wait_for_timeout(RENDER_WAIT)
 
 async def launch_browser():
     """
-    Launch a Microsoft Edge browser using the first available
-    working profile.
+    Launch Microsoft Edge using the first available profile.
 
     Returns
     -------
-    (playwright, context, page)
+    tuple
+        (playwright, context, page)
     """
 
     profiles = find_edge_profiles()
+
     if not profiles:
         raise RuntimeError("No Edge profiles found.")
 
-    logger.info("\nDetected Edge profiles:")
+    print("\nDetected Edge profiles:")
 
-    for p in profiles:
-        logger.info(f"  - '{p.name}'")
-    logger.info(f"\nFound {len(profiles)} Edge profile(s).\n")
+    for profile in profiles:
+        print(f"  - {profile.name}")
 
-    # Tries default first, then the remaining profiles.
+    print(f"\nFound {len(profiles)} Edge profile(s).\n")
+
+    # Try Default profile first, then the remaining profiles.
     ordered_profiles = sorted(
         profiles,
-        key=lambda p: p.name != "Default"
+        key=lambda profile: profile.name != "Default"
     )
 
     for profile in ordered_profiles:
-
-        logger.info(f"Trying profile: {profile.name}")
 
         playwright = None
         context = None
 
         try:
+            print(f"Trying profile: {profile.name}")
+
             playwright, context, page = await launch_profile(profile)
 
+            print(f"Using profile: {profile.name}")
 
-            logger.info(f"Using profile: {profile.name}")
+            return (
+                playwright,
+                context,
+                page,
+            )
 
-            return playwright, context, page
+        except Exception as error:
 
-        except Exception as e:
-            logger.exception(f"✗ {profile.name} failed: {e}")
+            print(
+                f"✗ Failed to launch '{profile.name}': {error}"
+            )
 
             try:
                 if context:
                     await context.close()
+
                 if playwright:
                     await playwright.stop()
-            except Exception as cleanup_error:
-                logger.exception(f"Error cleaning up profile '{profile.name}': {cleanup_error}")
+
+            except Exception:
+                pass
 
     raise RuntimeError(
-        "No Edge profile could open the dashboard."
+        "Unable to launch Microsoft Edge using any available profile."
     )

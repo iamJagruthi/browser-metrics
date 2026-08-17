@@ -1,6 +1,7 @@
 import json
 import os
 import logging
+import re
 import time
 from pathlib import Path
 from typing import List, Optional
@@ -25,11 +26,91 @@ if not logger.handlers:
 
 from dotenv import load_dotenv
 
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(_PROJECT_ROOT / ".env")
+load_dotenv(_PROJECT_ROOT / "ai" / ".env")
 
 # ---------------------------------------------------------------------------
-# Gemini Configuration
+# Gemini Configuration (Jagruthi: gemini-3.5 default, deprecated aliases, 503 fallbacks)
 # ---------------------------------------------------------------------------
-GEMINI_MODEL = "gemini-3.5-flash"
+_DEPRECATED_MODEL_ALIASES = {
+    "gemini-2.0-flash": "gemini-3.5-flash",
+    "gemini-2.0-flash-lite": "gemini-3.5-flash-lite",
+    "gemini-2.5-flash": "gemini-3.5-flash",
+    "gemini-2.5-flash-lite": "gemini-3.5-flash-lite",
+    "gemini-1.5-flash": "gemini-3.5-flash-lite",
+    "gemini-1.5-flash-latest": "gemini-3.5-flash-lite",
+    "gemini-1.5-pro": "gemini-3.5-flash",
+}
+
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+GEMINI_MODEL_FALLBACKS = [
+    model.strip()
+    for model in os.getenv(
+        "GEMINI_MODEL_FALLBACKS",
+        "gemini-3.5-flash-lite,gemini-3.6-flash",
+    ).split(",")
+    if model.strip()
+]
+
+
+def _normalize_gemini_model(model_name: str) -> str:
+    return _DEPRECATED_MODEL_ALIASES.get(model_name.strip(), model_name.strip())
+
+
+def _gemini_models_to_try() -> list[str]:
+    models: list[str] = []
+    for raw_name in [GEMINI_MODEL, *GEMINI_MODEL_FALLBACKS]:
+        name = _normalize_gemini_model(raw_name)
+        if name and name not in models:
+            models.append(name)
+    return models
+
+
+def _parse_retry_delay_seconds(error: Exception) -> float | None:
+    candidates = [str(error)]
+    response_json = getattr(error, "response_json", None)
+    if isinstance(response_json, dict):
+        candidates.append(str(response_json))
+        details = response_json.get("error", {}).get("details", [])
+        for detail in details:
+            if isinstance(detail, dict) and "retryDelay" in detail:
+                candidates.append(str(detail.get("retryDelay", "")))
+    for message in candidates:
+        match = re.search(r"retry in ([\d.]+)s", message, re.IGNORECASE)
+        if match:
+            return float(match.group(1)) + 1.0
+        match = re.search(r'"retryDelay":\s*"(\d+)s"', message)
+        if match:
+            return float(match.group(1)) + 1.0
+    return None
+
+
+def _is_model_not_found(error: Exception) -> bool:
+    message = str(error).casefold()
+    return "404" in message or "not_found" in message or "is not found" in message
+
+
+def _should_try_fallback_model(error: Exception) -> bool:
+    message = str(error).casefold()
+    return (
+        _is_model_not_found(error)
+        or "503" in message
+        or "unavailable" in message
+        or "resource_exhausted" in message
+        or "429" in message
+    )
+
+
+def _suggested_model_from_error(error: Exception) -> str | None:
+    match = re.search(
+        r"(?:use models/|update your code to use models/)([a-z0-9._-]+)",
+        str(error),
+        re.IGNORECASE,
+    )
+    if match:
+        return _normalize_gemini_model(match.group(1))
+    return None
 
 def initialize_gemini():
 
@@ -70,7 +151,9 @@ def initialize_gemini():
         raise
 
 
-client = initialize_gemini()
+# Initialise only when extraction is requested.  This lets the browser/DOME
+# collector and its table comparison complete even if an API key is absent.
+client = None
 
 #updated metadata for refreshdate, pagennumber and pagename
 class Metadata(BaseModel):
@@ -259,6 +342,8 @@ def extract_dashboard_json(image_path: Path) -> dict:
     Extract structured dashboard information from an image
     using Gemini.
     """
+
+    global client
 
     logger.info(
         "Starting dashboard extraction: %s",
@@ -458,6 +543,17 @@ def extract_dashboard_json(image_path: Path) -> dict:
         KPI EXTRACTION
         ==========================================================
 
+        Identify EVERY visible KPI card before extracting any charts. A KPI
+        card is a compact label/value visual such as "Total Sales 1,250" or a
+        card with a prior value/variance; it is not an axis label, legend,
+        tooltip, table cell, chart title, navigation control, or slicer value.
+
+        Work left-to-right and top-to-bottom. First count the KPI cards and
+        then return one kpi_cards object per card. Keep the label and value
+        paired from the same card. If a value cannot be read sharply, leave it
+        null rather than borrowing a nearby chart value. Preserve display
+        punctuation, currency symbols, percentage symbols, and suffixes.
+
         Identify visible KPI cards and extract:
 
         - KPI name
@@ -495,67 +591,96 @@ def extract_dashboard_json(image_path: Path) -> dict:
         )
 
         max_attempts = 3
+        models = _gemini_models_to_try()
+        response = None
+        logger.info("Gemini models to try | models=%s", models)
 
-        for attempt in range(1, max_attempts + 1):
-
-            try:
-
-                logger.info(
-                    "Gemini API attempt %d/%d | model=%s",
-                    attempt,
-                    max_attempts,
-                    GEMINI_MODEL,
-                )
-
-                response = client.models.generate_content(
-                    model=GEMINI_MODEL,
-                    contents=[
-                        types.Part.from_bytes(
-                            data=image_bytes,
-                            mime_type="image/png",
-                        ),
-                        prompt,
-                    ],
-                    config=types.GenerateContentConfig(
-                        temperature=0,
-                        response_mime_type="application/json",
-                        response_schema=DashboardExtraction,
-                    ),
-                )
-
-                logger.info(
-                    "Gemini response received successfully | attempt=%d",
-                    attempt,
-                )
-
-                break
-
-            except Exception as e:
-
-                logger.warning(
-                    "Gemini API attempt %d/%d failed | %s",
-                    attempt,
-                    max_attempts,
-                    e,
-                )
-
-                if attempt == max_attempts:
-
-                    logger.exception(
-                        "Gemini API failed after %d attempts",
+        model_index = 0
+        while model_index < len(models):
+            model_name = models[model_index]
+            model_succeeded = False
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    logger.info(
+                        "Gemini API attempt %d/%d | model=%s",
+                        attempt,
                         max_attempts,
+                        model_name,
                     )
 
-                    raise
+                    if client is None:
+                        client = initialize_gemini()
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=[
+                            types.Part.from_bytes(
+                                data=image_bytes,
+                                mime_type="image/png",
+                            ),
+                            prompt,
+                        ],
+                        config=types.GenerateContentConfig(
+                            temperature=0,
+                            response_mime_type="application/json",
+                            response_schema=DashboardExtraction,
+                        ),
+                    )
 
-                wait_seconds = 5 * attempt
+                    logger.info(
+                        "Gemini response received successfully | model=%s | attempt=%d",
+                        model_name,
+                        attempt,
+                    )
+                    model_succeeded = True
+                    break
 
-                logger.info(
-                    "Waiting %d seconds before Gemini retry",
-                    wait_seconds,
-                )
+                except Exception as e:
+                    logger.warning(
+                        "Gemini API attempt %d/%d failed | model=%s | %s",
+                        attempt,
+                        max_attempts,
+                        model_name,
+                        e,
+                    )
 
-                time.sleep(wait_seconds)
+                    if _is_model_not_found(e):
+                        suggested = _suggested_model_from_error(e)
+                        if suggested and suggested not in models:
+                            logger.warning(
+                                "Gemini suggested alternate model | model=%s",
+                                suggested,
+                            )
+                            models.append(suggested)
+                        break
+
+                    retry_delay = _parse_retry_delay_seconds(e)
+                    if attempt < max_attempts and not _should_try_fallback_model(e):
+                        wait_seconds = retry_delay or (5 * attempt)
+                        logger.info(
+                            "Waiting %.1f seconds before Gemini retry",
+                            wait_seconds,
+                        )
+                        time.sleep(wait_seconds)
+                    elif model_index < len(models) - 1 and _should_try_fallback_model(e):
+                        logger.warning(
+                            "Gemini request failed for model=%s; trying fallback model",
+                            model_name,
+                        )
+                        break
+                    else:
+                        logger.exception(
+                            "Gemini API failed after %d attempts on model=%s",
+                            max_attempts,
+                            model_name,
+                        )
+                        raise
+
+            if model_succeeded:
+                break
+            model_index += 1
+
+        if response is None:
+            raise RuntimeError("Gemini API failed on all configured models")
         
         # --------------------------------------------------
         # Validate Gemini Response
@@ -718,6 +843,7 @@ def build_dashboard_summary(extracted_data: dict) -> dict:
 
         raise
 #Filter Comparison
+# Jagruthi: case-insensitive filter name matching for source vs target dashboards.
 def compare_filters(
     source_data: dict,
     target_data: dict
@@ -755,21 +881,58 @@ def compare_filters(
             len(target_filters)
         )
 
+        def _normalize_filter_name(name: str) -> str:
+            return " ".join(str(name).casefold().split())
+
         # --------------------------------------------------
-        # Create lookup maps using filter names
+        # Create lookup maps using normalized filter names
         # --------------------------------------------------
 
         source_map = {
-            f.get("filter_name"): f
+            _normalize_filter_name(f.get("filter_name")): f
             for f in source_filters
             if f.get("filter_name")
         }
 
         target_map = {
-            f.get("filter_name"): f
+            _normalize_filter_name(f.get("filter_name")): f
             for f in target_filters
             if f.get("filter_name")
         }
+
+        # Dashboards may rename a parameter control (for example, a visual
+        # title can become "Table 1 View By") while exposing exactly the same
+        # selectable options.  Match those controls by a normalized option
+        # fingerprint only when there is one unambiguous candidate.  This is
+        # deliberately not based on dashboard-specific names.
+        def option_fingerprint(filter_data):
+            return frozenset(
+                " ".join(str(value).casefold().split())
+                for value in filter_data.get("available_values", [])
+                if str(value).strip()
+            )
+
+        source_only = [name for name in source_map if name not in target_map]
+        target_only = [name for name in target_map if name not in source_map]
+        for source_name in source_only:
+            source_filter = source_map[source_name]
+            fingerprint = option_fingerprint(source_filter)
+            candidates = [
+                target_name for target_name in target_only
+                if fingerprint
+                and fingerprint == option_fingerprint(target_map[target_name])
+                and str(source_filter.get("filter_type", "")).casefold()
+                == str(target_map[target_name].get("filter_type", "")).casefold()
+            ]
+            if len(candidates) == 1:
+                target_name = candidates[0]
+                target_map[source_name] = target_map.pop(target_name)
+                target_only.remove(target_name)
+                logger.info(
+                    "Matched renamed filter by options | source=%s | target=%s",
+                    source_name,
+                    target_name,
+                )
 
         results = []
 
@@ -788,6 +951,11 @@ def compare_filters(
             source = source_map.get(name)
 
             target = target_map.get(name)
+            display_name = (
+                (source or {}).get("filter_name")
+                or (target or {}).get("filter_name")
+                or name
+            )
 
             # ----------------------------------------------
             # Missing in Source
@@ -797,12 +965,12 @@ def compare_filters(
 
                 logger.warning(
                     "Filter '%s' exists only in target",
-                    name
+                    display_name
                 )
 
                 results.append({
 
-                    "filter_name": name,
+                    "filter_name": display_name,
 
                     "source_type": None,
 
@@ -837,12 +1005,12 @@ def compare_filters(
 
                 logger.warning(
                     "Filter '%s' exists only in source",
-                    name
+                    display_name
                 )
 
                 results.append({
 
-                    "filter_name": name,
+                    "filter_name": display_name,
 
                     "source_type": source.get(
                         "filter_type"
@@ -926,7 +1094,7 @@ def compare_filters(
 
             logger.info(
                 "Filter comparison | name=%s | status=%s",
-                name,
+                display_name,
                 status
             )
 
@@ -936,7 +1104,7 @@ def compare_filters(
 
             results.append({
 
-                "filter_name": name,
+                "filter_name": display_name,
 
                 "source_type": source.get(
                     "filter_type"
