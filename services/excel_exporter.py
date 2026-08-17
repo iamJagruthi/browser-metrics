@@ -41,6 +41,7 @@ _BROWSER_METRIC_SECTIONS = [
             "timestamp",
             "dashboard_name",
             "dashboard_url",
+            "page_name",
             "page_title",
             "final_url",
             "http_status",
@@ -1696,6 +1697,205 @@ def _create_slicer_test_sheet(wb, scenarios):
 
 
 # ---------------------------------------------------------
+# Jagruthi — Arun multi-page dashboard sheets
+# ---------------------------------------------------------
+
+def _write_table_rows(ws, headers, rows, start_row=2):
+    _format_header(ws, headers)
+    row_number = start_row
+    for row in rows:
+        for col_idx, value in enumerate(row, start=1):
+            cell = ws.cell(row=row_number, column=col_idx, value=value)
+            _style_cell(cell)
+        row_number += 1
+    _auto_fit(ws)
+    return row_number
+
+
+def _create_page_comparison_sheet(wb, page_comparisons):
+    """Jagruthi — per-page source vs target comparison summary (Arun multi-page)."""
+    if not page_comparisons:
+        return
+
+    logger.info("Creating Page Comparison worksheet")
+    ws = wb.create_sheet("Page Comparison")
+    headers = [
+        "Page Name",
+        "Status",
+        "Overall Match %",
+        "Filter Match %",
+        "KPI Match %",
+        "Visual Match %",
+    ]
+    rows = []
+    for item in page_comparisons:
+        summary = item.get("summary") or {}
+        rows.append(
+            (
+                item.get("page_name", "N/A"),
+                item.get("status", "N/A"),
+                summary.get("overall_match_percentage", 0),
+                summary.get("filter_match_percentage", 0),
+                summary.get("kpi_match_percentage", 0),
+                summary.get("visual_match_percentage", 0),
+            )
+        )
+    _write_table_rows(ws, headers, rows)
+
+
+def _create_page_inventory_sheet(wb, executions_by_dashboard):
+    """Jagruthi — visual inventory counts per dashboard page (filters, KPIs, charts)."""
+    if not executions_by_dashboard:
+        return
+
+    from services.dashboard_inventory_service import _count_inventory_for_execution
+
+    logger.info("Creating Page Inventory worksheet")
+    ws = wb.create_sheet("Page Inventory")
+    headers = [
+        "Dashboard",
+        "Page Name",
+        "Filter Count",
+        "KPI Count",
+        "Table Count",
+        "Matrix Count",
+        "Chart Count",
+        "Slicer Visuals",
+        "Total Visuals",
+        "Skipped Visuals",
+    ]
+    rows = []
+    for dashboard_executions in executions_by_dashboard:
+        for execution in dashboard_executions:
+            dashboard = execution.get("dashboard") or {}
+            inventory = _count_inventory_for_execution(execution)
+            rows.append(
+                (
+                    dashboard.get("name", "N/A"),
+                    dashboard.get("page_name") or inventory.get("page_name") or "Default",
+                    inventory.get("filter_count", 0),
+                    inventory.get("kpi_count", 0),
+                    inventory.get("table_count", 0),
+                    inventory.get("matrix_count", 0),
+                    inventory.get("chart_count", 0),
+                    inventory.get("slicer_visual_count", 0),
+                    inventory.get("total_visuals", 0),
+                    inventory.get("skipped_visual_count", 0),
+                )
+            )
+    _write_table_rows(ws, headers, rows)
+
+
+def _create_page_kpis_sheet(wb, executions_by_dashboard):
+    """Jagruthi — KPI cards listed per dashboard page."""
+    if not executions_by_dashboard:
+        return
+
+    from services.dashboard_inventory_service import _list_kpis_for_execution
+
+    logger.info("Creating Page KPIs worksheet")
+    ws = wb.create_sheet("Page KPIs")
+    headers = ["Dashboard", "Page Name", "KPI", "Value", "Previous", "Variance", "Source"]
+    rows = []
+    for dashboard_executions in executions_by_dashboard:
+        for execution in dashboard_executions:
+            dashboard = execution.get("dashboard") or {}
+            page_name = dashboard.get("page_name") or "Default"
+            for kpi in _list_kpis_for_execution(execution):
+                rows.append(
+                    (
+                        dashboard.get("name", "N/A"),
+                        page_name,
+                        kpi.get("name"),
+                        kpi.get("value"),
+                        kpi.get("previous_value"),
+                        kpi.get("variance"),
+                        kpi.get("extraction_source"),
+                    )
+                )
+    _write_table_rows(ws, headers, rows)
+
+
+def _create_page_visuals_sheet(wb, executions_by_dashboard):
+    """Jagruthi — DOM + Gemini visuals listed per dashboard page."""
+    if not executions_by_dashboard:
+        return
+
+    from services.dashboard_inventory_service import _list_visuals_for_execution
+
+    logger.info("Creating Page Visuals worksheet")
+    ws = wb.create_sheet("Page Visuals")
+    headers = ["Dashboard", "Page Name", "Visual Title", "Type", "Category", "Slicer", "Source"]
+    rows = []
+    for dashboard_executions in executions_by_dashboard:
+        for execution in dashboard_executions:
+            dashboard = execution.get("dashboard") or {}
+            page_name = dashboard.get("page_name") or "Default"
+            for visual in _list_visuals_for_execution(execution):
+                rows.append(
+                    (
+                        dashboard.get("name", "N/A"),
+                        page_name,
+                        visual.get("title"),
+                        visual.get("visual_type"),
+                        visual.get("category"),
+                        visual.get("is_slicer"),
+                        visual.get("extraction_source", "dom"),
+                    )
+                )
+    _write_table_rows(ws, headers, rows)
+
+
+def _create_page_browser_metrics_sheet(wb, executions_by_dashboard):
+    """Jagruthi — browser metrics for every dashboard page (Arun multi-page runs)."""
+    if not executions_by_dashboard:
+        return
+
+    logger.info("Creating Page Browser Metrics worksheet")
+    ws = wb.create_sheet("Page Browser Metrics")
+    headers = [
+        "Dashboard",
+        "Page Name",
+        "Metric",
+        "Value",
+    ]
+    metric_keys = [
+        key
+        for _, keys in _BROWSER_METRIC_SECTIONS
+        for key in keys
+    ]
+    rows = []
+    for dashboard_executions in executions_by_dashboard:
+        for execution in dashboard_executions:
+            dashboard = execution.get("dashboard") or {}
+            metrics = execution.get("metrics") or {}
+            page_name = dashboard.get("page_name") or metrics.get("page_name") or "Default"
+            for key in metric_keys:
+                if key not in metrics:
+                    continue
+                rows.append(
+                    (
+                        dashboard.get("name", "N/A"),
+                        page_name,
+                        key,
+                        _format_metric_value(metrics.get(key)),
+                    )
+                )
+            for key in sorted(metrics):
+                if key in metric_keys or key in {"network_details", "dashboard_name"}:
+                    continue
+                rows.append(
+                    (
+                        dashboard.get("name", "N/A"),
+                        page_name,
+                        key,
+                        _format_metric_value(metrics.get(key)),
+                    )
+                )
+    _write_table_rows(ws, headers, rows)
+
+
+# ---------------------------------------------------------
 # Main Export Function
 # ---------------------------------------------------------
 
@@ -1711,6 +1911,8 @@ def export_validation_workbook(
     output_directory,
     visual_data=None,
     slicer_scenarios=None,
+    page_comparisons=None,
+    executions_by_dashboard=None,
 ):
     """
     Create one Excel workbook for the complete validation run.
@@ -1825,6 +2027,14 @@ def export_validation_workbook(
             wb,
             metrics,
         )
+
+        # Jagruthi — Arun multi-page dashboard data in Excel
+        if page_comparisons or executions_by_dashboard:
+            _create_page_comparison_sheet(wb, page_comparisons or [])
+            _create_page_inventory_sheet(wb, executions_by_dashboard or [])
+            _create_page_kpis_sheet(wb, executions_by_dashboard or [])
+            _create_page_visuals_sheet(wb, executions_by_dashboard or [])
+            _create_page_browser_metrics_sheet(wb, executions_by_dashboard or [])
 
         _create_network_details_sheet(
             wb,

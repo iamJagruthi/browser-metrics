@@ -7,8 +7,11 @@ worksheet (plus optional network detail sheets).
 """
 
 from datetime import datetime
+import logging
 import uuid
 
+
+logger = logging.getLogger(__name__)
 
 _TIMER_FIELD_MAP = {
     "browser_launch": "browser_launch_seconds",
@@ -85,8 +88,13 @@ def build_metrics(
                 "page_errors": network_details.get("page_errors", []),
             }
 
+        logger.debug(
+            "Metrics built | dashboard=%s | page_load=%s",
+            dashboard_name,
+            metrics.get("page_load_seconds"),
+        )
         return metrics
 
-    except Exception as e:
-        print(f"Error building metrics for '{dashboard_name}': {e}")
+    except Exception:
+        logger.exception("Failed to build metrics | dashboard=%s", dashboard_name)
         raise

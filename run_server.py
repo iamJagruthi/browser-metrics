@@ -29,6 +29,8 @@ import logging
 import sys
 
 import uvicorn
+
+from api.logging_config import setup_logging
 from server import app  # Re-export the FastAPI application as the frontend/backend bridge.
 
 
@@ -36,6 +38,7 @@ logger = logging.getLogger(__name__)
 
 
 async def run():
+    setup_logging()
     config = uvicorn.Config(
         app,
         host="127.0.0.1",
@@ -43,6 +46,7 @@ async def run():
         log_level="info",
     )
     server = uvicorn.Server(config)
+    logger.info("Starting Browser Metrics Validator API on http://127.0.0.1:8000")
     await server.serve()
 
 

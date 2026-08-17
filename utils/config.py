@@ -4,9 +4,14 @@ config.py
 Loads all project configuration from the .env file.
 """
 
+import logging
 import os
 from pathlib import Path
+
 from dotenv import load_dotenv
+
+
+logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -14,7 +19,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # Load .env (project root only)
 # --------------------------------------------------
 
-load_dotenv(PROJECT_ROOT / ".env")
+try:
+    load_dotenv(PROJECT_ROOT / ".env")
+except Exception:
+    logger.exception("Failed to load .env from project root")
 
 OUTPUT_DIR = PROJECT_ROOT / os.getenv(
     "OUTPUT_DIR",
@@ -88,22 +96,18 @@ TABLE_COMPARE_KEY_COLUMNS = [
 # Create Required Directories
 # --------------------------------------------------
 
-OUTPUT_DIR.mkdir(
-    parents=True,
-    exist_ok=True
-)
-
-SCREENSHOT_DIR.mkdir(
-    parents=True,
-    exist_ok=True
-)
+try:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    logger.exception("Failed to create output directories")
 
 REPORT_DIR = PROJECT_ROOT / os.getenv(
     "REPORT_DIR",
     "output/reports"
 )
 
-REPORT_DIR.mkdir(
-    parents=True,
-    exist_ok=True
-)
+try:
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    logger.exception("Failed to create report directory | path=%s", REPORT_DIR)

@@ -11,7 +11,9 @@ from .performance import PerformanceTimer
 from .metrics import build_metrics
 from services.dashboard_inventory_service import (
     build_inventory_api_payload,
+    build_pages_showcase_payload,
     save_inventory_snapshot,
+    save_pages_snapshot,
 )
 from services.filter_service import build_filters_api_payload, save_filters_snapshot
 from services.visual_data_exporter import apply_slicer_value, extract_filter_data, extract_visual_data
@@ -470,6 +472,8 @@ class DashboardValidator:
                 run_id,
                 report_executions,
                 comparison,
+                executions_by_dashboard=executions_by_dashboard,
+                multi_page_mode=multi_page_mode,
             )
 
             public_executions = [
@@ -488,6 +492,22 @@ class DashboardValidator:
             )
             inventory_payload = build_inventory_api_payload(
                 public_executions,
+                run_id=run_id,
+            )
+            public_groups = [
+                [
+                    {
+                        key: value
+                        for key, value in item.items()
+                        if key != "_page"
+                    }
+                    for item in group
+                ]
+                for group in executions_by_dashboard
+            ]
+            pages_payload = build_pages_showcase_payload(
+                public_executions,
+                executions_by_dashboard=public_groups,
                 run_id=run_id,
             )
 
@@ -561,9 +581,11 @@ class DashboardValidator:
                     ),
                     "filters": f"/api/reports/{run_id}/filters",
                     "inventory": f"/api/reports/{run_id}/inventory",
+                    "pages": f"/api/reports/{run_id}/pages",
                 },
                 "filters": filters_payload,
                 "inventory": inventory_payload,
+                "pages": pages_payload,
                 "llm_results": llm_results,
                 "filter_state": filter_state,
             }
@@ -823,11 +845,23 @@ class DashboardValidator:
         run_id,
         executions,
         comparison,
+        executions_by_dashboard=None,
+        multi_page_mode=False,
     ):
         if len(executions) < 2:
             return {}
 
         paths = {}
+        page_comparisons = comparison.get("page_comparisons", [])
+        public_groups = None
+        if executions_by_dashboard:
+            public_groups = [
+                [
+                    {key: value for key, value in item.items() if key != "_page"}
+                    for item in group
+                ]
+                for group in executions_by_dashboard
+            ]
 
         try:
             from services.docx_reporter import (
@@ -839,6 +873,8 @@ class DashboardValidator:
                 executions,
                 comparison,
                 OUTPUT_DIR / "reports",
+                page_comparisons=page_comparisons if multi_page_mode else None,
+                executions_by_dashboard=public_groups,
             )
 
             paths["document"] = str(document)
@@ -887,6 +923,8 @@ class DashboardValidator:
                     "Target": executions[1]["visual_data"],
                 },
                 slicer_scenarios=comparison_payload.get("slicer_scenarios", []),
+                page_comparisons=page_comparisons if multi_page_mode else None,
+                executions_by_dashboard=public_groups,
             )
             paths["excel"] = str(workbook)
         except Exception as exc:
@@ -911,6 +949,13 @@ class DashboardValidator:
             )
             save_inventory_snapshot(run_id, inventory_payload, OUTPUT_DIR / "reports")
             paths["inventory"] = str(OUTPUT_DIR / "reports" / f"{run_id}_inventory.json")
+            pages_payload = build_pages_showcase_payload(
+                public_executions,
+                executions_by_dashboard=public_groups,
+                run_id=run_id,
+            )
+            save_pages_snapshot(run_id, pages_payload, OUTPUT_DIR / "reports")
+            paths["pages"] = str(OUTPUT_DIR / "reports" / f"{run_id}_pages.json")
         except Exception:
             logger.exception("Filter/inventory snapshot save failed | run_id=%s", run_id)
 
@@ -1329,6 +1374,110 @@ class DashboardValidator:
     async def run_inventory_probe(self, links):
         executions = await self._probe_dashboard_executions(links)
         return build_inventory_api_payload(executions, run_id=None)
+
+    async def run_pages_probe(self, links):
+        """Jagruthi — lightweight multi-page showcase (page names, KPIs, visuals, inventory)."""
+        executions, executions_by_dashboard = await self._probe_multi_page_dashboard_executions(links)
+        return build_pages_showcase_payload(
+            executions,
+            executions_by_dashboard=executions_by_dashboard,
+            run_id=None,
+        )
+
+    async def _probe_multi_page_dashboard_executions(self, links):
+        """Jagruthi — visit every report page and collect DOM visual inventory."""
+        executions = []
+        executions_by_dashboard = []
+        resources = []
+        if not links:
+            return executions, executions_by_dashboard
+        try:
+            playwright, context, first_page = await launch_browser()
+            resources.append((playwright, context))
+            for index, dashboard in enumerate(links):
+                page = first_page if index == 0 else await context.new_page()
+                dashboard_executions = []
+                try:
+                    await page.goto(
+                        dashboard["url"],
+                        wait_until="domcontentloaded",
+                        timeout=PAGE_TIMEOUT,
+                    )
+                    await wait_for_dashboard(page)
+                    pages = await self.get_dashboard_pages(page)
+                    page_items = pages if len(pages) > 1 else [{"name": "Default", "selected": True}]
+                    for page_info in page_items:
+                        page_name = page_info["name"]
+                        if not page_info.get("selected"):
+                            await self.navigate_to_page(page, page_name)
+                        visual_data = await extract_visual_data(
+                            page,
+                            attempt_export=False,
+                        )
+                        execution = {
+                            "dashboard": {
+                                **dashboard,
+                                "page_name": page_name,
+                            },
+                            "visual_data": visual_data,
+                            "extraction": {
+                                "status": "skipped",
+                                "data": None,
+                                "error": None,
+                            },
+                        }
+                        dashboard_executions.append(execution)
+                        executions.append(execution)
+                except Exception as exc:
+                    logger.exception(
+                        "Multi-page dashboard probe failed | dashboard=%s",
+                        dashboard.get("name"),
+                    )
+                    failed = {
+                        "dashboard": dashboard,
+                        "visual_data": {
+                            "status": "failed",
+                            "filters": [],
+                            "visuals": [],
+                            "errors": [str(exc)],
+                        },
+                        "extraction": {
+                            "status": "failed",
+                            "data": None,
+                            "error": str(exc),
+                        },
+                    }
+                    dashboard_executions.append(failed)
+                    executions.append(failed)
+                executions_by_dashboard.append(dashboard_executions)
+        except Exception as exc:
+            logger.exception("Unable to launch shared Edge context for multi-page probe")
+            for dashboard in links:
+                failed = {
+                    "dashboard": dashboard,
+                    "visual_data": {
+                        "status": "failed",
+                        "filters": [],
+                        "errors": [str(exc)],
+                    },
+                    "extraction": {
+                        "status": "failed",
+                        "data": None,
+                        "error": str(exc),
+                    },
+                }
+                executions.append(failed)
+                executions_by_dashboard.append([failed])
+        finally:
+            for playwright, context in resources:
+                try:
+                    await context.close()
+                    await playwright.stop()
+                except Exception:
+                    logger.exception(
+                        "Failed to close browser resources after multi-page probe"
+                    )
+        return executions, executions_by_dashboard
 
     async def _probe_dashboard_executions(self, links):
         executions = []

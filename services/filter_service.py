@@ -213,13 +213,17 @@ def build_filters_api_payload(
     comparison_filters: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build the full filters API response for a validation run."""
-    dashboards = [build_dashboard_filters_payload(item) for item in executions]
-    return {
-        "run_id": run_id,
-        "dashboards": dashboards,
-        "comparison": comparison_filters or [],
-        "filter_download_url": f"/api/reports/{run_id}/filters" if run_id else None,
-    }
+    try:
+        dashboards = [build_dashboard_filters_payload(item) for item in executions]
+        return {
+            "run_id": run_id,
+            "dashboards": dashboards,
+            "comparison": comparison_filters or [],
+            "filter_download_url": f"/api/reports/{run_id}/filters" if run_id else None,
+        }
+    except Exception:
+        logger.exception("Failed to build filters API payload")
+        raise
 
 
 def save_filters_snapshot(
@@ -228,15 +232,23 @@ def save_filters_snapshot(
     output_directory: Path,
 ) -> Path:
     """Persist filter payload so GET /api/reports/{run_id}/filters can retrieve it."""
-    output_directory.mkdir(parents=True, exist_ok=True)
-    path = output_directory / f"{run_id}_filters.json"
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    logger.info("Filter snapshot saved | run_id=%s | path=%s", run_id, path)
-    return path
+    try:
+        output_directory.mkdir(parents=True, exist_ok=True)
+        path = output_directory / f"{run_id}_filters.json"
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        logger.info("Filter snapshot saved | run_id=%s | path=%s", run_id, path)
+        return path
+    except Exception:
+        logger.exception("Failed to save filter snapshot | run_id=%s", run_id)
+        raise
 
 
 def load_filters_snapshot(run_id: str, output_directory: Path) -> dict[str, Any] | None:
     path = output_directory / f"{run_id}_filters.json"
     if not path.is_file():
         return None
-    return json.loads(path.read_text(encoding="utf-8"))
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        logger.exception("Failed to load filter snapshot | run_id=%s", run_id)
+        return None

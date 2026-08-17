@@ -4,25 +4,24 @@ browser_service.py
 Service layer for browser automation.
 """
 
+import logging
+
 from automation.browser import launch_browser
 
 
-async def capture_dashboard(dashboard_url):
-    """
-    Launch browser and capture dashboard.
-    """
+logger = logging.getLogger(__name__)
 
+
+async def capture_dashboard(dashboard_url: str) -> dict:
+    """Launch browser and capture dashboard."""
     try:
-        playwright, context, page = await launch_browser(
-            dashboard_url
-        )
-
+        logger.info("Capturing dashboard | url=%s", dashboard_url)
+        playwright, context, page = await launch_browser(dashboard_url)
         return {
             "playwright": playwright,
             "context": context,
-            "page": page
+            "page": page,
         }
-
-    except Exception as e:
-        print(f"Error capturing dashboard '{dashboard_url}': {e}")
+    except Exception:
+        logger.exception("Failed to capture dashboard | url=%s", dashboard_url)
         raise
