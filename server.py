@@ -29,7 +29,6 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Browser Metrics Validator API")
 
-# Allow the Vite dev server to call this API from the browser.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -53,7 +52,6 @@ class FiltersRequest(BaseModel):
 
 
 def _report_path(run_id: str, extension: str) -> Path:
-    """Resolve a generated report without allowing path traversal."""
     if not re.fullmatch(r"[a-f0-9]{32}", run_id):
         raise HTTPException(status_code=400, detail="Invalid validation run ID.")
     path = REPORT_DIR / f"{run_id}_dashboard_validation.{extension}"
@@ -62,23 +60,13 @@ def _report_path(run_id: str, extension: str) -> Path:
     return path
 
 
-def _filters_snapshot_path(run_id: str) -> Path:
-    if not re.fullmatch(r"[a-f0-9]{32}", run_id):
-        raise HTTPException(status_code=400, detail="Invalid validation run ID.")
-    return REPORT_DIR / f"{run_id}_filters.json"
-
-
 @app.get("/api/health")
 async def health():
-    """
-    Simple health check so the frontend can verify the API is up.
-    """
     return {"status": "ok", "service": "browser-metrics-validator"}
 
 
 @app.get("/api/reports/{run_id}")
 async def report_status(run_id: str):
-    """Return frontend-ready report download links for a completed run."""
     if not re.fullmatch(r"[a-f0-9]{32}", run_id):
         raise HTTPException(status_code=400, detail="Invalid validation run ID.")
     return {
@@ -108,10 +96,8 @@ async def download_docx_report(run_id: str):
 
 @app.get("/api/reports/{run_id}/filters")
 async def get_run_filters(run_id: str):
-    """Return available filter values and selected state for a completed validation run."""
-    path = _filters_snapshot_path(run_id)
-    if not path.is_file():
-        raise HTTPException(status_code=404, detail="Filter snapshot is not ready for this run.")
+    if not re.fullmatch(r"[a-f0-9]{32}", run_id):
+        raise HTTPException(status_code=400, detail="Invalid validation run ID.")
     payload = load_filters_snapshot(run_id, REPORT_DIR)
     if payload is None:
         raise HTTPException(status_code=404, detail="Filter snapshot is not ready for this run.")
@@ -120,12 +106,8 @@ async def get_run_filters(run_id: str):
 
 @app.get("/api/reports/{run_id}/inventory")
 async def get_run_inventory(run_id: str):
-    """Return filters (with selected values) and visual inventory counts for a run."""
     if not re.fullmatch(r"[a-f0-9]{32}", run_id):
         raise HTTPException(status_code=400, detail="Invalid validation run ID.")
-    path = REPORT_DIR / f"{run_id}_inventory.json"
-    if not path.is_file():
-        raise HTTPException(status_code=404, detail="Inventory snapshot is not ready for this run.")
     payload = load_inventory_snapshot(run_id, REPORT_DIR)
     if payload is None:
         raise HTTPException(status_code=404, detail="Inventory snapshot is not ready for this run.")
@@ -134,22 +116,16 @@ async def get_run_inventory(run_id: str):
 
 @app.post("/api/inventory")
 async def probe_inventory(request: FiltersRequest):
-    """Collect filters and visual inventory from dashboard URLs without full validation."""
     source_url = request.source_url.strip()
     if not source_url:
         raise HTTPException(status_code=400, detail="source_url is required.")
-
     links = [{"name": "Dashboard A", "url": source_url}]
     target_url = (request.target_url or "").strip()
     if target_url:
         links.append({"name": "Dashboard B", "url": target_url})
-
     try:
         validator = DashboardValidator()
-        logger.info("Inventory probe request received | dashboards=%d", len(links))
-        result = await validator.run_inventory_probe(links)
-        logger.info("Inventory probe completed | dashboards=%d", len(result.get("dashboards", [])))
-        return result
+        return await validator.run_inventory_probe(links)
     except Exception:
         logger.exception("Inventory probe request failed")
         raise HTTPException(status_code=500, detail="Inventory probe failed. Review the server logs for details.")
@@ -157,22 +133,16 @@ async def probe_inventory(request: FiltersRequest):
 
 @app.post("/api/filters")
 async def probe_filters(request: FiltersRequest):
-    """Collect filter state from dashboard URLs without running full validation."""
     source_url = request.source_url.strip()
     if not source_url:
         raise HTTPException(status_code=400, detail="source_url is required.")
-
     links = [{"name": "Dashboard A", "url": source_url}]
     target_url = (request.target_url or "").strip()
     if target_url:
         links.append({"name": "Dashboard B", "url": target_url})
-
     try:
         validator = DashboardValidator()
-        logger.info("Filter probe request received | dashboards=%d", len(links))
-        result = await validator.run_filter_probe(links)
-        logger.info("Filter probe completed | dashboards=%d", len(result.get("dashboards", [])))
-        return result
+        return await validator.run_filter_probe(links)
     except Exception:
         logger.exception("Filter probe request failed")
         raise HTTPException(status_code=500, detail="Filter probe failed. Review the server logs for details.")
@@ -180,20 +150,10 @@ async def probe_filters(request: FiltersRequest):
 
 @app.post("/api/validate")
 async def validate(request: ValidateRequest):
-    """
-    Runs the validator against the two supplied URLs and returns
-    metrics for each dashboard plus the KPI comparison between them.
-    """
-
     if not request.source_url.strip() or not request.target_url.strip():
-        raise HTTPException(
-            status_code=400,
-            detail="Both source_url and target_url are required.",
-        )
-
+        raise HTTPException(status_code=400, detail="Both source_url and target_url are required.")
     try:
         validator = DashboardValidator()
-
         links = [
             {"name": "Dashboard A", "url": request.source_url.strip()},
             {"name": "Dashboard B", "url": request.target_url.strip()},
@@ -202,7 +162,6 @@ async def validate(request: ValidateRequest):
         result = await validator.run_links(links)
         logger.info("Validation completed | run_id=%s", result.get("run_id"))
         return result
-
     except Exception:
         logger.exception("Validation request failed")
         raise HTTPException(status_code=500, detail="Validation failed. Review the server logs for details.")
