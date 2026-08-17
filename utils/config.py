@@ -32,8 +32,15 @@ DASHBOARD_CONFIG = PROJECT_ROOT / os.getenv(
 )
 
 PAGE_TIMEOUT = int(os.getenv("PAGE_TIMEOUT", 120000))
-PAGE_TIMEOUT
-# -----------------------------------
+
+# --------------------------------------------------
+# Matrix / table scroll (Jagruthi: wider matrices need more horizontal steps)
+# --------------------------------------------------
+
+MATRIX_MAX_SCROLL_STEPS = int(os.getenv("MATRIX_MAX_SCROLL_STEPS", "60"))
+SCROLL_STEP_WAIT_MS = int(os.getenv("SCROLL_STEP_WAIT_MS", "350"))
+
+# --------------------------------------------------
 # Browser
 # --------------------------------------------------
 PROFILE_DIR = os.getenv("PROFILE_DIR") or "Profile 7"

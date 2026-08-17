@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from openpyxl import load_workbook
+from utils.config import MATRIX_MAX_SCROLL_STEPS, SCROLL_STEP_WAIT_MS
 
 
 VISUAL_SELECTOR = ".visualContainer, [data-visual-container]"
@@ -83,6 +84,9 @@ class _MatrixCellMerger:
     def row_count(self) -> int:
         return len(self.row_cells)
 
+    def col_count(self) -> int:
+        return len(self.col_order)
+
     def to_table(self) -> tuple[list[str], list[list[str]]]:
         if not self.col_order and not self.row_cells:
             return [], []
@@ -119,11 +123,13 @@ class VisualDataExporter:
         page,
         *,
         download_directory: str | Path | None = None,
-        max_scroll_steps: int = 30,
+        max_scroll_steps: int | None = None,
+        scroll_step_wait_ms: int | None = None,
     ):
         self.page = page
         self.download_directory = Path(download_directory) if download_directory else None
-        self.max_scroll_steps = max_scroll_steps
+        self.max_scroll_steps = max_scroll_steps or MATRIX_MAX_SCROLL_STEPS
+        self.scroll_step_wait_ms = scroll_step_wait_ms or SCROLL_STEP_WAIT_MS
 
     async def extract_dashboard_data(self, *, attempt_export: bool = False) -> dict[str, Any]:
         """Return slicer state, visual metadata, visible/scrollable rows and exports.
@@ -382,14 +388,17 @@ class VisualDataExporter:
                     .filter(Boolean).join(' ');
                 const canScrollY = (el) => el.scrollHeight > el.clientHeight + 2;
                 const canScrollX = (el) => el.scrollWidth > el.clientWidth + 2;
-                const scrollable = [...node.querySelectorAll('*')].some(el => {
-                    const style = getComputedStyle(el);
-                    return canScrollY(el) && /(auto|scroll|hidden)/i.test(style.overflowY);
-                });
-                const horizontallyScrollable = [...node.querySelectorAll('*')].some(el => {
-                    const style = getComputedStyle(el);
-                    return canScrollX(el) && /(auto|scroll|hidden)/i.test(style.overflowX);
-                });
+                const grid = node.querySelector('[role="grid"], [role="table"], .mid-viewport, [class*="scrollRegion" i]');
+                const scrollable = Boolean(grid && canScrollY(grid))
+                    || [...node.querySelectorAll('*')].some(el => {
+                        const style = getComputedStyle(el);
+                        return canScrollY(el) && /(auto|scroll|hidden)/i.test(style.overflowY);
+                    });
+                const horizontallyScrollable = Boolean(grid && canScrollX(grid))
+                    || [...node.querySelectorAll('*')].some(el => {
+                        const style = getComputedStyle(el);
+                        return canScrollX(el) && /(auto|scroll|hidden)/i.test(style.overflowX);
+                    });
                 const exportLabel = [...node.querySelectorAll('button, [role="button"]')]
                     .map(el => `${el.getAttribute('aria-label') || ''} ${el.title || ''} ${el.innerText || ''}`)
                     .some(text => /export data|more options|more/i.test(text));
@@ -413,8 +422,10 @@ class VisualDataExporter:
         rows: list[list[str]] = []
         columns: list[str] = []
         scanned_columns = 0
+        horizontal_steps = 0
+        vertical_steps = 0
         if not metadata.get("is_slicer"):
-            columns, rows, scanned_columns = await self._collect_rows(
+            columns, rows, scanned_columns, horizontal_steps, vertical_steps = await self._collect_rows(
                 locator,
                 metadata.get("scrollable", False),
                 metadata.get("horizontally_scrollable", False),
@@ -437,16 +448,18 @@ class VisualDataExporter:
             "rows": rows,
             "row_count": len(rows),
             "scanned_columns": scanned_columns,
+            "horizontal_scroll_steps": horizontal_steps,
+            "vertical_scroll_steps": vertical_steps,
             "collection_method": "rendered_dom",
         }
         if not metadata.get("is_loading_placeholder"):
             logger.info(
-                "Visual collected | title=%s | rows=%d | cols=%d | vertical_scroll=%s | horizontal_scroll=%s",
+                "Visual collected | title=%s | rows=%d | cols=%d | vertical_steps=%d | horizontal_steps=%d",
                 title,
                 len(rows),
                 len(columns),
-                metadata["scrollable"],
-                metadata["horizontally_scrollable"],
+                vertical_steps,
+                horizontal_steps,
             )
         metadata["export"] = {
             "supported": metadata.pop("export_menu_present"),
@@ -461,12 +474,12 @@ class VisualDataExporter:
         locator,
         scrollable: bool,
         horizontally_scrollable: bool,
-    ) -> tuple[list[str], list[list[str]], int]:
+    ) -> tuple[list[str], list[list[str]], int, int, int]:
         """Collect matrix/table cells with combined vertical and horizontal scrolling.
 
-        Jagruthi: Power BI matrices virtualise both axes.  Cells are merged by
-        aria-rowindex/colindex (or position) so new columns from horizontal
-        scroll extend existing rows instead of creating duplicate partial rows.
+        Jagruthi: Power BI matrices virtualise both axes.  Always attempts a full
+        2D scan (horizontal slices × vertical steps) with wheel/scrollIntoView
+        fallbacks when scrollLeft does not move.
         """
         merger = _MatrixCellMerger()
 
@@ -529,17 +542,31 @@ class VisualDataExporter:
             )
             merger.ingest(payload)
 
+        async def wait_after_scroll() -> None:
+            await self.page.wait_for_timeout(self.scroll_step_wait_ms)
+
         async def reset_axis(axis: str) -> None:
             await locator.evaluate(
                 """(node, axis) => {
                     const isY = axis === 'y';
-                    [...node.querySelectorAll('*')].forEach(el => {
-                        const size = isY ? el.scrollHeight - el.clientHeight : el.scrollWidth - el.clientWidth;
+                    const targets = [
+                        ...node.querySelectorAll(
+                            '[role="grid"], [role="table"], .mid-viewport, [class*="scrollRegion" i], [class*="scrollable-region" i]'
+                        ),
+                        ...node.querySelectorAll('*'),
+                    ];
+                    const seen = new Set();
+                    for (const el of targets) {
+                        if (seen.has(el)) continue;
+                        seen.add(el);
+                        const size = isY
+                            ? el.scrollHeight - el.clientHeight
+                            : el.scrollWidth - el.clientWidth;
                         if (size > 2) {
                             if (isY) el.scrollTop = 0;
                             else el.scrollLeft = 0;
                         }
-                    });
+                    }
                 }""",
                 axis,
             )
@@ -548,68 +575,123 @@ class VisualDataExporter:
             return await locator.evaluate(
                 """(node, axis) => {
                     const isY = axis === 'y';
-                    const candidates = [...node.querySelectorAll('*')].filter(el => {
-                        const delta = isY
-                            ? el.scrollHeight - el.clientHeight
-                            : el.scrollWidth - el.clientWidth;
-                        return delta > 2;
-                    }).sort((a, b) => {
+                    const canScroll = (el) => isY
+                        ? el.scrollHeight > el.clientHeight + 2
+                        : el.scrollWidth > el.clientWidth + 2;
+                    const preferred = [
+                        ...node.querySelectorAll(
+                            '[role="grid"], [role="table"], .mid-viewport, [class*="scrollRegion" i], [class*="scrollable-region" i], [class*="pivotTable" i], [class*="matrix" i]'
+                        ),
+                    ];
+                    const generic = [...node.querySelectorAll('*')].filter(el => canScroll(el));
+                    generic.sort((a, b) => {
                         const aDelta = isY ? a.scrollHeight - a.clientHeight : a.scrollWidth - a.clientWidth;
                         const bDelta = isY ? b.scrollHeight - b.clientHeight : b.scrollWidth - b.clientWidth;
                         return bDelta - aDelta;
                     });
-                    const element = candidates[0];
-                    if (!element) return false;
-                    const before = isY ? element.scrollTop : element.scrollLeft;
-                    const max = isY
-                        ? element.scrollHeight - element.clientHeight
-                        : element.scrollWidth - element.clientWidth;
-                    const step = Math.max((isY ? element.clientHeight : element.clientWidth) * 0.75, 40);
-                    if (isY) {
-                        element.scrollTop = Math.min(element.scrollTop + step, max);
-                    } else {
-                        element.scrollLeft = Math.min(element.scrollLeft + step, max);
+                    const seen = new Set();
+                    const candidates = [];
+                    for (const el of preferred) {
+                        if (!seen.has(el) && canScroll(el)) {
+                            seen.add(el);
+                            candidates.push(el);
+                        }
                     }
-                    element.dispatchEvent(new Event('scroll', { bubbles: true }));
-                    const after = isY ? element.scrollTop : element.scrollLeft;
-                    return after > before + 0.5;
+                    for (const el of generic) {
+                        if (!seen.has(el)) {
+                            seen.add(el);
+                            candidates.push(el);
+                        }
+                    }
+                    const tryElement = (element) => {
+                        const before = isY ? element.scrollTop : element.scrollLeft;
+                        const max = isY
+                            ? element.scrollHeight - element.clientHeight
+                            : element.scrollWidth - element.clientWidth;
+                        const step = Math.max(
+                            (isY ? element.clientHeight : element.clientWidth) * 0.8,
+                            48,
+                        );
+                        if (isY) {
+                            element.scrollTop = Math.min(element.scrollTop + step, max);
+                        } else {
+                            element.scrollLeft = Math.min(element.scrollLeft + step, max);
+                        }
+                        element.dispatchEvent(new Event('scroll', { bubbles: true }));
+                        let after = isY ? element.scrollTop : element.scrollLeft;
+                        if (after > before + 0.5) return true;
+                        if (!isY) {
+                            element.dispatchEvent(new WheelEvent('wheel', {
+                                deltaX: step,
+                                deltaY: 0,
+                                bubbles: true,
+                                cancelable: true,
+                            }));
+                            after = element.scrollLeft;
+                            if (after > before + 0.5) return true;
+                        }
+                        return false;
+                    };
+                    for (const element of candidates) {
+                        if (tryElement(element)) return true;
+                    }
+                    if (!isY) {
+                        const cells = [...node.querySelectorAll('[role="gridcell"], td, th')]
+                            .filter(cell => cell.getBoundingClientRect().width > 0);
+                        if (!cells.length) return false;
+                        const rightCell = cells.reduce((best, cell) => {
+                            const box = cell.getBoundingClientRect();
+                            const bestBox = best.getBoundingClientRect();
+                            return box.right > bestBox.right ? cell : best;
+                        }, cells[0]);
+                        const before = candidates[0]?.scrollLeft ?? 0;
+                        rightCell.scrollIntoView({ block: 'nearest', inline: 'end', behavior: 'instant' });
+                        const after = candidates[0]?.scrollLeft ?? 0;
+                        return after > before + 0.5;
+                    }
+                    return false;
                 }""",
                 axis,
             )
 
-        await snapshot()
         horizontal_moves = 0
         vertical_moves = 0
+        max_steps = self.max_scroll_steps
 
-        for _ in range(self.max_scroll_steps + 1):
+        await reset_axis("x")
+        await reset_axis("y")
+        await snapshot()
+
+        for h_index in range(max_steps + 1):
             await reset_axis("y")
             await snapshot()
 
-            if scrollable or merger.row_count() > 0:
-                for _ in range(self.max_scroll_steps):
+            if scrollable or horizontally_scrollable or merger.row_count() > 0 or merger.col_count() > 0:
+                for _ in range(max_steps):
                     moved = await scroll_axis("y")
                     if not moved:
                         break
                     vertical_moves += 1
-                    await self.page.wait_for_timeout(250)
+                    await wait_after_scroll()
                     await snapshot()
 
-            if not horizontally_scrollable and horizontal_moves == 0:
-                probe = await scroll_axis("x")
-                if probe:
-                    horizontal_moves += 1
-                    horizontally_scrollable = True
-                    await self.page.wait_for_timeout(250)
-                    await reset_axis("y")
-                    await snapshot()
-                    continue
+            if h_index >= max_steps:
                 break
 
+            columns_before = merger.col_count()
             moved_right = await scroll_axis("x")
             if not moved_right:
                 break
             horizontal_moves += 1
-            await self.page.wait_for_timeout(250)
+            await wait_after_scroll()
+            await snapshot()
+
+            if merger.col_count() <= columns_before:
+                logger.info(
+                    "Horizontal scroll stopped | no new columns after step %d",
+                    horizontal_moves,
+                )
+                break
 
         columns, rows = merger.to_table()
         logger.info(
@@ -619,7 +701,7 @@ class VisualDataExporter:
             len(rows),
             len(columns),
         )
-        return columns, rows, len(columns)
+        return columns, rows, len(columns), horizontal_moves, vertical_moves
 
     async def _try_export(self, locator, visual: dict[str, Any], index: int) -> dict[str, Any]:
         export = dict(visual["export"], attempted=True, status="unavailable")
