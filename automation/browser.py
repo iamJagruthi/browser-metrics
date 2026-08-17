@@ -6,6 +6,10 @@ Responsible for:
 2. Launching an Edge profile
 3. Validating whether the profile has Power BI access
 4. Returning the first working profile
+
+Jagruthi — features:
+- Dashboard stability wait until loading placeholders clear
+- Safer signature polling via page.evaluate (not evaluate_all)
 """
 import logging
 
@@ -122,20 +126,35 @@ async def wait_for_dashboard(page):
         # painted.  A fixed sleep captured loading placeholders and led to
         # duplicate/partial visual extraction.  Require a quiet, non-loading
         # interval before the screenshot and DOM collection begin.
+        # Jagruthi: wait until loading placeholders clear, not only DOM text stability.
         stable_samples = 0
         previous_signature = None
-        for _ in range(max(3, RENDER_WAIT // 500)):
-            signature = await page.locator(".visualContainer").evaluate_all(
-                """nodes => nodes.map(node => (node.innerText || '').trim())
-                    .filter(Boolean).join('\\n').slice(0, 50000)"""
+        for _ in range(max(6, RENDER_WAIT // 500)):
+            signature = await page.evaluate(
+                """() => [...document.querySelectorAll('.visualContainer')]
+                    .map(node => (node.innerText || '').trim())
+                    .filter(Boolean)
+                    .join('\\n')
+                    .slice(0, 50000)"""
             )
             loading_count = await page.locator(
                 ".loading, [aria-label*='loading' i], [aria-busy='true']"
             ).count()
-            if signature == previous_signature and loading_count == 0:
+            has_loading_placeholder = await page.evaluate(
+                """() => [...document.querySelectorAll('.visualContainer')].some(node =>
+                    /\\bvisuals?\\s+are\\s+loading\\b/i.test((node.innerText || '').trim())
+                    || /\\bvisuals?\\s+are\\s+loading\\b/i.test(
+                        (node.querySelector('.visualTitle, [class*="visualTitle"]')?.innerText || '').trim()
+                    ))"""
+            )
+            if (
+                signature == previous_signature
+                and loading_count == 0
+                and not has_loading_placeholder
+            ):
                 stable_samples += 1
                 if stable_samples >= 3:
-                    logger.info("Dashboard visuals are stable")
+                    logger.info("Dashboard visuals are ready for extraction")
                     return
             else:
                 stable_samples = 0

@@ -1,8 +1,11 @@
 """Browser-side extraction of Power BI visual data.
 
-This module deliberately does not use Gemini.  It inspects the rendered Power
-BI DOM in the existing Playwright page so callers can retain the current slicer
-state and obtain data that is available to the signed-in browser session.
+Jagruthi — features:
+- Null-safe slicer/filter DOM reads via page.evaluate
+- Loading-placeholder detection and skip during visual scan
+- Slicer vs table separation (button filters are not scraped as tables)
+- DOM KPI card/callout extraction to supplement Gemini
+- Vertical and horizontal 2D matrix scroll with merged column headers (Jagruthi)
 """
 
 from __future__ import annotations
@@ -16,9 +19,11 @@ from pathlib import Path
 from typing import Any
 
 from openpyxl import load_workbook
+from utils.config import MATRIX_MAX_SCROLL_STEPS, SCROLL_STEP_WAIT_MS
 
 
 VISUAL_SELECTOR = ".visualContainer, [data-visual-container]"
+_LOADING_TITLE_RE = re.compile(r"\bvisuals?\s+are\s+loading\b", re.IGNORECASE)
 logger = logging.getLogger(__name__)
 
 
@@ -31,6 +36,85 @@ def _safe_filename(value: str, fallback: str) -> str:
     return value or fallback
 
 
+class _MatrixCellMerger:
+    """Merge matrix cells across vertical and horizontal scroll positions."""
+
+    def __init__(self) -> None:
+        self.header_map: dict[str, str] = {}
+        self.col_order: list[str] = []
+        self.row_cells: dict[str, dict[str, str]] = {}
+
+    @staticmethod
+    def _col_key(item: dict[str, Any]) -> str:
+        colindex = item.get("colindex")
+        if colindex is not None and str(colindex).strip():
+            return f"col:{colindex}"
+        return f"left:{int(round(float(item.get("left", 0)) / 4)) * 4}"
+
+    @staticmethod
+    def _row_key(item: dict[str, Any]) -> str:
+        rowindex = item.get("rowindex")
+        if rowindex is not None and str(rowindex).strip():
+            return f"row:{rowindex}"
+        return f"top:{int(round(float(item.get("top", 0)) / 4)) * 4}"
+
+    def ingest(self, payload: dict[str, Any] | None) -> None:
+        if not payload:
+            return
+        for header in payload.get("headers", []):
+            key = self._col_key(header)
+            if header.get("value"):
+                self.header_map.setdefault(key, header["value"])
+            if key not in self.col_order:
+                self.col_order.append(key)
+        for cell in payload.get("cells", []):
+            if cell.get("role") == "columnheader":
+                key = self._col_key(cell)
+                if cell.get("value"):
+                    self.header_map.setdefault(key, cell["value"])
+                if key not in self.col_order:
+                    self.col_order.append(key)
+                continue
+            row_key = self._row_key(cell)
+            col_key = self._col_key(cell)
+            if col_key not in self.col_order:
+                self.col_order.append(col_key)
+            self.row_cells.setdefault(row_key, {})[col_key] = cell["value"]
+
+    def row_count(self) -> int:
+        return len(self.row_cells)
+
+    def col_count(self) -> int:
+        return len(self.col_order)
+
+    def to_table(self) -> tuple[list[str], list[list[str]]]:
+        if not self.col_order and not self.row_cells:
+            return [], []
+        columns = [
+            self.header_map.get(key) or f"Column {index + 1}"
+            for index, key in enumerate(self.col_order)
+        ]
+
+        def sort_key(key: str) -> tuple[int | str, ...]:
+            if key.startswith("row:"):
+                try:
+                    return (0, int(key.split(":", 1)[1]))
+                except ValueError:
+                    return (1, key)
+            if key.startswith("top:"):
+                try:
+                    return (0, int(key.split(":", 1)[1]))
+                except ValueError:
+                    return (1, key)
+            return (1, key)
+
+        rows = []
+        for row_key in sorted(self.row_cells.keys(), key=sort_key):
+            row_data = self.row_cells[row_key]
+            rows.append([row_data.get(col_key, "") for col_key in self.col_order])
+        return columns, rows
+
+
 class VisualDataExporter:
     """Extract visible visual data without modifying the dashboard's filters."""
 
@@ -39,11 +123,13 @@ class VisualDataExporter:
         page,
         *,
         download_directory: str | Path | None = None,
-        max_scroll_steps: int = 30,
+        max_scroll_steps: int | None = None,
+        scroll_step_wait_ms: int | None = None,
     ):
         self.page = page
         self.download_directory = Path(download_directory) if download_directory else None
-        self.max_scroll_steps = max_scroll_steps
+        self.max_scroll_steps = max_scroll_steps or MATRIX_MAX_SCROLL_STEPS
+        self.scroll_step_wait_ms = scroll_step_wait_ms or SCROLL_STEP_WAIT_MS
 
     async def extract_dashboard_data(self, *, attempt_export: bool = False) -> dict[str, Any]:
         """Return slicer state, visual metadata, visible/scrollable rows and exports.
@@ -56,6 +142,7 @@ class VisualDataExporter:
             "status": "success",
             "extracted_at": datetime.now(timezone.utc).isoformat(),
             "filters": await self._extract_filter_state(),
+            "kpi_cards": await self._extract_kpi_cards(),
             "visuals": [],
             "skipped_visuals": [],
             "errors": [],
@@ -80,13 +167,41 @@ class VisualDataExporter:
                     result["skipped_visuals"].append({"index": index + 1, "reason": "hidden"})
                     continue
                 visual = await self._inspect_visual(locator, index)
-                if visual.pop("is_loading_placeholder", False):
-                    result["skipped_visuals"].append({"index": index + 1, "reason": "Power BI loading placeholder"})
+                # Jagruthi: skip Power BI loading shells before table/slicer handling.
+                if visual.pop("is_loading_placeholder", False) or _LOADING_TITLE_RE.search(
+                    visual.get("title", "")
+                ):
+                    result["skipped_visuals"].append({
+                        "index": index + 1,
+                        "reason": "Power BI loading placeholder",
+                        "title": visual.get("title"),
+                    })
+                    continue
+                if visual.get("is_slicer"):
+                    visual["data"] = {
+                        "columns": [],
+                        "rows": [],
+                        "row_count": 0,
+                        "collection_method": "slicer_skipped",
+                    }
+                    result["skipped_visuals"].append({
+                        "index": index + 1,
+                        "reason": "slicer_or_button_filter",
+                        "title": visual.get("title"),
+                    })
                     continue
                 # Native export is the accuracy fallback for virtualised Power
                 # BI tables/matrices: request it only for visuals that expose
                 # a grid/scrollbar, never for every chart on the page.
-                is_tabular = bool(visual["data"]["columns"] or visual["data"]["rows"] or visual["scrollable"] or visual["horizontally_scrollable"])
+                is_tabular = bool(
+                    visual["data"]["columns"]
+                    or visual["scrollable"]
+                    or visual["horizontally_scrollable"]
+                    or (
+                        visual["data"]["rows"]
+                        and max(len(row) for row in visual["data"]["rows"]) > 1
+                    )
+                )
                 if attempt_export and is_tabular and visual["export"]["supported"]:
                     visual["export"] = await self._try_export(locator, visual, index)
                     if visual["export"].get("status") == "downloaded":
@@ -109,41 +224,100 @@ class VisualDataExporter:
         examine visual containers as well and use their pressed/checked state
         instead of asking Gemini to infer selection from colour.
         """
-        selector = (
-            ".slicerContainer, [aria-label*='Slicer' i], "
-            "[data-visual-type*='slicer' i], " + VISUAL_SELECTOR
-        )
         try:
-            filters = await self.page.locator(selector).evaluate_all(
-                """nodes => nodes.map((node, index) => {
-                    const visual = node.closest('.visualContainer, [data-visual-container]') || node;
-                    const text = item => (item.innerText || item.getAttribute('aria-label') || item.value || '').replace(/\\s+/g, ' ').trim();
-                    const title = text(visual.querySelector('.visualTitle, [class*="visualTitle"], [data-visual-title]'))
-                        || (visual.getAttribute('aria-label') || '').trim()
-                        || (visual.querySelector('[title]')?.getAttribute('title') || '').trim();
-                    const controls = [...node.querySelectorAll('[role="option"], [role="radio"], [role="checkbox"], label, button, input')]
-                        .map(item => ({
-                            value: text(item),
-                            selected: item.matches('input:checked, [aria-selected="true"], [aria-checked="true"], [aria-pressed="true"]')
-                                || /(^|\\s)(selected|active)(\\s|$)/i.test(item.className || ''),
-                        }))
-                        .filter(item => item.value);
-                    const selected = controls.filter(item => item.selected).map(item => item.value);
-                    const values = controls.map(item => item.value);
-                    const hasSlicerMarkup = node.matches('.slicerContainer, [class*="slicer" i], [aria-label*="Slicer" i], [data-visual-type*="slicer" i]')
-                        || visual.matches('[data-visual-type*="slicer" i]');
-                    const hasChoiceControl = controls.some(item => item.value && !/^(more options|focus mode|drill down|expand)$/i.test(item.value));
-                    const looksLikeFilter = hasSlicerMarkup || (title && hasChoiceControl && controls.length >= 2);
-                    return {
-                        id: node.id || `slicer-${index + 1}`,
-                        name: title,
-                        filter_type: controls.some(item => item.selected) ? 'Buttons' : 'Dropdown',
-                        selected_values: [...new Set(selected)],
-                        visible_values: [...new Set(values)].slice(0, 500),
-                        looks_like_filter: looksLikeFilter,
-                        extraction_source: 'dom',
+            # Jagruthi: use page.evaluate with null-safe reads; avoid evaluate_all on broad selectors.
+            filters = await self.page.evaluate(
+                """() => {
+                    const safeText = item => {
+                        if (!item) return '';
+                        return (item.innerText || item.getAttribute('aria-label') || item.value || '')
+                            .replace(/\\s+/g, ' ').trim();
                     };
-                }).filter(item => item.looks_like_filter && item.name)"""
+                    const nodeSelector = '.slicerContainer, [aria-label*="Slicer" i], [data-visual-type*="slicer" i]';
+                    const nodes = [...document.querySelectorAll(nodeSelector)];
+                    if (!nodes.length) {
+                        return [...document.querySelectorAll('.visualContainer, [data-visual-container]')]
+                            .map((visual, index) => {
+                                const controls = [...visual.querySelectorAll(
+                                    '[role="option"], [role="radio"], [role="checkbox"], label, button, input'
+                                )]
+                                    .filter(item => item && !item.disabled)
+                                    .map(item => ({
+                                        value: safeText(item),
+                                        selected: item.matches(
+                                            'input:checked, [aria-selected="true"], [aria-checked="true"], [aria-pressed="true"]'
+                                        ) || /(^|\\s)(selected|active)(\\s|$)/i.test(item.className || ''),
+                                        control_type: item.tagName === 'BUTTON' || item.getAttribute('role') === 'button'
+                                            ? 'button'
+                                            : (item.matches('input[type="radio"], input[type="checkbox"]') ? 'input' : 'option'),
+                                    }))
+                                    .filter(item => item.value);
+                                const title = safeText(
+                                    visual.querySelector('.visualTitle, [class*="visualTitle"], [data-visual-title]')
+                                ) || safeText(visual);
+                                const hasChoiceControl = controls.some(
+                                    item => item.value && !/^(more options|focus mode|drill down|expand)$/i.test(item.value)
+                                );
+                                if (!title || !hasChoiceControl || controls.length < 2) return null;
+                                const selected = controls.filter(item => item.selected).map(item => item.value);
+                                const values = controls.map(item => item.value);
+                                const hasButtons = controls.some(item => item.control_type === 'button');
+                                return {
+                                    id: visual.id || `filter-visual-${index + 1}`,
+                                    name: title,
+                                    filter_type: hasButtons ? 'Buttons' : 'Dropdown',
+                                    selected_values: [...new Set(selected)],
+                                    visible_values: [...new Set(values)].slice(0, 500),
+                                    options: controls,
+                                    looks_like_filter: true,
+                                    extraction_source: 'dom',
+                                };
+                            })
+                            .filter(Boolean);
+                    }
+                    return nodes.map((node, index) => {
+                        const visual = node.closest('.visualContainer, [data-visual-container]') || node;
+                        const title = safeText(
+                            visual.querySelector('.visualTitle, [class*="visualTitle"], [data-visual-title]')
+                        )
+                            || (visual.getAttribute('aria-label') || '').trim()
+                            || safeText(visual.querySelector('[title]'));
+                        const controls = [...node.querySelectorAll(
+                            '[role="option"], [role="radio"], [role="checkbox"], label, button, input'
+                        )]
+                            .filter(item => item && !item.disabled)
+                            .map(item => ({
+                                value: safeText(item),
+                                selected: item.matches(
+                                    'input:checked, [aria-selected="true"], [aria-checked="true"], [aria-pressed="true"]'
+                                ) || /(^|\\s)(selected|active)(\\s|$)/i.test(item.className || ''),
+                                control_type: item.tagName === 'BUTTON' || item.getAttribute('role') === 'button'
+                                    ? 'button'
+                                    : (item.matches('input[type="radio"], input[type="checkbox"]') ? 'input' : 'option'),
+                            }))
+                            .filter(item => item.value);
+                        const selected = controls.filter(item => item.selected).map(item => item.value);
+                        const values = controls.map(item => item.value);
+                        const hasButtons = controls.some(item => item.control_type === 'button');
+                        const hasSlicerMarkup = node.matches(
+                            '.slicerContainer, [class*="slicer" i], [aria-label*="Slicer" i], [data-visual-type*="slicer" i]'
+                        ) || visual.matches('[data-visual-type*="slicer" i]');
+                        const hasChoiceControl = controls.some(
+                            item => item.value && !/^(more options|focus mode|drill down|expand)$/i.test(item.value)
+                        );
+                        const looksLikeFilter = hasSlicerMarkup || (title && hasChoiceControl && controls.length >= 2);
+                        return {
+                            id: node.id || `slicer-${index + 1}`,
+                            name: title,
+                            filter_type: hasButtons ? 'Buttons' : (controls.some(item => item.selected) ? 'Buttons' : 'Dropdown'),
+                            selected_values: [...new Set(selected)],
+                            visible_values: [...new Set(values)].slice(0, 500),
+                            options: controls,
+                            looks_like_filter: looksLikeFilter,
+                            extraction_source: 'dom',
+                        };
+                    }).filter(item => item.looks_like_filter && item.name);
+                }"""
             )
             # The selector can overlap (a slicer is also a visual container).
             # Keep the record with the most actual option/selection evidence,
@@ -161,6 +335,50 @@ class VisualDataExporter:
             logger.exception("Unable to read slicer state")
             return []
 
+    async def _extract_kpi_cards(self) -> list[dict[str, Any]]:
+        """Read compact KPI/card visuals from the DOM when Gemini misses them."""
+        try:
+            return await self.page.evaluate(
+                """() => {
+                    const safeText = item => {
+                        if (!item) return '';
+                        return (item.innerText || item.getAttribute('aria-label') || item.value || '')
+                            .replace(/\\s+/g, ' ').trim();
+                    };
+                    const cards = [];
+                    const visuals = [...document.querySelectorAll('.visualContainer, [data-visual-container]')];
+                    for (const visual of visuals) {
+                        const title = safeText(
+                            visual.querySelector('.visualTitle, [class*="visualTitle"], [data-visual-title]')
+                        ) || safeText(visual.querySelector('[title]'));
+                        const valueNode = visual.querySelector(
+                            '[class*="callout" i] [class*="value" i], [class*="calloutValue" i], [class*="dataLabel" i], [class*="metric" i], [class*="value" i]'
+                        );
+                        const value = safeText(valueNode);
+                        if (!title || !value) continue;
+                        if (/^(more options|focus mode|drill down|expand)$/i.test(title)) continue;
+                        if (!/[\\d%,.$]/i.test(value)) continue;
+                        const typeSource = [
+                            visual.className,
+                            visual.getAttribute('data-visual-type'),
+                            visual.getAttribute('aria-roledescription'),
+                        ].filter(Boolean).join(' ');
+                        if (/slicer|dropdown|button/i.test(typeSource)) continue;
+                        cards.push({
+                            name: title,
+                            value,
+                            previous_value: null,
+                            variance: null,
+                            extraction_source: 'dom',
+                        });
+                    }
+                    return cards;
+                }"""
+            )
+        except Exception:
+            logger.exception("Unable to read DOM KPI cards")
+            return []
+
     async def _inspect_visual(self, locator, index: int) -> dict[str, Any]:
         metadata = await locator.evaluate(
             r"""(node, index) => {
@@ -168,23 +386,32 @@ class VisualDataExporter:
                 const titleNode = node.querySelector('[title], [aria-label], .title, .visualTitle');
                 const typeSource = [node.className, node.getAttribute('data-visual-type'), node.getAttribute('aria-roledescription')]
                     .filter(Boolean).join(' ');
-                const scrollable = [...node.querySelectorAll('*')].some(el => {
-                    const style = getComputedStyle(el);
-                    return /(auto|scroll)/.test(style.overflowY) && el.scrollHeight > el.clientHeight + 2;
-                });
-                const horizontallyScrollable = [...node.querySelectorAll('*')].some(el => {
-                    const style = getComputedStyle(el);
-                    return /(auto|scroll)/.test(style.overflowX) && el.scrollWidth > el.clientWidth + 2;
-                });
+                const canScrollY = (el) => el.scrollHeight > el.clientHeight + 2;
+                const canScrollX = (el) => el.scrollWidth > el.clientWidth + 2;
+                const grid = node.querySelector('[role="grid"], [role="table"], .mid-viewport, [class*="scrollRegion" i]');
+                const scrollable = Boolean(grid && canScrollY(grid))
+                    || [...node.querySelectorAll('*')].some(el => {
+                        const style = getComputedStyle(el);
+                        return canScrollY(el) && /(auto|scroll|hidden)/i.test(style.overflowY);
+                    });
+                const horizontallyScrollable = Boolean(grid && canScrollX(grid))
+                    || [...node.querySelectorAll('*')].some(el => {
+                        const style = getComputedStyle(el);
+                        return canScrollX(el) && /(auto|scroll|hidden)/i.test(style.overflowX);
+                    });
                 const exportLabel = [...node.querySelectorAll('button, [role="button"]')]
                     .map(el => `${el.getAttribute('aria-label') || ''} ${el.title || ''} ${el.innerText || ''}`)
                     .some(text => /export data|more options|more/i.test(text));
+                const isSlicer = /slicer/i.test(typeSource)
+                    || node.matches('.slicerContainer, [class*="slicer" i], [aria-label*="Slicer" i], [data-visual-type*="slicer" i]')
+                    || node.querySelector('.slicerContainer, [class*="slicer" i], [aria-label*="Slicer" i]');
                 return {
                     id: node.getAttribute('data-visual-id') || node.id || `visual-${index + 1}`,
                     title: (titleNode?.getAttribute('title') || titleNode?.getAttribute('aria-label') || '').trim(),
                     visual_type: typeSource || 'unknown',
                     accessible_text: text,
                     is_loading_placeholder: /\bvisuals?\s+are\s+loading\b/i.test(text) || /^loading\.\.\.?$/i.test(text),
+                    is_slicer: Boolean(isSlicer),
                     scrollable,
                     horizontally_scrollable: horizontallyScrollable,
                     export_menu_present: exportLabel,
@@ -192,24 +419,48 @@ class VisualDataExporter:
             }""",
             index,
         )
-        columns = await locator.evaluate(
-            """node => [...node.querySelectorAll('[role="columnheader"], th, .columnHeader, [class*="columnHeader" i]')]
-                .map(cell => (cell.innerText || cell.getAttribute('aria-label') || '').trim())
-                .filter(Boolean)"""
-        )
-        rows = await self._collect_rows(locator, metadata["scrollable"])
+        rows: list[list[str]] = []
+        columns: list[str] = []
+        scanned_columns = 0
+        horizontal_steps = 0
+        vertical_steps = 0
+        if not metadata.get("is_slicer"):
+            columns, rows, scanned_columns, horizontal_steps, vertical_steps = await self._collect_rows(
+                locator,
+                metadata.get("scrollable", False),
+                metadata.get("horizontally_scrollable", False),
+            )
+        if not columns:
+            columns = await locator.evaluate(
+                """node => [...node.querySelectorAll('[role="columnheader"], th, .columnHeader, [class*="columnHeader" i]')]
+                    .map(cell => (cell.innerText || cell.getAttribute('aria-label') || '').trim())
+                    .filter(Boolean)"""
+            )
         if columns and rows and rows[0] == columns:
             rows = rows[1:]
         lines = _normalise_lines(metadata.pop("accessible_text", ""))
         title = metadata["title"] or (lines[0] if lines else metadata["id"])
         metadata["title"] = title
+        if _LOADING_TITLE_RE.search(title) or _LOADING_TITLE_RE.search(metadata.get("title", "")):
+            metadata["is_loading_placeholder"] = True
         metadata["data"] = {
             "columns": columns,
             "rows": rows,
             "row_count": len(rows),
+            "scanned_columns": scanned_columns,
+            "horizontal_scroll_steps": horizontal_steps,
+            "vertical_scroll_steps": vertical_steps,
             "collection_method": "rendered_dom",
         }
-        logger.info("Visual collected | title=%s | rows=%d | vertical_scroll=%s | horizontal_scroll=%s", title, len(rows), metadata["scrollable"], metadata["horizontally_scrollable"])
+        if not metadata.get("is_loading_placeholder"):
+            logger.info(
+                "Visual collected | title=%s | rows=%d | cols=%d | vertical_steps=%d | horizontal_steps=%d",
+                title,
+                len(rows),
+                len(columns),
+                vertical_steps,
+                horizontal_steps,
+            )
         metadata["export"] = {
             "supported": metadata.pop("export_menu_present"),
             "attempted": False,
@@ -218,87 +469,239 @@ class VisualDataExporter:
         }
         return metadata
 
-    async def _collect_rows(self, locator, scrollable: bool) -> list[list[str]]:
-        """Collect virtualised table rows while scrolling vertically and horizontally.
+    async def _collect_rows(
+        self,
+        locator,
+        scrollable: bool,
+        horizontally_scrollable: bool,
+    ) -> tuple[list[str], list[list[str]], int, int, int]:
+        """Collect matrix/table cells with combined vertical and horizontal scrolling.
 
-        Power BI frequently renders only the viewport columns for a matrix.  We
-        retain first-seen order and scan both axes so a later column is not
-        silently omitted from the comparison workbook.
+        Jagruthi: Power BI matrices virtualise both axes.  Always attempts a full
+        2D scan (horizontal slices × vertical steps) with wheel/scrollIntoView
+        fallbacks when scrollLeft does not move.
         """
-        seen: dict[tuple[str, ...], None] = {}
+        merger = _MatrixCellMerger()
 
-        async def collect() -> None:
-            rows = await locator.evaluate(
+        async def snapshot() -> None:
+            payload = await locator.evaluate(
                 """node => {
-                    const directRows = [...node.querySelectorAll('[role="row"], tr')].map(row =>
-                        [...row.querySelectorAll('[role="gridcell"], [role="columnheader"], td, th, .cell, [class*="cell" i]')]
-                            .map(cell => (cell.innerText || cell.getAttribute('aria-label') || '').trim())
-                            .filter(Boolean)
-                    ).filter(row => row.length);
-                    if (directRows.length) return directRows;
-                    const groups = new Map();
-                    [...node.querySelectorAll('[role="gridcell"], td, .cell, [class*="cell" i]')].forEach(cell => {
-                        const value = (cell.innerText || cell.getAttribute('aria-label') || '').trim();
+                    const text = el => {
+                        if (!el) return '';
+                        return (el.innerText || el.getAttribute('aria-label') || '').trim();
+                    };
+                    const headers = [];
+                    const cells = [];
+                    node.querySelectorAll(
+                        '[role="columnheader"], th, .columnHeader, [class*="columnHeader" i]'
+                    ).forEach(cell => {
+                        const value = text(cell);
                         const box = cell.getBoundingClientRect();
-                        if (!value || box.width < 1 || box.height < 1) return;
-                        const key = Math.round(box.top / 3) * 3;
-                        if (!groups.has(key)) groups.set(key, []);
-                        groups.get(key).push({ left: box.left, value });
+                        if (!value || box.width < 1) return;
+                        headers.push({
+                            value,
+                            colindex: cell.getAttribute('aria-colindex'),
+                            left: box.left,
+                        });
                     });
-                    return [...groups.entries()].sort((a, b) => a[0] - b[0])
-                        .map(([, cells]) => cells.sort((a, b) => a.left - b.left).map(cell => cell.value));
+                    const selectors = '[role="gridcell"], [role="rowheader"], [role="columnheader"], td, th';
+                    node.querySelectorAll(selectors).forEach(cell => {
+                        const value = text(cell);
+                        if (!value) return;
+                        const box = cell.getBoundingClientRect();
+                        if (box.width < 1 || box.height < 1) return;
+                        cells.push({
+                            value,
+                            rowindex: cell.getAttribute('aria-rowindex'),
+                            colindex: cell.getAttribute('aria-colindex'),
+                            left: box.left,
+                            top: box.top,
+                            role: cell.getAttribute('role') || '',
+                        });
+                    });
+                    if (!cells.length) {
+                        [...node.querySelectorAll('[role="row"], tr')].forEach(row => {
+                            const rowCells = [...row.querySelectorAll(
+                                '[role="gridcell"], [role="columnheader"], td, th, .cell, [class*="cell" i]'
+                            )].map(cell => text(cell)).filter(Boolean);
+                            if (!rowCells.length) return;
+                            rowCells.forEach((value, index) => {
+                                cells.push({
+                                    value,
+                                    rowindex: null,
+                                    colindex: String(index + 1),
+                                    left: index * 100,
+                                    top: row.offsetTop || 0,
+                                    role: 'gridcell',
+                                });
+                            });
+                        });
+                    }
+                    return { headers, cells };
                 }"""
             )
-            for row in rows:
-                seen.setdefault(tuple(row), None)
+            merger.ingest(payload)
 
-        await collect()
-        # Scan the complete two-dimensional viewport grid.  A previous pass
-        # reached the bottom vertically and only then moved horizontally,
-        # which missed the upper rows of later columns in a Power BI matrix.
-        for horizontal_step in range(self.max_scroll_steps + 1):
+        async def wait_after_scroll() -> None:
+            await self.page.wait_for_timeout(self.scroll_step_wait_ms)
+
+        async def reset_axis(axis: str) -> None:
             await locator.evaluate(
-                """node => [...node.querySelectorAll('*')].forEach(el => {
-                    const style = getComputedStyle(el);
-                    if (/(auto|scroll)/.test(style.overflowY) && el.scrollHeight > el.clientHeight + 2) el.scrollTop = 0;
-                })"""
+                """(node, axis) => {
+                    const isY = axis === 'y';
+                    const targets = [
+                        ...node.querySelectorAll(
+                            '[role="grid"], [role="table"], .mid-viewport, [class*="scrollRegion" i], [class*="scrollable-region" i]'
+                        ),
+                        ...node.querySelectorAll('*'),
+                    ];
+                    const seen = new Set();
+                    for (const el of targets) {
+                        if (seen.has(el)) continue;
+                        seen.add(el);
+                        const size = isY
+                            ? el.scrollHeight - el.clientHeight
+                            : el.scrollWidth - el.clientWidth;
+                        if (size > 2) {
+                            if (isY) el.scrollTop = 0;
+                            else el.scrollLeft = 0;
+                        }
+                    }
+                }""",
+                axis,
             )
-            await collect()
-            if scrollable:
-                for _ in range(self.max_scroll_steps):
-                    moved_down = await locator.evaluate(
-                        """node => {
-                            const element = [...node.querySelectorAll('*')].filter(el => {
-                                const style = getComputedStyle(el);
-                                return /(auto|scroll)/.test(style.overflowY) && el.scrollHeight > el.clientHeight + 2;
-                            }).sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight))[0];
-                            if (!element || element.scrollTop + element.clientHeight >= element.scrollHeight - 2) return false;
-                            element.scrollTop = Math.min(element.scrollTop + Math.max(element.clientHeight * .8, 1), element.scrollHeight);
-                            element.dispatchEvent(new Event('scroll', {bubbles: true}));
-                            return true;
-                        }"""
-                    )
-                    if not moved_down:
+
+        async def scroll_axis(axis: str) -> bool:
+            return await locator.evaluate(
+                """(node, axis) => {
+                    const isY = axis === 'y';
+                    const canScroll = (el) => isY
+                        ? el.scrollHeight > el.clientHeight + 2
+                        : el.scrollWidth > el.clientWidth + 2;
+                    const preferred = [
+                        ...node.querySelectorAll(
+                            '[role="grid"], [role="table"], .mid-viewport, [class*="scrollRegion" i], [class*="scrollable-region" i], [class*="pivotTable" i], [class*="matrix" i]'
+                        ),
+                    ];
+                    const generic = [...node.querySelectorAll('*')].filter(el => canScroll(el));
+                    generic.sort((a, b) => {
+                        const aDelta = isY ? a.scrollHeight - a.clientHeight : a.scrollWidth - a.clientWidth;
+                        const bDelta = isY ? b.scrollHeight - b.clientHeight : b.scrollWidth - b.clientWidth;
+                        return bDelta - aDelta;
+                    });
+                    const seen = new Set();
+                    const candidates = [];
+                    for (const el of preferred) {
+                        if (!seen.has(el) && canScroll(el)) {
+                            seen.add(el);
+                            candidates.push(el);
+                        }
+                    }
+                    for (const el of generic) {
+                        if (!seen.has(el)) {
+                            seen.add(el);
+                            candidates.push(el);
+                        }
+                    }
+                    const tryElement = (element) => {
+                        const before = isY ? element.scrollTop : element.scrollLeft;
+                        const max = isY
+                            ? element.scrollHeight - element.clientHeight
+                            : element.scrollWidth - element.clientWidth;
+                        const step = Math.max(
+                            (isY ? element.clientHeight : element.clientWidth) * 0.8,
+                            48,
+                        );
+                        if (isY) {
+                            element.scrollTop = Math.min(element.scrollTop + step, max);
+                        } else {
+                            element.scrollLeft = Math.min(element.scrollLeft + step, max);
+                        }
+                        element.dispatchEvent(new Event('scroll', { bubbles: true }));
+                        let after = isY ? element.scrollTop : element.scrollLeft;
+                        if (after > before + 0.5) return true;
+                        if (!isY) {
+                            element.dispatchEvent(new WheelEvent('wheel', {
+                                deltaX: step,
+                                deltaY: 0,
+                                bubbles: true,
+                                cancelable: true,
+                            }));
+                            after = element.scrollLeft;
+                            if (after > before + 0.5) return true;
+                        }
+                        return false;
+                    };
+                    for (const element of candidates) {
+                        if (tryElement(element)) return true;
+                    }
+                    if (!isY) {
+                        const cells = [...node.querySelectorAll('[role="gridcell"], td, th')]
+                            .filter(cell => cell.getBoundingClientRect().width > 0);
+                        if (!cells.length) return false;
+                        const rightCell = cells.reduce((best, cell) => {
+                            const box = cell.getBoundingClientRect();
+                            const bestBox = best.getBoundingClientRect();
+                            return box.right > bestBox.right ? cell : best;
+                        }, cells[0]);
+                        const before = candidates[0]?.scrollLeft ?? 0;
+                        rightCell.scrollIntoView({ block: 'nearest', inline: 'end', behavior: 'instant' });
+                        const after = candidates[0]?.scrollLeft ?? 0;
+                        return after > before + 0.5;
+                    }
+                    return false;
+                }""",
+                axis,
+            )
+
+        horizontal_moves = 0
+        vertical_moves = 0
+        max_steps = self.max_scroll_steps
+
+        await reset_axis("x")
+        await reset_axis("y")
+        await snapshot()
+
+        for h_index in range(max_steps + 1):
+            await reset_axis("y")
+            await snapshot()
+
+            if scrollable or horizontally_scrollable or merger.row_count() > 0 or merger.col_count() > 0:
+                for _ in range(max_steps):
+                    moved = await scroll_axis("y")
+                    if not moved:
                         break
-                    await self.page.wait_for_timeout(200)
-                    await collect()
-            moved_right = await locator.evaluate(
-                """node => {
-                    const element = [...node.querySelectorAll('*')].filter(el => {
-                        const style = getComputedStyle(el);
-                        return /(auto|scroll)/.test(style.overflowX) && el.scrollWidth > el.clientWidth + 2;
-                    }).sort((a, b) => (b.scrollWidth - b.clientWidth) - (a.scrollWidth - a.clientWidth))[0];
-                    if (!element || element.scrollLeft + element.clientWidth >= element.scrollWidth - 2) return false;
-                    element.scrollLeft = Math.min(element.scrollLeft + Math.max(element.clientWidth * .8, 1), element.scrollWidth);
-                    element.dispatchEvent(new Event('scroll', {bubbles: true}));
-                    return true;
-                }"""
-            )
+                    vertical_moves += 1
+                    await wait_after_scroll()
+                    await snapshot()
+
+            if h_index >= max_steps:
+                break
+
+            columns_before = merger.col_count()
+            moved_right = await scroll_axis("x")
             if not moved_right:
                 break
-            await self.page.wait_for_timeout(200)
+            horizontal_moves += 1
+            await wait_after_scroll()
+            await snapshot()
 
-        return [list(row) for row in seen]
+            if merger.col_count() <= columns_before:
+                logger.info(
+                    "Horizontal scroll stopped | no new columns after step %d",
+                    horizontal_moves,
+                )
+                break
+
+        columns, rows = merger.to_table()
+        logger.info(
+            "Matrix scan complete | vertical_steps=%d | horizontal_steps=%d | rows=%d | cols=%d",
+            vertical_moves,
+            horizontal_moves,
+            len(rows),
+            len(columns),
+        )
+        return columns, rows, len(columns), horizontal_moves, vertical_moves
 
     async def _try_export(self, locator, visual: dict[str, Any], index: int) -> dict[str, Any]:
         export = dict(visual["export"], attempted=True, status="unavailable")
@@ -359,6 +762,27 @@ async def extract_visual_data(page, **kwargs) -> dict[str, Any]:
     )
 
 
+async def extract_filter_data(page) -> dict[str, Any]:
+    """Collect slicer/filter state only — skips table/matrix scrolling and exports."""
+    exporter = VisualDataExporter(page)
+    try:
+        filters = await exporter._extract_filter_state()
+        return {
+            "status": "success",
+            "extracted_at": datetime.now(timezone.utc).isoformat(),
+            "filters": filters,
+            "errors": [],
+        }
+    except Exception as exc:
+        logger.exception("Filter-only extraction failed")
+        return {
+            "status": "failed",
+            "extracted_at": datetime.now(timezone.utc).isoformat(),
+            "filters": [],
+            "errors": [str(exc)],
+        }
+
+
 async def apply_slicer_value(page, slicer_name: str, value: str) -> bool:
     """Select an exact slicer option in the currently loaded Power BI page.
 
@@ -366,17 +790,23 @@ async def apply_slicer_value(page, slicer_name: str, value: str) -> bool:
     control; callers can report this rather than claiming a filter was applied.
     """
     try:
-        selected = await page.locator(
-            ".slicerContainer, [aria-label*='Slicer' i], [data-visual-type*='slicer' i]"
-        ).evaluate_all(
-            """(nodes, args) => {
-                const normalise = text => (text || '').replace(/\\s+/g, ' ').trim().toLocaleLowerCase();
-                const wantedName = normalise(args.name);
-                const wantedValue = normalise(args.value);
-                const container = nodes.find(node => normalise(node.innerText).includes(wantedName));
+        # Jagruthi: null-safe slicer click via page.evaluate (not evaluate_all).
+        selected = await page.evaluate(
+            """(args) => {
+                const safeText = item => {
+                    if (!item) return '';
+                    return (item.innerText || item.getAttribute('aria-label') || item.value || '')
+                        .replace(/\\s+/g, ' ').trim().toLocaleLowerCase();
+                };
+                const wantedName = safeText({ innerText: args.name });
+                const wantedValue = safeText({ innerText: args.value });
+                const nodes = [...document.querySelectorAll(
+                    '.slicerContainer, [aria-label*="Slicer" i], [data-visual-type*="slicer" i], .visualContainer, [data-visual-container]'
+                )];
+                const container = nodes.find(node => safeText(node).includes(wantedName));
                 if (!container) return false;
                 const option = [...container.querySelectorAll('[role="option"], label, button, input')]
-                    .find(node => normalise(node.innerText || node.getAttribute('aria-label') || node.value) === wantedValue);
+                    .find(node => safeText(node) === wantedValue);
                 if (!option || option.disabled) return false;
                 option.click();
                 return true;

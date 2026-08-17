@@ -9,6 +9,11 @@ Captures browser network activity:
 - JavaScript Errors
 """
 
+import logging
+
+
+logger = logging.getLogger(__name__)
+
 requests = []
 responses = []
 failed_requests = []
@@ -17,29 +22,21 @@ page_errors = []
 
 
 def clear():
-    """
-    Clears all collected network data before every execution.
-    """
+    """Clears all collected network data before every execution."""
     try:
         requests.clear()
         responses.clear()
         failed_requests.clear()
         console_logs.clear()
         page_errors.clear()
-    except Exception as e:
-        print(f"Error clearing network data: {e}")
+    except Exception:
+        logger.exception("Error clearing network data")
 
 
 async def register(page):
-    """
-    Register all browser event listeners.
-    """
-
+    """Register all browser event listeners."""
     clear()
 
-    # ----------------------------
-    # Requests
-    # ----------------------------
     def handle_request(request):
         try:
             requests.append({
@@ -47,12 +44,9 @@ async def register(page):
                 "url": request.url,
                 "resource_type": request.resource_type,
             })
-        except Exception as e:
-            print(f"Error handling request event: {e}")
+        except Exception:
+            logger.exception("Error handling request event")
 
-    # ----------------------------
-    # Responses
-    # ----------------------------
     def handle_response(response):
         try:
             data = {
@@ -67,43 +61,35 @@ async def register(page):
             if response.status >= 400:
                 failed_requests.append(data)
 
-        except Exception as e:
-            print(f"Error handling response event: {e}")
+        except Exception:
+            logger.exception("Error handling response event")
 
-    # ----------------------------
-    # Console Logs
-    # ----------------------------
     def handle_console(message):
         try:
             console_logs.append({
                 "type": message.type,
                 "text": message.text,
             })
-        except Exception as e:
-            print(f"Error handling console event: {e}")
+        except Exception:
+            logger.exception("Error handling console event")
 
-    # ----------------------------
-    # JavaScript Errors
-    # ----------------------------
     def handle_page_error(error):
         try:
             page_errors.append(str(error))
-        except Exception as e:
-            print(f"Error handling page error event: {e}")
+        except Exception:
+            logger.exception("Error handling page error event")
 
     try:
         page.on("request", handle_request)
         page.on("response", handle_response)
         page.on("console", handle_console)
         page.on("pageerror", handle_page_error)
-    except Exception as e:
-        print(f"Error registering network listeners: {e}")
+    except Exception:
+        logger.exception("Error registering network listeners")
 
 
 def summary():
-    """
-    Returns a summarized view of network activity.
-    """
+    """Returns a summarized view of network activity."""
     try:
         return {
             "total_requests": len(requests),
@@ -112,12 +98,29 @@ def summary():
             "console_messages": len(console_logs),
             "page_errors": len(page_errors),
         }
-    except Exception as e:
-        print(f"Error building network summary: {e}")
+    except Exception:
+        logger.exception("Error building network summary")
         return {
             "total_requests": 0,
             "total_responses": 0,
             "failed_requests": 0,
             "console_messages": 0,
             "page_errors": 0,
+        }
+
+
+def details(max_failed: int = 200, max_console: int = 200):
+    """Return detailed network events captured during a dashboard run."""
+    try:
+        return {
+            "failed_requests": list(failed_requests[:max_failed]),
+            "console_logs": list(console_logs[:max_console]),
+            "page_errors": list(page_errors[:max_failed]),
+        }
+    except Exception:
+        logger.exception("Error building network details")
+        return {
+            "failed_requests": [],
+            "console_logs": [],
+            "page_errors": [],
         }

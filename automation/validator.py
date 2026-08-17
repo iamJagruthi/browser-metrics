@@ -6,10 +6,17 @@ import logging
 import uuid
 
 from .browser import launch_browser, wait_for_dashboard
-from .network import clear, register, summary
+from .network import clear, details, register, summary
 from .performance import PerformanceTimer
 from .metrics import build_metrics
-from services.visual_data_exporter import apply_slicer_value, extract_visual_data
+from services.dashboard_inventory_service import (
+    build_inventory_api_payload,
+    build_pages_showcase_payload,
+    save_inventory_snapshot,
+    save_pages_snapshot,
+)
+from services.filter_service import build_filters_api_payload, save_filters_snapshot
+from services.visual_data_exporter import apply_slicer_value, extract_filter_data, extract_visual_data
 from utils.config import DASHBOARD_CONFIG, OUTPUT_DIR, PAGE_TIMEOUT, SCREENSHOT_DIR
 
 
@@ -134,6 +141,10 @@ class DashboardValidator:
                     extraction["data"],
                     visual_data,
                 )
+                self._merge_dom_kpis(
+                    extraction["data"],
+                    visual_data,
+                )
 
                 extraction["status"] = "success"
 
@@ -150,6 +161,7 @@ class DashboardValidator:
                 dashboard_url=dashboard["url"],
                 timers=self.timer.summary(),
                 network_summary=summary(),
+                network_details=details(),
                 page_title=await page.title(),
                 final_url=page.url,
                 http_status=response.status if response else None,
@@ -157,6 +169,8 @@ class DashboardValidator:
 
             metrics["screenshot_path"] = str(screenshot_path)
             metrics["extraction_status"] = extraction["status"]
+            if extraction.get("error"):
+                metrics["extraction_error"] = extraction["error"]
 
             return playwright, context, {
                 "dashboard": dashboard,
@@ -246,6 +260,49 @@ class DashboardValidator:
             "Merged DOM filter state | filters=%d",
             len(filters),
         )
+
+    @staticmethod
+    def _build_comparison_payload(execution: dict) -> dict:
+        """Merge Gemini extraction with live DOM filter state for comparisons."""
+        extraction = execution.get("extraction", {})
+        visual_data = execution.get("visual_data", {})
+        data = dict(extraction.get("data") or {})
+        if not data:
+            data = {
+                "filters": [],
+                "kpi_cards": [],
+                "charts": [],
+                "tables": [],
+                "metadata": {},
+            }
+        DashboardValidator._merge_dom_filters(data, visual_data)
+        DashboardValidator._merge_dom_kpis(data, visual_data)
+        return data
+
+    @staticmethod
+    def _merge_dom_kpis(extracted_data, visual_data):
+        """Supplement Gemini KPI cards with DOM card/callout values when present."""
+        if not extracted_data:
+            return
+        existing = {
+            " ".join(str(item.get("name", "")).casefold().split())
+            for item in extracted_data.get("kpi_cards", [])
+            if item.get("name")
+        }
+        for dom_kpi in visual_data.get("kpi_cards", []):
+            key = " ".join(str(dom_kpi.get("name", "")).casefold().split())
+            if not key or key in existing:
+                continue
+            extracted_data.setdefault("kpi_cards", []).append(
+                {
+                    "name": dom_kpi.get("name"),
+                    "value": dom_kpi.get("value"),
+                    "previous_value": dom_kpi.get("previous_value"),
+                    "variance": dom_kpi.get("variance"),
+                    "extraction_source": "dom",
+                }
+            )
+            existing.add(key)
 
     async def run_links(self, links):
         """Validate source/target URLs and return data suitable for the API/frontend."""
@@ -415,6 +472,8 @@ class DashboardValidator:
                 run_id,
                 report_executions,
                 comparison,
+                executions_by_dashboard=executions_by_dashboard,
+                multi_page_mode=multi_page_mode,
             )
 
             public_executions = [
@@ -425,6 +484,32 @@ class DashboardValidator:
                 }
                 for item in executions
             ]
+
+            filters_payload = build_filters_api_payload(
+                public_executions,
+                run_id=run_id,
+                comparison_filters=comparison.get("filters", []),
+            )
+            inventory_payload = build_inventory_api_payload(
+                public_executions,
+                run_id=run_id,
+            )
+            public_groups = [
+                [
+                    {
+                        key: value
+                        for key, value in item.items()
+                        if key != "_page"
+                    }
+                    for item in group
+                ]
+                for group in executions_by_dashboard
+            ]
+            pages_payload = build_pages_showcase_payload(
+                public_executions,
+                executions_by_dashboard=public_groups,
+                run_id=run_id,
+            )
 
             # ============================================================
             # Arun - Page-aware API response
@@ -494,7 +579,13 @@ class DashboardValidator:
                         if report_paths.get("document")
                         else None
                     ),
+                    "filters": f"/api/reports/{run_id}/filters",
+                    "inventory": f"/api/reports/{run_id}/inventory",
+                    "pages": f"/api/reports/{run_id}/pages",
                 },
+                "filters": filters_payload,
+                "inventory": inventory_payload,
+                "pages": pages_payload,
                 "llm_results": llm_results,
                 "filter_state": filter_state,
             }
@@ -728,77 +819,49 @@ class DashboardValidator:
             }
 
         source, target = executions[:2]
+        source_data = self._build_comparison_payload(source)
+        target_data = self._build_comparison_payload(target)
+        source_gemini_ok = source["extraction"]["status"] == "success"
+        target_gemini_ok = target["extraction"]["status"] == "success"
 
-        if (
-            source["extraction"]["status"] != "success"
-            or target["extraction"]["status"] != "success"
-        ):
-            return {
-                "status": "not_compared",
-                "reason": (
-                    "Gemini extraction failed for one or both "
-                    "dashboards; no match percentage was calculated."
-                ),
-            }
+        if not source_data.get("filters") and not target_data.get("filters"):
+            if not source_gemini_ok and not target_gemini_ok:
+                return {
+                    "status": "not_compared",
+                    "reason": "Gemini extraction failed for both dashboards and no DOM filters were captured.",
+                }
 
-        from ai.Text_Extraction import (
-            compare_filters,
-            compare_visuals,
-        )
+        from services.comparison_service import compare_dashboard_payloads
 
-        from services.excel_exporter import (
-            build_comparison_summary,
-            compare_kpis,
-        )
-
-        source_data = source["extraction"]["data"]
-        target_data = target["extraction"]["data"]
-
-        filters = compare_filters(
+        return compare_dashboard_payloads(
             source_data,
             target_data,
+            source_gemini_ok=source_gemini_ok,
+            target_gemini_ok=target_gemini_ok,
         )
-
-        kpis = compare_kpis(
-            source_data,
-            target_data,
-        )
-
-        visuals = compare_visuals(
-            source_data,
-            target_data,
-        )
-
-        summary = build_comparison_summary(
-            filters,
-            kpis,
-            visuals,
-        )
-
-        return {
-            "status": "success",
-            "filters": filters,
-            "kpis": kpis,
-            "visuals": visuals,
-            "summary": summary,
-            # Kept for the existing dashboard UI while richer result groups are
-            # available above for API consumers.
-            "results": kpis,
-            "match_percentage": summary[
-                "kpi_match_percentage"
-            ],
-        }
 
     def _export_reports(
         self,
         run_id,
         executions,
         comparison,
+        executions_by_dashboard=None,
+        multi_page_mode=False,
     ):
         if len(executions) < 2:
             return {}
 
         paths = {}
+        page_comparisons = comparison.get("page_comparisons", [])
+        public_groups = None
+        if executions_by_dashboard:
+            public_groups = [
+                [
+                    {key: value for key, value in item.items() if key != "_page"}
+                    for item in group
+                ]
+                for group in executions_by_dashboard
+            ]
 
         try:
             from services.docx_reporter import (
@@ -810,13 +873,13 @@ class DashboardValidator:
                 executions,
                 comparison,
                 OUTPUT_DIR / "reports",
+                page_comparisons=page_comparisons if multi_page_mode else None,
+                executions_by_dashboard=public_groups,
             )
 
             paths["document"] = str(document)
 
         except ModuleNotFoundError as exc:
-            # Word output is an optional enhancement. Keep the validation and
-            # Excel workbook usable until its package is installed.
             if exc.name != "docx":
                 raise
 
@@ -824,38 +887,77 @@ class DashboardValidator:
                 "Word report skipped: install "
                 "python-docx from requirements.txt."
             )
+        except Exception:
+            logger.exception("Word report generation failed | run_id=%s", run_id)
+            paths["document_error"] = "Word report generation failed. See server logs."
 
-        if comparison.get("status") != "success":
-            return paths
+        try:
+            from services.excel_exporter import export_validation_workbook
 
-        from services.excel_exporter import (
-            export_validation_workbook,
-        )
+            comparison_payload = comparison if comparison.get("status") == "success" else {
+                "filters": comparison.get("filters", []),
+                "kpis": comparison.get("kpis", []),
+                "visuals": comparison.get("visuals", []),
+                "summary": comparison.get("summary", {
+                    "filter_match_percentage": 0.0,
+                    "kpi_match_percentage": 0.0,
+                    "visual_match_percentage": 0.0,
+                    "overall_match_percentage": 0.0,
+                }),
+                "slicer_scenarios": comparison.get("slicer_scenarios", []),
+            }
+            source_payload = self._build_comparison_payload(executions[0])
+            target_payload = self._build_comparison_payload(executions[1])
+            workbook = export_validation_workbook(
+                run_id,
+                source_payload,
+                target_payload,
+                comparison_payload.get("filters", []),
+                comparison_payload.get("kpis", []),
+                comparison_payload.get("visuals", []),
+                comparison_payload.get("summary", {}),
+                [item["metrics"] for item in executions],
+                OUTPUT_DIR / "reports",
+                visual_data={
+                    "Source": executions[0]["visual_data"],
+                    "Target": executions[1]["visual_data"],
+                },
+                slicer_scenarios=comparison_payload.get("slicer_scenarios", []),
+                page_comparisons=page_comparisons if multi_page_mode else None,
+                executions_by_dashboard=public_groups,
+            )
+            paths["excel"] = str(workbook)
+        except Exception as exc:
+            logger.exception("Excel workbook generation failed | run_id=%s", run_id)
+            paths["excel_error"] = f"Excel report failed: {exc}"
 
-        workbook = export_validation_workbook(
-            run_id,
-            executions[0]["extraction"]["data"],
-            executions[1]["extraction"]["data"],
-            comparison["filters"],
-            comparison["kpis"],
-            comparison["visuals"],
-            comparison["summary"],
-            [
-                item["metrics"]
+        try:
+            public_executions = [
+                {key: value for key, value in item.items() if key != "_page"}
                 for item in executions
-            ],
-            OUTPUT_DIR / "reports",
-            visual_data={
-                "Source": executions[0]["visual_data"],
-                "Target": executions[1]["visual_data"],
-            },
-            slicer_scenarios=comparison.get(
-                "slicer_scenarios",
-                [],
-            ),
-        )
-
-        paths["excel"] = str(workbook)
+            ]
+            filters_payload = build_filters_api_payload(
+                public_executions,
+                run_id=run_id,
+                comparison_filters=comparison.get("filters", []),
+            )
+            save_filters_snapshot(run_id, filters_payload, OUTPUT_DIR / "reports")
+            paths["filters"] = str(OUTPUT_DIR / "reports" / f"{run_id}_filters.json")
+            inventory_payload = build_inventory_api_payload(
+                public_executions,
+                run_id=run_id,
+            )
+            save_inventory_snapshot(run_id, inventory_payload, OUTPUT_DIR / "reports")
+            paths["inventory"] = str(OUTPUT_DIR / "reports" / f"{run_id}_inventory.json")
+            pages_payload = build_pages_showcase_payload(
+                public_executions,
+                executions_by_dashboard=public_groups,
+                run_id=run_id,
+            )
+            save_pages_snapshot(run_id, pages_payload, OUTPUT_DIR / "reports")
+            paths["pages"] = str(OUTPUT_DIR / "reports" / f"{run_id}_pages.json")
+        except Exception:
+            logger.exception("Filter/inventory snapshot save failed | run_id=%s", run_id)
 
         return paths
 
@@ -926,6 +1028,10 @@ class DashboardValidator:
                     extraction["data"],
                     visual_data,
                 )
+                self._merge_dom_kpis(
+                    extraction["data"],
+                    visual_data,
+                )
 
                 extraction["status"] = "success"
 
@@ -942,6 +1048,7 @@ class DashboardValidator:
                 dashboard_url=dashboard["url"],
                 timers=self.timer.summary(),
                 network_summary=summary(),
+                network_details=details(),
                 page_title=await page.title(),
                 final_url=page.url,
                 http_status=response.status if response else None,
@@ -950,6 +1057,8 @@ class DashboardValidator:
             metrics["page_name"] = page_name
             metrics["screenshot_path"] = str(screenshot_path)
             metrics["extraction_status"] = extraction["status"]
+            if extraction.get("error"):
+                metrics["extraction_error"] = extraction["error"]
 
             return {
                 "dashboard": {
@@ -1246,6 +1355,175 @@ class DashboardValidator:
             scenarios.extend(page_scenarios)
 
         return scenarios
+
+    async def run_filter_probe(self, links):
+        executions = await self._probe_dashboard_executions(links)
+        comparison_filters = []
+        if len(executions) >= 2:
+            source_data = self._build_comparison_payload(executions[0])
+            target_data = self._build_comparison_payload(executions[1])
+            if source_data.get("filters") or target_data.get("filters"):
+                from ai.Text_Extraction import compare_filters
+                comparison_filters = compare_filters(source_data, target_data)
+        return build_filters_api_payload(
+            executions,
+            run_id=None,
+            comparison_filters=comparison_filters,
+        )
+
+    async def run_inventory_probe(self, links):
+        executions = await self._probe_dashboard_executions(links)
+        return build_inventory_api_payload(executions, run_id=None)
+
+    async def run_pages_probe(self, links):
+        """Jagruthi — lightweight multi-page showcase (page names, KPIs, visuals, inventory)."""
+        executions, executions_by_dashboard = await self._probe_multi_page_dashboard_executions(links)
+        return build_pages_showcase_payload(
+            executions,
+            executions_by_dashboard=executions_by_dashboard,
+            run_id=None,
+        )
+
+    async def _probe_multi_page_dashboard_executions(self, links):
+        """Jagruthi — visit every report page and collect DOM visual inventory."""
+        executions = []
+        executions_by_dashboard = []
+        resources = []
+        if not links:
+            return executions, executions_by_dashboard
+        try:
+            playwright, context, first_page = await launch_browser()
+            resources.append((playwright, context))
+            for index, dashboard in enumerate(links):
+                page = first_page if index == 0 else await context.new_page()
+                dashboard_executions = []
+                try:
+                    await page.goto(
+                        dashboard["url"],
+                        wait_until="domcontentloaded",
+                        timeout=PAGE_TIMEOUT,
+                    )
+                    await wait_for_dashboard(page)
+                    pages = await self.get_dashboard_pages(page)
+                    page_items = pages if len(pages) > 1 else [{"name": "Default", "selected": True}]
+                    for page_info in page_items:
+                        page_name = page_info["name"]
+                        if not page_info.get("selected"):
+                            await self.navigate_to_page(page, page_name)
+                        visual_data = await extract_visual_data(
+                            page,
+                            attempt_export=False,
+                        )
+                        execution = {
+                            "dashboard": {
+                                **dashboard,
+                                "page_name": page_name,
+                            },
+                            "visual_data": visual_data,
+                            "extraction": {
+                                "status": "skipped",
+                                "data": None,
+                                "error": None,
+                            },
+                        }
+                        dashboard_executions.append(execution)
+                        executions.append(execution)
+                except Exception as exc:
+                    logger.exception(
+                        "Multi-page dashboard probe failed | dashboard=%s",
+                        dashboard.get("name"),
+                    )
+                    failed = {
+                        "dashboard": dashboard,
+                        "visual_data": {
+                            "status": "failed",
+                            "filters": [],
+                            "visuals": [],
+                            "errors": [str(exc)],
+                        },
+                        "extraction": {
+                            "status": "failed",
+                            "data": None,
+                            "error": str(exc),
+                        },
+                    }
+                    dashboard_executions.append(failed)
+                    executions.append(failed)
+                executions_by_dashboard.append(dashboard_executions)
+        except Exception as exc:
+            logger.exception("Unable to launch shared Edge context for multi-page probe")
+            for dashboard in links:
+                failed = {
+                    "dashboard": dashboard,
+                    "visual_data": {
+                        "status": "failed",
+                        "filters": [],
+                        "errors": [str(exc)],
+                    },
+                    "extraction": {
+                        "status": "failed",
+                        "data": None,
+                        "error": str(exc),
+                    },
+                }
+                executions.append(failed)
+                executions_by_dashboard.append([failed])
+        finally:
+            for playwright, context in resources:
+                try:
+                    await context.close()
+                    await playwright.stop()
+                except Exception:
+                    logger.exception(
+                        "Failed to close browser resources after multi-page probe"
+                    )
+        return executions, executions_by_dashboard
+
+    async def _probe_dashboard_executions(self, links):
+        executions = []
+        resources = []
+        if not links:
+            return executions
+        try:
+            playwright, context, first_page = await launch_browser()
+            resources.append((playwright, context))
+            for index, dashboard in enumerate(links):
+                page = first_page if index == 0 else await context.new_page()
+                try:
+                    await page.goto(
+                        dashboard["url"],
+                        wait_until="domcontentloaded",
+                        timeout=PAGE_TIMEOUT,
+                    )
+                    await wait_for_dashboard(page)
+                    visual_data = await extract_filter_data(page)
+                    executions.append({
+                        "dashboard": dashboard,
+                        "visual_data": visual_data,
+                        "extraction": {"status": "skipped", "data": None, "error": None},
+                    })
+                except Exception as exc:
+                    logger.exception("Dashboard probe failed | dashboard=%s", dashboard.get("name"))
+                    executions.append({
+                        "dashboard": dashboard,
+                        "visual_data": {"status": "failed", "filters": [], "errors": [str(exc)]},
+                        "extraction": {"status": "failed", "data": None, "error": str(exc)},
+                    })
+        except Exception as exc:
+            logger.exception("Unable to launch shared Edge context for dashboard probe")
+            executions = [{
+                "dashboard": dashboard,
+                "visual_data": {"status": "failed", "filters": [], "errors": [str(exc)]},
+                "extraction": {"status": "failed", "data": None, "error": str(exc)},
+            } for dashboard in links]
+        finally:
+            for playwright, context in resources:
+                try:
+                    await context.close()
+                    await playwright.stop()
+                except Exception:
+                    logger.exception("Failed to close browser resources after dashboard probe")
+        return executions
 
     async def run_all(self):
         return await self.run_links(

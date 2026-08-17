@@ -23,6 +23,7 @@ Each successful validation writes reports beneath `output/reports/`:
 ## Important behaviour
 
 - Visual capture waits for Power BI to settle to reduce loading placeholders and duplicate visual readings.
-- Virtualised table rows are collected by vertical scrolling and visible matrix columns are collected by horizontal scrolling.
+- Virtualised table rows are collected by vertical scrolling; matrix columns are merged across horizontal scroll positions (2D scan per column slice). Tune via `MATRIX_MAX_SCROLL_STEPS` (default 60) and `SCROLL_STEP_WAIT_MS` (default 350) in `.env`.
+- Multi-page Power BI reports are navigated page-by-page when more than one report page is detected.
 - A shared slicer test is only attempted when both dashboards expose the same named slicer with the same unselected value. It applies that value to both dashboards, captures new screenshots, and performs Gemini analysis again.
 - Gemini is intentionally lazy-initialised: a missing API key does not prevent browser-side table and filter collection.

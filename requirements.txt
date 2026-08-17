@@ -17,5 +17,8 @@ python-dotenv==1.1.1
 # Excel workbook generation
 openpyxl==3.1.5
 
+# Table comparison (Jagruthi)
+pandas>=2.2,<3.0
+
 # Word validation report
 python-docx==1.2.0
