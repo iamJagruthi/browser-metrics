@@ -5,7 +5,7 @@ Jagruthi — features:
 - Loading-placeholder detection and skip during visual scan
 - Slicer vs table separation (button filters are not scraped as tables)
 - DOM KPI card/callout extraction to supplement Gemini
-- Vertical and horizontal scroll collection for matrices
+- Vertical and horizontal 2D matrix scroll with merged column headers (Jagruthi)
 """
 
 from __future__ import annotations
@@ -33,6 +33,82 @@ def _normalise_lines(value: str) -> list[str]:
 def _safe_filename(value: str, fallback: str) -> str:
     value = re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("_.")
     return value or fallback
+
+
+class _MatrixCellMerger:
+    """Merge matrix cells across vertical and horizontal scroll positions."""
+
+    def __init__(self) -> None:
+        self.header_map: dict[str, str] = {}
+        self.col_order: list[str] = []
+        self.row_cells: dict[str, dict[str, str]] = {}
+
+    @staticmethod
+    def _col_key(item: dict[str, Any]) -> str:
+        colindex = item.get("colindex")
+        if colindex is not None and str(colindex).strip():
+            return f"col:{colindex}"
+        return f"left:{int(round(float(item.get("left", 0)) / 4)) * 4}"
+
+    @staticmethod
+    def _row_key(item: dict[str, Any]) -> str:
+        rowindex = item.get("rowindex")
+        if rowindex is not None and str(rowindex).strip():
+            return f"row:{rowindex}"
+        return f"top:{int(round(float(item.get("top", 0)) / 4)) * 4}"
+
+    def ingest(self, payload: dict[str, Any] | None) -> None:
+        if not payload:
+            return
+        for header in payload.get("headers", []):
+            key = self._col_key(header)
+            if header.get("value"):
+                self.header_map.setdefault(key, header["value"])
+            if key not in self.col_order:
+                self.col_order.append(key)
+        for cell in payload.get("cells", []):
+            if cell.get("role") == "columnheader":
+                key = self._col_key(cell)
+                if cell.get("value"):
+                    self.header_map.setdefault(key, cell["value"])
+                if key not in self.col_order:
+                    self.col_order.append(key)
+                continue
+            row_key = self._row_key(cell)
+            col_key = self._col_key(cell)
+            if col_key not in self.col_order:
+                self.col_order.append(col_key)
+            self.row_cells.setdefault(row_key, {})[col_key] = cell["value"]
+
+    def row_count(self) -> int:
+        return len(self.row_cells)
+
+    def to_table(self) -> tuple[list[str], list[list[str]]]:
+        if not self.col_order and not self.row_cells:
+            return [], []
+        columns = [
+            self.header_map.get(key) or f"Column {index + 1}"
+            for index, key in enumerate(self.col_order)
+        ]
+
+        def sort_key(key: str) -> tuple[int | str, ...]:
+            if key.startswith("row:"):
+                try:
+                    return (0, int(key.split(":", 1)[1]))
+                except ValueError:
+                    return (1, key)
+            if key.startswith("top:"):
+                try:
+                    return (0, int(key.split(":", 1)[1]))
+                except ValueError:
+                    return (1, key)
+            return (1, key)
+
+        rows = []
+        for row_key in sorted(self.row_cells.keys(), key=sort_key):
+            row_data = self.row_cells[row_key]
+            rows.append([row_data.get(col_key, "") for col_key in self.col_order])
+        return columns, rows
 
 
 class VisualDataExporter:
@@ -165,6 +241,9 @@ class VisualDataExporter:
                                         selected: item.matches(
                                             'input:checked, [aria-selected="true"], [aria-checked="true"], [aria-pressed="true"]'
                                         ) || /(^|\\s)(selected|active)(\\s|$)/i.test(item.className || ''),
+                                        control_type: item.tagName === 'BUTTON' || item.getAttribute('role') === 'button'
+                                            ? 'button'
+                                            : (item.matches('input[type="radio"], input[type="checkbox"]') ? 'input' : 'option'),
                                     }))
                                     .filter(item => item.value);
                                 const title = safeText(
@@ -176,12 +255,14 @@ class VisualDataExporter:
                                 if (!title || !hasChoiceControl || controls.length < 2) return null;
                                 const selected = controls.filter(item => item.selected).map(item => item.value);
                                 const values = controls.map(item => item.value);
+                                const hasButtons = controls.some(item => item.control_type === 'button');
                                 return {
                                     id: visual.id || `filter-visual-${index + 1}`,
                                     name: title,
-                                    filter_type: controls.some(item => item.selected) ? 'Buttons' : 'Dropdown',
+                                    filter_type: hasButtons ? 'Buttons' : 'Dropdown',
                                     selected_values: [...new Set(selected)],
                                     visible_values: [...new Set(values)].slice(0, 500),
+                                    options: controls,
                                     looks_like_filter: true,
                                     extraction_source: 'dom',
                                 };
@@ -204,10 +285,14 @@ class VisualDataExporter:
                                 selected: item.matches(
                                     'input:checked, [aria-selected="true"], [aria-checked="true"], [aria-pressed="true"]'
                                 ) || /(^|\\s)(selected|active)(\\s|$)/i.test(item.className || ''),
+                                control_type: item.tagName === 'BUTTON' || item.getAttribute('role') === 'button'
+                                    ? 'button'
+                                    : (item.matches('input[type="radio"], input[type="checkbox"]') ? 'input' : 'option'),
                             }))
                             .filter(item => item.value);
                         const selected = controls.filter(item => item.selected).map(item => item.value);
                         const values = controls.map(item => item.value);
+                        const hasButtons = controls.some(item => item.control_type === 'button');
                         const hasSlicerMarkup = node.matches(
                             '.slicerContainer, [class*="slicer" i], [aria-label*="Slicer" i], [data-visual-type*="slicer" i]'
                         ) || visual.matches('[data-visual-type*="slicer" i]');
@@ -218,9 +303,10 @@ class VisualDataExporter:
                         return {
                             id: node.id || `slicer-${index + 1}`,
                             name: title,
-                            filter_type: controls.some(item => item.selected) ? 'Buttons' : 'Dropdown',
+                            filter_type: hasButtons ? 'Buttons' : (controls.some(item => item.selected) ? 'Buttons' : 'Dropdown'),
                             selected_values: [...new Set(selected)],
                             visible_values: [...new Set(values)].slice(0, 500),
+                            options: controls,
                             looks_like_filter: looksLikeFilter,
                             extraction_source: 'dom',
                         };
@@ -294,13 +380,15 @@ class VisualDataExporter:
                 const titleNode = node.querySelector('[title], [aria-label], .title, .visualTitle');
                 const typeSource = [node.className, node.getAttribute('data-visual-type'), node.getAttribute('aria-roledescription')]
                     .filter(Boolean).join(' ');
+                const canScrollY = (el) => el.scrollHeight > el.clientHeight + 2;
+                const canScrollX = (el) => el.scrollWidth > el.clientWidth + 2;
                 const scrollable = [...node.querySelectorAll('*')].some(el => {
                     const style = getComputedStyle(el);
-                    return /(auto|scroll)/.test(style.overflowY) && el.scrollHeight > el.clientHeight + 2;
+                    return canScrollY(el) && /(auto|scroll|hidden)/i.test(style.overflowY);
                 });
                 const horizontallyScrollable = [...node.querySelectorAll('*')].some(el => {
                     const style = getComputedStyle(el);
-                    return /(auto|scroll)/.test(style.overflowX) && el.scrollWidth > el.clientWidth + 2;
+                    return canScrollX(el) && /(auto|scroll|hidden)/i.test(style.overflowX);
                 });
                 const exportLabel = [...node.querySelectorAll('button, [role="button"]')]
                     .map(el => `${el.getAttribute('aria-label') || ''} ${el.title || ''} ${el.innerText || ''}`)
@@ -322,14 +410,21 @@ class VisualDataExporter:
             }""",
             index,
         )
-        columns = await locator.evaluate(
-            """node => [...node.querySelectorAll('[role="columnheader"], th, .columnHeader, [class*="columnHeader" i]')]
-                .map(cell => (cell.innerText || cell.getAttribute('aria-label') || '').trim())
-                .filter(Boolean)"""
-        )
         rows: list[list[str]] = []
+        columns: list[str] = []
+        scanned_columns = 0
         if not metadata.get("is_slicer"):
-            rows = await self._collect_rows(locator, metadata["scrollable"])
+            columns, rows, scanned_columns = await self._collect_rows(
+                locator,
+                metadata.get("scrollable", False),
+                metadata.get("horizontally_scrollable", False),
+            )
+        if not columns:
+            columns = await locator.evaluate(
+                """node => [...node.querySelectorAll('[role="columnheader"], th, .columnHeader, [class*="columnHeader" i]')]
+                    .map(cell => (cell.innerText || cell.getAttribute('aria-label') || '').trim())
+                    .filter(Boolean)"""
+            )
         if columns and rows and rows[0] == columns:
             rows = rows[1:]
         lines = _normalise_lines(metadata.pop("accessible_text", ""))
@@ -341,13 +436,15 @@ class VisualDataExporter:
             "columns": columns,
             "rows": rows,
             "row_count": len(rows),
+            "scanned_columns": scanned_columns,
             "collection_method": "rendered_dom",
         }
         if not metadata.get("is_loading_placeholder"):
             logger.info(
-                "Visual collected | title=%s | rows=%d | vertical_scroll=%s | horizontal_scroll=%s",
+                "Visual collected | title=%s | rows=%d | cols=%d | vertical_scroll=%s | horizontal_scroll=%s",
                 title,
                 len(rows),
+                len(columns),
                 metadata["scrollable"],
                 metadata["horizontally_scrollable"],
             )
@@ -359,87 +456,170 @@ class VisualDataExporter:
         }
         return metadata
 
-    async def _collect_rows(self, locator, scrollable: bool) -> list[list[str]]:
-        """Collect virtualised table rows while scrolling vertically and horizontally.
+    async def _collect_rows(
+        self,
+        locator,
+        scrollable: bool,
+        horizontally_scrollable: bool,
+    ) -> tuple[list[str], list[list[str]], int]:
+        """Collect matrix/table cells with combined vertical and horizontal scrolling.
 
-        Power BI frequently renders only the viewport columns for a matrix.  We
-        retain first-seen order and scan both axes so a later column is not
-        silently omitted from the comparison workbook.
+        Jagruthi: Power BI matrices virtualise both axes.  Cells are merged by
+        aria-rowindex/colindex (or position) so new columns from horizontal
+        scroll extend existing rows instead of creating duplicate partial rows.
         """
-        seen: dict[tuple[str, ...], None] = {}
+        merger = _MatrixCellMerger()
 
-        async def collect() -> None:
-            rows = await locator.evaluate(
+        async def snapshot() -> None:
+            payload = await locator.evaluate(
                 """node => {
-                    const directRows = [...node.querySelectorAll('[role="row"], tr')].map(row =>
-                        [...row.querySelectorAll('[role="gridcell"], [role="columnheader"], td, th, .cell, [class*="cell" i]')]
-                            .map(cell => (cell.innerText || cell.getAttribute('aria-label') || '').trim())
-                            .filter(Boolean)
-                    ).filter(row => row.length);
-                    if (directRows.length) return directRows;
-                    const groups = new Map();
-                    [...node.querySelectorAll('[role="gridcell"], td, .cell, [class*="cell" i]')].forEach(cell => {
-                        const value = (cell.innerText || cell.getAttribute('aria-label') || '').trim();
+                    const text = el => {
+                        if (!el) return '';
+                        return (el.innerText || el.getAttribute('aria-label') || '').trim();
+                    };
+                    const headers = [];
+                    const cells = [];
+                    node.querySelectorAll(
+                        '[role="columnheader"], th, .columnHeader, [class*="columnHeader" i]'
+                    ).forEach(cell => {
+                        const value = text(cell);
                         const box = cell.getBoundingClientRect();
-                        if (!value || box.width < 1 || box.height < 1) return;
-                        const key = Math.round(box.top / 3) * 3;
-                        if (!groups.has(key)) groups.set(key, []);
-                        groups.get(key).push({ left: box.left, value });
+                        if (!value || box.width < 1) return;
+                        headers.push({
+                            value,
+                            colindex: cell.getAttribute('aria-colindex'),
+                            left: box.left,
+                        });
                     });
-                    return [...groups.entries()].sort((a, b) => a[0] - b[0])
-                        .map(([, cells]) => cells.sort((a, b) => a.left - b.left).map(cell => cell.value));
+                    const selectors = '[role="gridcell"], [role="rowheader"], [role="columnheader"], td, th';
+                    node.querySelectorAll(selectors).forEach(cell => {
+                        const value = text(cell);
+                        if (!value) return;
+                        const box = cell.getBoundingClientRect();
+                        if (box.width < 1 || box.height < 1) return;
+                        cells.push({
+                            value,
+                            rowindex: cell.getAttribute('aria-rowindex'),
+                            colindex: cell.getAttribute('aria-colindex'),
+                            left: box.left,
+                            top: box.top,
+                            role: cell.getAttribute('role') || '',
+                        });
+                    });
+                    if (!cells.length) {
+                        [...node.querySelectorAll('[role="row"], tr')].forEach(row => {
+                            const rowCells = [...row.querySelectorAll(
+                                '[role="gridcell"], [role="columnheader"], td, th, .cell, [class*="cell" i]'
+                            )].map(cell => text(cell)).filter(Boolean);
+                            if (!rowCells.length) return;
+                            rowCells.forEach((value, index) => {
+                                cells.push({
+                                    value,
+                                    rowindex: null,
+                                    colindex: String(index + 1),
+                                    left: index * 100,
+                                    top: row.offsetTop || 0,
+                                    role: 'gridcell',
+                                });
+                            });
+                        });
+                    }
+                    return { headers, cells };
                 }"""
             )
-            for row in rows:
-                seen.setdefault(tuple(row), None)
+            merger.ingest(payload)
 
-        await collect()
-        # Scan the complete two-dimensional viewport grid.  A previous pass
-        # reached the bottom vertically and only then moved horizontally,
-        # which missed the upper rows of later columns in a Power BI matrix.
-        for horizontal_step in range(self.max_scroll_steps + 1):
+        async def reset_axis(axis: str) -> None:
             await locator.evaluate(
-                """node => [...node.querySelectorAll('*')].forEach(el => {
-                    const style = getComputedStyle(el);
-                    if (/(auto|scroll)/.test(style.overflowY) && el.scrollHeight > el.clientHeight + 2) el.scrollTop = 0;
-                })"""
+                """(node, axis) => {
+                    const isY = axis === 'y';
+                    [...node.querySelectorAll('*')].forEach(el => {
+                        const size = isY ? el.scrollHeight - el.clientHeight : el.scrollWidth - el.clientWidth;
+                        if (size > 2) {
+                            if (isY) el.scrollTop = 0;
+                            else el.scrollLeft = 0;
+                        }
+                    });
+                }""",
+                axis,
             )
-            await collect()
-            if scrollable:
+
+        async def scroll_axis(axis: str) -> bool:
+            return await locator.evaluate(
+                """(node, axis) => {
+                    const isY = axis === 'y';
+                    const candidates = [...node.querySelectorAll('*')].filter(el => {
+                        const delta = isY
+                            ? el.scrollHeight - el.clientHeight
+                            : el.scrollWidth - el.clientWidth;
+                        return delta > 2;
+                    }).sort((a, b) => {
+                        const aDelta = isY ? a.scrollHeight - a.clientHeight : a.scrollWidth - a.clientWidth;
+                        const bDelta = isY ? b.scrollHeight - b.clientHeight : b.scrollWidth - b.clientWidth;
+                        return bDelta - aDelta;
+                    });
+                    const element = candidates[0];
+                    if (!element) return false;
+                    const before = isY ? element.scrollTop : element.scrollLeft;
+                    const max = isY
+                        ? element.scrollHeight - element.clientHeight
+                        : element.scrollWidth - element.clientWidth;
+                    const step = Math.max((isY ? element.clientHeight : element.clientWidth) * 0.75, 40);
+                    if (isY) {
+                        element.scrollTop = Math.min(element.scrollTop + step, max);
+                    } else {
+                        element.scrollLeft = Math.min(element.scrollLeft + step, max);
+                    }
+                    element.dispatchEvent(new Event('scroll', { bubbles: true }));
+                    const after = isY ? element.scrollTop : element.scrollLeft;
+                    return after > before + 0.5;
+                }""",
+                axis,
+            )
+
+        await snapshot()
+        horizontal_moves = 0
+        vertical_moves = 0
+
+        for _ in range(self.max_scroll_steps + 1):
+            await reset_axis("y")
+            await snapshot()
+
+            if scrollable or merger.row_count() > 0:
                 for _ in range(self.max_scroll_steps):
-                    moved_down = await locator.evaluate(
-                        """node => {
-                            const element = [...node.querySelectorAll('*')].filter(el => {
-                                const style = getComputedStyle(el);
-                                return /(auto|scroll)/.test(style.overflowY) && el.scrollHeight > el.clientHeight + 2;
-                            }).sort((a, b) => (b.scrollHeight - b.clientHeight) - (a.scrollHeight - a.clientHeight))[0];
-                            if (!element || element.scrollTop + element.clientHeight >= element.scrollHeight - 2) return false;
-                            element.scrollTop = Math.min(element.scrollTop + Math.max(element.clientHeight * .8, 1), element.scrollHeight);
-                            element.dispatchEvent(new Event('scroll', {bubbles: true}));
-                            return true;
-                        }"""
-                    )
-                    if not moved_down:
+                    moved = await scroll_axis("y")
+                    if not moved:
                         break
-                    await self.page.wait_for_timeout(200)
-                    await collect()
-            moved_right = await locator.evaluate(
-                """node => {
-                    const element = [...node.querySelectorAll('*')].filter(el => {
-                        const style = getComputedStyle(el);
-                        return /(auto|scroll)/.test(style.overflowX) && el.scrollWidth > el.clientWidth + 2;
-                    }).sort((a, b) => (b.scrollWidth - b.clientWidth) - (a.scrollWidth - a.clientWidth))[0];
-                    if (!element || element.scrollLeft + element.clientWidth >= element.scrollWidth - 2) return false;
-                    element.scrollLeft = Math.min(element.scrollLeft + Math.max(element.clientWidth * .8, 1), element.scrollWidth);
-                    element.dispatchEvent(new Event('scroll', {bubbles: true}));
-                    return true;
-                }"""
-            )
+                    vertical_moves += 1
+                    await self.page.wait_for_timeout(250)
+                    await snapshot()
+
+            if not horizontally_scrollable and horizontal_moves == 0:
+                probe = await scroll_axis("x")
+                if probe:
+                    horizontal_moves += 1
+                    horizontally_scrollable = True
+                    await self.page.wait_for_timeout(250)
+                    await reset_axis("y")
+                    await snapshot()
+                    continue
+                break
+
+            moved_right = await scroll_axis("x")
             if not moved_right:
                 break
-            await self.page.wait_for_timeout(200)
+            horizontal_moves += 1
+            await self.page.wait_for_timeout(250)
 
-        return [list(row) for row in seen]
+        columns, rows = merger.to_table()
+        logger.info(
+            "Matrix scan complete | vertical_steps=%d | horizontal_steps=%d | rows=%d | cols=%d",
+            vertical_moves,
+            horizontal_moves,
+            len(rows),
+            len(columns),
+        )
+        return columns, rows, len(columns)
 
     async def _try_export(self, locator, visual: dict[str, Any], index: int) -> dict[str, Any]:
         export = dict(visual["export"], attempted=True, status="unavailable")
@@ -498,6 +678,27 @@ async def extract_visual_data(page, **kwargs) -> dict[str, Any]:
     return await VisualDataExporter(page, **kwargs).extract_dashboard_data(
         attempt_export=attempt_export
     )
+
+
+async def extract_filter_data(page) -> dict[str, Any]:
+    """Collect slicer/filter state only — skips table/matrix scrolling and exports."""
+    exporter = VisualDataExporter(page)
+    try:
+        filters = await exporter._extract_filter_state()
+        return {
+            "status": "success",
+            "extracted_at": datetime.now(timezone.utc).isoformat(),
+            "filters": filters,
+            "errors": [],
+        }
+    except Exception as exc:
+        logger.exception("Filter-only extraction failed")
+        return {
+            "status": "failed",
+            "extracted_at": datetime.now(timezone.utc).isoformat(),
+            "filters": [],
+            "errors": [str(exc)],
+        }
 
 
 async def apply_slicer_value(page, slicer_name: str, value: str) -> bool:

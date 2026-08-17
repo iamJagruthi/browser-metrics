@@ -20,6 +20,8 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from automation.validator import DashboardValidator
+from services.dashboard_inventory_service import load_inventory_snapshot
+from services.filter_service import load_filters_snapshot
 from utils.config import REPORT_DIR
 
 
@@ -45,6 +47,11 @@ class ValidateRequest(BaseModel):
     target_url: str
 
 
+class FiltersRequest(BaseModel):
+    source_url: str
+    target_url: str | None = None
+
+
 def _report_path(run_id: str, extension: str) -> Path:
     """Resolve a generated report without allowing path traversal."""
     if not re.fullmatch(r"[a-f0-9]{32}", run_id):
@@ -53,6 +60,12 @@ def _report_path(run_id: str, extension: str) -> Path:
     if not path.is_file():
         raise HTTPException(status_code=404, detail=f"{extension.upper()} report is not ready for this run.")
     return path
+
+
+def _filters_snapshot_path(run_id: str) -> Path:
+    if not re.fullmatch(r"[a-f0-9]{32}", run_id):
+        raise HTTPException(status_code=400, detail="Invalid validation run ID.")
+    return REPORT_DIR / f"{run_id}_filters.json"
 
 
 @app.get("/api/health")
@@ -72,8 +85,12 @@ async def report_status(run_id: str):
         "run_id": run_id,
         "excel_ready": (REPORT_DIR / f"{run_id}_dashboard_validation.xlsx").is_file(),
         "docx_ready": (REPORT_DIR / f"{run_id}_dashboard_validation.docx").is_file(),
+        "filters_ready": (REPORT_DIR / f"{run_id}_filters.json").is_file(),
+        "inventory_ready": (REPORT_DIR / f"{run_id}_inventory.json").is_file(),
         "excel_download_url": f"/api/reports/{run_id}/excel",
         "docx_download_url": f"/api/reports/{run_id}/docx",
+        "filters_url": f"/api/reports/{run_id}/filters",
+        "inventory_url": f"/api/reports/{run_id}/inventory",
     }
 
 
@@ -87,6 +104,78 @@ async def download_excel_report(run_id: str):
 async def download_docx_report(run_id: str):
     path = _report_path(run_id, "docx")
     return FileResponse(path, media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document", filename=path.name)
+
+
+@app.get("/api/reports/{run_id}/filters")
+async def get_run_filters(run_id: str):
+    """Return available filter values and selected state for a completed validation run."""
+    path = _filters_snapshot_path(run_id)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Filter snapshot is not ready for this run.")
+    payload = load_filters_snapshot(run_id, REPORT_DIR)
+    if payload is None:
+        raise HTTPException(status_code=404, detail="Filter snapshot is not ready for this run.")
+    return payload
+
+
+@app.get("/api/reports/{run_id}/inventory")
+async def get_run_inventory(run_id: str):
+    """Return filters (with selected values) and visual inventory counts for a run."""
+    if not re.fullmatch(r"[a-f0-9]{32}", run_id):
+        raise HTTPException(status_code=400, detail="Invalid validation run ID.")
+    path = REPORT_DIR / f"{run_id}_inventory.json"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Inventory snapshot is not ready for this run.")
+    payload = load_inventory_snapshot(run_id, REPORT_DIR)
+    if payload is None:
+        raise HTTPException(status_code=404, detail="Inventory snapshot is not ready for this run.")
+    return payload
+
+
+@app.post("/api/inventory")
+async def probe_inventory(request: FiltersRequest):
+    """Collect filters and visual inventory from dashboard URLs without full validation."""
+    source_url = request.source_url.strip()
+    if not source_url:
+        raise HTTPException(status_code=400, detail="source_url is required.")
+
+    links = [{"name": "Dashboard A", "url": source_url}]
+    target_url = (request.target_url or "").strip()
+    if target_url:
+        links.append({"name": "Dashboard B", "url": target_url})
+
+    try:
+        validator = DashboardValidator()
+        logger.info("Inventory probe request received | dashboards=%d", len(links))
+        result = await validator.run_inventory_probe(links)
+        logger.info("Inventory probe completed | dashboards=%d", len(result.get("dashboards", [])))
+        return result
+    except Exception:
+        logger.exception("Inventory probe request failed")
+        raise HTTPException(status_code=500, detail="Inventory probe failed. Review the server logs for details.")
+
+
+@app.post("/api/filters")
+async def probe_filters(request: FiltersRequest):
+    """Collect filter state from dashboard URLs without running full validation."""
+    source_url = request.source_url.strip()
+    if not source_url:
+        raise HTTPException(status_code=400, detail="source_url is required.")
+
+    links = [{"name": "Dashboard A", "url": source_url}]
+    target_url = (request.target_url or "").strip()
+    if target_url:
+        links.append({"name": "Dashboard B", "url": target_url})
+
+    try:
+        validator = DashboardValidator()
+        logger.info("Filter probe request received | dashboards=%d", len(links))
+        result = await validator.run_filter_probe(links)
+        logger.info("Filter probe completed | dashboards=%d", len(result.get("dashboards", [])))
+        return result
+    except Exception:
+        logger.exception("Filter probe request failed")
+        raise HTTPException(status_code=500, detail="Filter probe failed. Review the server logs for details.")
 
 
 @app.post("/api/validate")

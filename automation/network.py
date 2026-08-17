@@ -121,3 +121,20 @@ def summary():
             "console_messages": 0,
             "page_errors": 0,
         }
+
+
+def details(max_failed: int = 200, max_console: int = 200):
+    """Return detailed network events captured during a dashboard run."""
+    try:
+        return {
+            "failed_requests": list(failed_requests[:max_failed]),
+            "console_logs": list(console_logs[:max_console]),
+            "page_errors": list(page_errors[:max_failed]),
+        }
+    except Exception as e:
+        print(f"Error building network details: {e}")
+        return {
+            "failed_requests": [],
+            "console_logs": [],
+            "page_errors": [],
+        }

@@ -1,96 +1,54 @@
 """
-Test complete KPI comparison pipeline.
-
-Flow:
-Screenshot A
-    ↓
-OCR
-    ↓
-KPIs
-
-Screenshot B
-    ↓
-OCR
-    ↓
-KPIs
-
-Comparison
+Test KPI comparison using comparison_service (live validation path).
 """
 
-from extraction.ocr import extract_text
 from extraction.kpi_extractor import extract_kpis
-from automation.comparison import DashboardComparison
+from extraction.ocr import extract_text
+from services.comparison_service import compare_kpi_cards
 
 
 SOURCE_IMAGE = "output/screenshots/example_source.png"
 TARGET_IMAGE = "output/screenshots/example_target.png"
 
-print(SOURCE_IMAGE)
-print(TARGET_IMAGE)
 
 def main():
-
     print("=" * 60)
     print("POWER BI KPI VALIDATION")
     print("=" * 60)
 
-    # -----------------------------
-    # OCR
-    # -----------------------------
-
     print("\nRunning OCR...")
-
     source_ocr = extract_text(SOURCE_IMAGE)
     target_ocr = extract_text(TARGET_IMAGE)
 
-    # -----------------------------
-    # KPI Extraction
-    # -----------------------------
-
     print("Extracting KPIs...")
-
     source_kpis = extract_kpis(source_ocr)
     target_kpis = extract_kpis(target_ocr)
-
     print(f"Source KPIs : {len(source_kpis)}")
     print(f"Target KPIs : {len(target_kpis)}")
 
-    # -----------------------------
-    # Comparison
-    # -----------------------------
-
-    comparison = DashboardComparison()
-
-    results = comparison.compare_kpis(
-        source_kpis,
-        target_kpis
+    results = compare_kpi_cards(
+        {"kpi_cards": source_kpis},
+        {"kpi_cards": target_kpis},
     )
-
-    # -----------------------------
-    # Results
-    # -----------------------------
 
     print("\n")
     print("=" * 60)
     print("KPI COMPARISON RESULTS")
     print("=" * 60)
 
-    for result in results["results"]:
+    for result in results:
+        print(f"\nKPI      : {result.get('kpi')}")
+        print(f"Source   : {result.get('source')}")
+        print(f"Target   : {result.get('target')}")
+        print(f"Status   : {result.get('status')}")
 
-        print(f"\nKPI      : {result['kpi']}")
-        print(f"Source   : {result['source']}")
-        print(f"Target   : {result['target']}")
-        print(f"Status   : {result['status']}")
-
+    matches = sum(1 for item in results if item.get("status") == "Match")
     print("\n")
     print("=" * 60)
-
-    print(f"Total KPIs      : {results['total_kpis']}")
-    print(f"Matched         : {results['matched']}")
-    print(f"Near Matched    : {results['near_matched']}")
-    print(f"Mismatched      : {results['mismatched']}")
-    print(f"Match Percentage: {results['match_percentage']} %")
-
+    print(f"Total KPIs      : {len(results)}")
+    print(f"Matched         : {matches}")
+    if results:
+        print(f"Match Percentage: {round((matches / len(results)) * 100, 2)} %")
     print("=" * 60)
 
 

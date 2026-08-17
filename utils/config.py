@@ -8,17 +8,13 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
-# --------------------------------------------------
-# Load .env
-# --------------------------------------------------
-
-load_dotenv()
-
-# --------------------------------------------------
-# Project Paths
-# --------------------------------------------------
-
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# --------------------------------------------------
+# Load .env (project root only)
+# --------------------------------------------------
+
+load_dotenv(PROJECT_ROOT / ".env")
 
 OUTPUT_DIR = PROJECT_ROOT / os.getenv(
     "OUTPUT_DIR",
@@ -80,25 +76,6 @@ TABLE_COMPARE_KEY_COLUMNS = [
     for column in os.getenv("TABLE_COMPARE_KEY_COLUMNS", "").split(",")
     if column.strip()
 ]
-
-# --------------------------------------------------
-# Storage
-# --------------------------------------------------
-
-STORAGE_TYPE = os.getenv(
-    "STORAGE_TYPE",
-    "both"
-)
-
-CSV_FILE = OUTPUT_DIR / os.getenv(
-    "CSV_FILE",
-    "DashboardMetrics.csv"
-)
-
-EXCEL_FILE = OUTPUT_DIR / os.getenv(
-    "EXCEL_FILE",
-    "DashboardMetrics.xlsx"
-)
 
 # --------------------------------------------------
 # Create Required Directories

@@ -31,6 +31,60 @@ from openpyxl.utils import get_column_letter
 
 logger = logging.getLogger(__name__)
 
+# Jagruthi — ordered browser metrics sections aligned with automation/metrics.py
+_BROWSER_METRIC_SECTIONS = [
+    (
+        "Run Information",
+        [
+            "validation_run_id",
+            "run_id",
+            "timestamp",
+            "dashboard_name",
+            "dashboard_url",
+            "page_title",
+            "final_url",
+            "http_status",
+            "screenshot_path",
+            "extraction_status",
+            "extraction_error",
+        ],
+    ),
+    (
+        "Performance (seconds)",
+        [
+            "browser_launch_seconds",
+            "page_load_seconds",
+            "dashboard_render_seconds",
+            "screenshot_seconds",
+            "gemini_extraction_seconds",
+            "total_execution_seconds",
+        ],
+    ),
+    (
+        "Network Summary",
+        [
+            "total_requests",
+            "total_responses",
+            "failed_requests",
+            "console_messages",
+            "page_errors",
+        ],
+    ),
+]
+
+_SUMMARY_TIMING_METRICS = [
+    ("Browser Launch (sec)", "browser_launch_seconds"),
+    ("Page Load (sec)", "page_load_seconds"),
+    ("Dashboard Render (sec)", "dashboard_render_seconds"),
+    ("Screenshot (sec)", "screenshot_seconds"),
+    ("Gemini Extraction (sec)", "gemini_extraction_seconds"),
+    ("Total Execution (sec)", "total_execution_seconds"),
+    ("HTTP Requests", "total_requests"),
+    ("Failed Requests", "failed_requests"),
+    ("Console Messages", "console_messages"),
+    ("Page Errors", "page_errors"),
+]
+
 
 def _kpi_key(name):
     """Canonicalise a KPI label without deleting business terms."""
@@ -334,6 +388,28 @@ def _create_summary_sheet(
             + len(target_data.get("kpi_cards", [])),
         ),
     ]
+
+    source_metrics = metrics[0] if metrics else None
+    target_metrics = metrics[1] if metrics and len(metrics) > 1 else None
+    source_label = (
+        source_metrics.get("dashboard_name", "Source")
+        if source_metrics
+        else "Source"
+    )
+    target_label = (
+        target_metrics.get("dashboard_name", "Target")
+        if target_metrics
+        else "Target"
+    )
+    for label, key in _SUMMARY_TIMING_METRICS:
+        source_value = source_metrics.get(key, "N/A") if source_metrics else "N/A"
+        target_value = target_metrics.get(key, "N/A") if target_metrics else "N/A"
+        rows.append(
+            (
+                label,
+                f"{source_label}: {source_value} | {target_label}: {target_value}",
+            )
+        )
 
     _format_header(
         ws,
@@ -1277,71 +1353,183 @@ def _create_visual_comparison_sheet(
 # Browser Metrics
 # ---------------------------------------------------------
 
+def _format_metric_value(value):
+    if value is None:
+        return "N/A"
+    if isinstance(value, (list, dict)):
+        return _values_to_string(value)
+    return value
+
+
+def _browser_metric_status(source_value, target_value):
+    if source_value is None and target_value is None:
+        return "N/A"
+    if source_value is None:
+        return "Missing in Source"
+    if target_value is None:
+        return "Missing in Target"
+
+    source_text = str(_format_metric_value(source_value))
+    target_text = str(_format_metric_value(target_value))
+    if source_text == target_text:
+        return "Match"
+
+    try:
+        if float(source_text) == float(target_text):
+            return "Match"
+    except (ValueError, TypeError):
+        pass
+
+    return "Different"
+
+
 def _create_browser_metrics_sheet(
     wb,
     metrics,
 ):
-    """Create Browser Metrics worksheet."""
+    """Create a side-by-side Browser Metrics worksheet (Source vs Target)."""
 
-    logger.info(
-        "Creating Browser Metrics worksheet"
+    logger.info("Creating Browser Metrics worksheet")
+
+    ws = wb.create_sheet("Browser Metrics")
+
+    source_metrics = metrics[0] if metrics else None
+    target_metrics = metrics[1] if metrics and len(metrics) > 1 else None
+    source_label = (
+        source_metrics.get("dashboard_name", "Source")
+        if source_metrics
+        else "Source"
     )
-
-    ws = wb.create_sheet(
-        "Browser Metrics"
+    target_label = (
+        target_metrics.get("dashboard_name", "Target")
+        if target_metrics
+        else "Target"
     )
 
     headers = [
-        "Dashboard",
+        "Category",
         "Metric",
-        "Value",
+        source_label,
+        target_label,
+        "Status",
     ]
-
-    _format_header(
-        ws,
-        headers,
-    )
+    _format_header(ws, headers)
 
     row = 2
+    section_keys = {key for _, keys in _BROWSER_METRIC_SECTIONS for key in keys}
+    ordered_rows: list[tuple[str, str]] = []
 
+    for category, keys in _BROWSER_METRIC_SECTIONS:
+        for key in keys:
+            if (
+                (source_metrics and key in source_metrics)
+                or (target_metrics and key in target_metrics)
+            ):
+                ordered_rows.append((category, key))
+
+    extra_keys = set()
+    for dashboard_metrics in (source_metrics, target_metrics):
+        if not dashboard_metrics:
+            continue
+        for key in dashboard_metrics:
+            if key in section_keys or key in {"network_details", "dashboard_name"}:
+                continue
+            extra_keys.add(key)
+
+    for key in sorted(extra_keys):
+        ordered_rows.append(("Additional", key))
+
+    for category, key in ordered_rows:
+        source_value = source_metrics.get(key) if source_metrics else None
+        target_value = target_metrics.get(key) if target_metrics else None
+        status = _browser_metric_status(source_value, target_value)
+        values = [
+            category,
+            key,
+            _format_metric_value(source_value),
+            _format_metric_value(target_value),
+            status,
+        ]
+        for col_idx, item in enumerate(values, start=1):
+            cell = ws.cell(row=row, column=col_idx, value=item)
+            _style_cell(cell)
+            if col_idx == 5 and status not in {"Match", "N/A"}:
+                cell.fill = PatternFill(fill_type="solid", fgColor="FCE4D6")
+        row += 1
+
+    if row == 2:
+        for col_idx, value in enumerate(
+            ["N/A", "No browser metrics captured", "N/A", "N/A", "N/A"],
+            start=1,
+        ):
+            _style_cell(ws.cell(row=2, column=col_idx, value=value))
+
+    _auto_fit(ws)
+
+
+def _create_network_details_sheet(wb, metrics):
+    """Write failed requests, console logs, and page errors per dashboard."""
+
+    logger.info("Creating Network Details worksheet")
+
+    ws = wb.create_sheet("Network Details")
+
+    headers = [
+        "Dashboard",
+        "Event Type",
+        "Detail 1",
+        "Detail 2",
+        "Detail 3",
+    ]
+    _format_header(ws, headers)
+
+    row = 2
     for dashboard_metrics in metrics:
-
         if not dashboard_metrics:
             continue
 
-        dashboard_name = dashboard_metrics.get(
-            "dashboard_name",
-            "N/A",
-        )
+        dashboard_name = dashboard_metrics.get("dashboard_name", "N/A")
+        network_details = dashboard_metrics.get("network_details") or {}
 
-        for key, value in dashboard_metrics.items():
-
-            if key == "dashboard_name":
-                continue
-
-            if isinstance(value, dict):
-                value = str(value)
-
+        for item in network_details.get("failed_requests", []):
             values = [
                 dashboard_name,
-                key,
-                value,
+                "Failed Request",
+                item.get("url", "N/A"),
+                item.get("status", "N/A"),
+                item.get("status_text", "N/A"),
             ]
-
-            for col_idx, item in enumerate(
-                values,
-                start=1,
-            ):
-
-                _style_cell(
-                    ws.cell(
-                        row=row,
-                        column=col_idx,
-                        value=item,
-                    )
-                )
-
+            for col_idx, value in enumerate(values, start=1):
+                _style_cell(ws.cell(row=row, column=col_idx, value=value))
             row += 1
+
+        for item in network_details.get("console_logs", []):
+            values = [
+                dashboard_name,
+                "Console",
+                item.get("type", "N/A"),
+                item.get("text", "N/A"),
+                "",
+            ]
+            for col_idx, value in enumerate(values, start=1):
+                _style_cell(ws.cell(row=row, column=col_idx, value=value))
+            row += 1
+
+        for item in network_details.get("page_errors", []):
+            values = [
+                dashboard_name,
+                "Page Error",
+                str(item),
+                "",
+                "",
+            ]
+            for col_idx, value in enumerate(values, start=1):
+                _style_cell(ws.cell(row=row, column=col_idx, value=value))
+            row += 1
+
+    if row == 2:
+        _style_cell(ws.cell(row=2, column=1, value="N/A"))
+        _style_cell(ws.cell(row=2, column=2, value="No network events captured"))
 
     _auto_fit(ws)
 
@@ -1634,6 +1822,11 @@ def export_validation_workbook(
         )
 
         _create_browser_metrics_sheet(
+            wb,
+            metrics,
+        )
+
+        _create_network_details_sheet(
             wb,
             metrics,
         )
