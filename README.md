@@ -13,6 +13,67 @@ The backend captures browser/network metrics, reads rendered Power BI visuals an
 
 The frontend calls `POST /api/validate` with `source_url` and `target_url`; `GET /api/health` confirms the service is running.
 
+## Git workflow (team)
+
+Do **not** push directly to `main`. Use `dev` as the shared integration branch.
+
+| Branch | Purpose |
+|--------|---------|
+| `main` | Production-ready code only (merge from `dev` via pull request) |
+| `dev` | Daily integration — **push your work here** (or open a PR into `dev`) |
+| `feature/*` | Optional personal branches → PR into `dev` |
+
+### Clone and start on `dev`
+
+```bash
+git clone https://github.com/iamJagruthi/browser-metrics.git
+cd browser-metrics
+git checkout dev
+git pull origin dev
+```
+
+### Day-to-day
+
+```bash
+git checkout dev
+git pull origin dev
+# ... make changes ...
+git add <files>
+git commit -m "Describe your change"
+git push origin dev
+```
+
+### Install local hook (blocks accidental `git push origin main`)
+
+```powershell
+# Windows
+.\scripts\install-git-hooks.ps1
+```
+
+```bash
+# macOS / Linux
+./scripts/install-git-hooks.sh
+```
+
+### Protect `main` on GitHub (repo admin)
+
+In GitHub → **Settings** → **Branches** → **Add branch protection rule** for `main`:
+
+- Require a pull request before merging
+- Do not allow bypassing the above settings
+- (Optional) Require approvals
+
+Set **default branch** to `dev` under **Settings** → **General** so new PRs target `dev` by default.
+
+Full admin checklist (screenshots-level steps): **`docs/GITHUB_BRANCH_POLICY.md`**
+
+Optional API setup (repo admin PAT):
+
+```powershell
+$env:GITHUB_TOKEN = "ghp_your_personal_access_token"
+.\scripts\setup-github-branch-protection.ps1
+```
+
 ## Generated reports
 
 Each successful validation writes reports beneath `output/reports/`:

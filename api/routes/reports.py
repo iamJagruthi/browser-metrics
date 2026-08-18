@@ -14,6 +14,7 @@ from fastapi.responses import FileResponse
 from api.dependencies import validate_run_id
 from services.dashboard_inventory_service import load_inventory_snapshot, load_pages_snapshot
 from services.filter_service import load_filters_snapshot
+from services.mismatch_service import load_mismatch_snapshot
 from utils.config import REPORT_DIR
 
 
@@ -50,11 +51,13 @@ async def report_status(run_id: str) -> dict[str, object]:
             "filters_ready": (REPORT_DIR / f"{run_id}_filters.json").is_file(),
             "inventory_ready": (REPORT_DIR / f"{run_id}_inventory.json").is_file(),
             "pages_ready": (REPORT_DIR / f"{run_id}_pages.json").is_file(),
+            "mismatches_ready": (REPORT_DIR / f"{run_id}_mismatches.json").is_file(),
             "excel_download_url": f"/api/reports/{run_id}/excel",
             "docx_download_url": f"/api/reports/{run_id}/docx",
             "filters_url": f"/api/reports/{run_id}/filters",
             "inventory_url": f"/api/reports/{run_id}/inventory",
             "pages_url": f"/api/reports/{run_id}/pages",
+            "mismatches_url": f"/api/reports/{run_id}/mismatches",
         }
     except HTTPException:
         raise
@@ -147,3 +150,23 @@ async def get_run_pages(run_id: str) -> dict:
     except Exception:
         logger.exception("Pages snapshot read failed | run_id=%s", run_id)
         raise HTTPException(status_code=500, detail="Unable to load pages snapshot.")
+
+
+@router.get("/{run_id}/mismatches")
+async def get_run_mismatches(run_id: str) -> dict:
+    """Jagruthi — mismatch-only comparison data for frontend diff views."""
+    try:
+        validate_run_id(run_id)
+        payload = load_mismatch_snapshot(run_id, REPORT_DIR)
+        if payload is None:
+            logger.warning("Mismatch snapshot missing | run_id=%s", run_id)
+            raise HTTPException(
+                status_code=404,
+                detail="Mismatch snapshot is not ready for this run.",
+            )
+        return payload
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Mismatch snapshot read failed | run_id=%s", run_id)
+        raise HTTPException(status_code=500, detail="Unable to load mismatch snapshot.")
