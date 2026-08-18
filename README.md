@@ -65,6 +65,15 @@ In GitHub → **Settings** → **Branches** → **Add branch protection rule** f
 
 Set **default branch** to `dev` under **Settings** → **General** so new PRs target `dev` by default.
 
+Full admin checklist (screenshots-level steps): **`docs/GITHUB_BRANCH_POLICY.md`**
+
+Optional API setup (repo admin PAT):
+
+```powershell
+$env:GITHUB_TOKEN = "ghp_your_personal_access_token"
+.\scripts\setup-github-branch-protection.ps1
+```
+
 ## Generated reports
 
 Each successful validation writes reports beneath `output/reports/`:
