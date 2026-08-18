@@ -15,6 +15,7 @@ from services.dashboard_inventory_service import (
     save_inventory_snapshot,
     save_pages_snapshot,
 )
+from services.mismatch_service import build_mismatch_payload, save_mismatch_snapshot
 from services.filter_service import build_filters_api_payload, save_filters_snapshot
 from services.visual_data_exporter import apply_slicer_value, extract_filter_data, extract_visual_data
 from utils.config import DASHBOARD_CONFIG, OUTPUT_DIR, PAGE_TIMEOUT, SCREENSHOT_DIR
@@ -582,10 +583,12 @@ class DashboardValidator:
                     "filters": f"/api/reports/{run_id}/filters",
                     "inventory": f"/api/reports/{run_id}/inventory",
                     "pages": f"/api/reports/{run_id}/pages",
+                    "mismatches": f"/api/reports/{run_id}/mismatches",
                 },
                 "filters": filters_payload,
                 "inventory": inventory_payload,
                 "pages": pages_payload,
+                "mismatches": report_paths.get("mismatches_data"),
                 "llm_results": llm_results,
                 "filter_state": filter_state,
             }
@@ -956,6 +959,18 @@ class DashboardValidator:
             )
             save_pages_snapshot(run_id, pages_payload, OUTPUT_DIR / "reports")
             paths["pages"] = str(OUTPUT_DIR / "reports" / f"{run_id}_pages.json")
+            mismatch_payload = build_mismatch_payload(
+                comparison,
+                visual_data={
+                    "Source": executions[0]["visual_data"],
+                    "Target": executions[1]["visual_data"],
+                },
+                metrics=[item["metrics"] for item in executions],
+                run_id=run_id,
+            )
+            save_mismatch_snapshot(run_id, mismatch_payload, OUTPUT_DIR / "reports")
+            paths["mismatches"] = str(OUTPUT_DIR / "reports" / f"{run_id}_mismatches.json")
+            paths["mismatches_data"] = mismatch_payload
         except Exception:
             logger.exception("Filter/inventory snapshot save failed | run_id=%s", run_id)
 
