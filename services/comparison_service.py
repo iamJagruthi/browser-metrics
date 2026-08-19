@@ -19,15 +19,6 @@ from services.excel_exporter import build_comparison_summary, compare_kpis
 logger = logging.getLogger(__name__)
 
 
-def compare_kpi_cards(source_data: dict[str, Any], target_data: dict[str, Any]) -> list[dict[str, Any]]:
-    """Compare KPI cards between source and target dashboard payloads."""
-    try:
-        return compare_kpis(source_data, target_data)
-    except Exception:
-        logger.exception("KPI card comparison failed")
-        raise
-
-
 def compare_dashboard_payloads(
     source_data: dict[str, Any],
     target_data: dict[str, Any],
