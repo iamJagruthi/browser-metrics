@@ -19,6 +19,8 @@ from services.mismatch_service import build_mismatch_payload, save_mismatch_snap
 from services.filter_service import build_filters_api_payload, save_filters_snapshot
 from services.visual_data_exporter import apply_slicer_value, extract_filter_data, extract_visual_data
 from utils.config import DASHBOARD_CONFIG, OUTPUT_DIR, PAGE_TIMEOUT, SCREENSHOT_DIR
+from ai.Text_Extraction import extract_dashboard_json
+from automation.SlicerEngine import SlicerEngine
 
 
 logger = logging.getLogger(__name__)
@@ -987,137 +989,68 @@ class DashboardValidator:
         response,
         page_name,
     ):
-        """Process one currently selected dashboard page."""
+        """Process one currently selected dashboard page and run AI on random filter selections."""
+        
+        executions = []
+        engine = SlicerEngine(page)
 
-        extraction = {
-            "status": "failed",
-            "data": None,
-            "error": None,
+        # ---------------------------------------------------------
+        # STEP 1: Process the default (unfiltered) page state
+        # ---------------------------------------------------------
+        logger.info(f"Processing default state for page: {page_name}")
+        default_screenshot = SCREENSHOT_DIR / f"{dashboard['name']}_{page_name}_default_{uuid.uuid4().hex[:8]}.png"
+        await page.screenshot(path=str(default_screenshot), full_page=True)
+        
+        default_ai_data = await asyncio.to_thread(extract_dashboard_json, default_screenshot)
+        
+        executions.append({
+            "page_name": page_name,
+            "state": "default",
+            "filter_applied": None,
+            "ai_data": default_ai_data,
+            "screenshot": str(default_screenshot)
+        })
+
+        # ---------------------------------------------------------
+        # STEP 2: Find filters and apply random options
+        # ---------------------------------------------------------
+        detected_filters = await engine.extract_filters_from_dom()
+        
+        if detected_filters:
+            # Grab the first two filters (e.g., "Time Period", "Relative Time")
+            target_filters = detected_filters[:2]
+            
+            for f_name in target_filters:
+                logger.info(f"Applying random option to filter: {f_name}")
+                
+                # Apply a random valid option
+                applied_option = await engine.apply_random_valid_option(f_name)
+                
+                if applied_option:
+                    # Wait for DAX queries and visuals to recalculate
+                    logger.info("Waiting 4.5s for Power BI visuals to recalculate...")
+                    await page.wait_for_timeout(4500)
+                    
+                    # Take a new screenshot of the filtered state
+                    filtered_screenshot = SCREENSHOT_DIR / f"{dashboard['name']}_{page_name}_{f_name}_{uuid.uuid4().hex[:8]}.png"
+                    await page.screenshot(path=str(filtered_screenshot), full_page=True)
+                    
+                    # Send the new screenshot to the AI
+                    filtered_ai_data = await asyncio.to_thread(extract_dashboard_json, filtered_screenshot)
+                    
+                    executions.append({
+                        "page_name": page_name,
+                        "state": "filtered",
+                        "filter_applied": f"{f_name} = {applied_option}",
+                        "ai_data": filtered_ai_data,
+                        "screenshot": str(filtered_screenshot)
+                    })
+
+        return {
+            "dashboard": {**dashboard, "page_name": page_name},
+            "page_executions": executions,
+            "_page": page,
         }
-
-        visual_data = {
-            "status": "failed",
-            "filters": [],
-            "visuals": [],
-            "errors": [],
-        }
-
-        self.timer.reset()
-        self.timer.start("total_execution")
-
-        try:
-            # Screenshot
-            self.timer.start("screenshot")
-
-            screenshot_path = (
-                SCREENSHOT_DIR
-                / f"{dashboard['name']}_{page_name}_{uuid.uuid4().hex[:8]}.png"
-            )
-
-            await page.screenshot(
-                path=str(screenshot_path),
-                full_page=True,
-            )
-
-            self.timer.stop("screenshot")
-
-            # Visual data extraction
-            visual_data = await extract_visual_data(
-                page,
-                download_directory=OUTPUT_DIR / "visual_exports",
-                attempt_export=True,
-            )
-
-            # AI / text extraction
-            self.timer.start("ocr")
-
-            try:
-                from ai.Text_Extraction import extract_dashboard_json
-
-                extraction["data"] = await asyncio.to_thread(
-                    extract_dashboard_json,
-                    screenshot_path,
-                )
-
-                self._merge_dom_filters(
-                    extraction["data"],
-                    visual_data,
-                )
-                self._merge_dom_kpis(
-                    extraction["data"],
-                    visual_data,
-                )
-
-                extraction["status"] = "success"
-
-            except Exception as exc:
-                extraction["error"] = str(exc)
-
-            finally:
-                self.timer.stop("ocr")
-
-            self.timer.stop("total_execution")
-
-            metrics = build_metrics(
-                dashboard_name=dashboard["name"],
-                dashboard_url=dashboard["url"],
-                timers=self.timer.summary(),
-                network_summary=summary(),
-                network_details=details(),
-                page_title=await page.title(),
-                final_url=page.url,
-                http_status=response.status if response else None,
-            )
-
-            metrics["page_name"] = page_name
-            metrics["screenshot_path"] = str(screenshot_path)
-            metrics["extraction_status"] = extraction["status"]
-            if extraction.get("error"):
-                metrics["extraction_error"] = extraction["error"]
-
-            return {
-                "dashboard": {
-                    **dashboard,
-                    "page_name": page_name,
-                },
-                "metrics": metrics,
-                "extraction": extraction,
-                "visual_data": visual_data,
-                "_page": page,
-            }
-
-        except Exception as exc:
-            logger.exception(
-                "Dashboard page processing failed | dashboard=%s | page=%s",
-                dashboard.get("name"),
-                page_name,
-            )
-
-            try:
-                self.timer.stop("total_execution")
-            except Exception:
-                pass
-
-            return {
-                "dashboard": {
-                    **dashboard,
-                    "page_name": page_name,
-                },
-                "metrics": None,
-                "extraction": {
-                    "status": "failed",
-                    "data": None,
-                    "error": str(exc),
-                },
-                "visual_data": {
-                    "status": "failed",
-                    "filters": [],
-                    "visuals": [],
-                    "errors": [str(exc)],
-                },
-                "_page": page,
-            }
-
     # ============================================================
     # Arun - Multi Page Dashboard Navigation
     # ============================================================
