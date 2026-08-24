@@ -55,10 +55,9 @@ class SlicerEngine:
         logger.info(f"Reading options for filter: '{filter_name}'")
         options = []
         try:
-            # 1. Force close any lingering dropdown
             await self._close_any_open_popups()
 
-            # 2. Locate exact visual container
+            # 1. Locate visual container for this slicer
             slicer_visual = self.page.locator(
                 f"visual-container:has(.slicer-header-text:text-is('{filter_name}'))"
             ).first
@@ -71,38 +70,50 @@ class SlicerEngine:
                 logger.warning(f"Slicer visual '{filter_name}' not found in DOM.")
                 return options
 
-            # 3. Click dropdown trigger
+            # 2. Determine if it's a Dropdown vs On-Canvas visual (Checkboxes/Radio/Tiles)
             dropdown_btn = slicer_visual.locator(
                 ".slicer-dropdown-menu, .slicer-rest-item, [role='combobox']"
             ).first
-            
-            if await dropdown_btn.count() == 0:
-                logger.warning(f"Dropdown trigger for '{filter_name}' not found.")
-                return options
 
-            await dropdown_btn.click(force=True)
+            container = slicer_visual
 
-            # 4. Wait explicitly for a visible popup to appear
-            popup = self.page.locator(".slicer-dropdown-popup:visible").first
+            if await dropdown_btn.count() > 0:
+                await dropdown_btn.click(force=True)
+                popup = self.page.locator(".slicer-dropdown-popup:visible").first
+                try:
+                    await popup.wait_for(state="visible", timeout=3000)
+                    container = popup
+                except Exception:
+                    logger.warning(f"Dropdown popup failed to open for '{filter_name}'.")
+                    return options
+
+            # 3. Comprehensive Selector: Catches Checkboxes, Radio Buttons, Tiles, and Lists
+            items = container.locator(
+                ".slicerItemContainer .slicerText, "
+                "[role='checkbox'], "
+                "[role='radio'], "
+                "[role='option'], "
+                "[role='treeitem'], "
+                ".slicer-checkbox, "
+                ".slicerText"
+            )
+
             try:
-                await popup.wait_for(state="visible", timeout=3000)
+                # Wait up to 3 seconds for options to render
+                await items.first.wait_for(state="visible", timeout=3000)
             except Exception:
-                logger.warning(f"Popup failed to open for filter '{filter_name}'.")
+                logger.warning(f"No option items rendered for filter '{filter_name}'.")
+                await self._close_any_open_popups()
                 return options
 
-            # 5. Read options from the newly verified popup
-            items = popup.locator(".slicerItemContainer .slicerText")
             count = await items.count()
-
             for i in range(min(count, 15)):
                 txt = await items.nth(i).text_content()
                 clean = txt.strip() if txt else ""
                 if clean and clean not in options:
                     options.append(clean)
 
-            # 6. Clean up popup state
             await self._close_any_open_popups()
-
             logger.info(f"✅ Discovered options for '{filter_name}': {options}")
             return options
 
@@ -110,54 +121,70 @@ class SlicerEngine:
             logger.error(f"Error reading options for '{filter_name}': {e}")
             await self._close_any_open_popups()
             return options
+
+         
     
     async def apply_filter(self, filter_name: str, option_value: str):
-        """Auto-selects option in active popup after ensuring clean popup state."""
         logger.info(f"Applying filter: [{filter_name} = '{option_value}']")
         try:
-            # 1. Close any leftover popups first
             await self._close_any_open_popups()
 
-            # 2. Locate visual container using exact text match
-            slicer_visual = self.page.locator(f"visual-container:has(.slicer-header-text:text-is('{filter_name}'))").first
+            slicer_visual = self.page.locator(
+                f"visual-container:has(.slicer-header-text:text-is('{filter_name}'))"
+            ).first
             if await slicer_visual.count() == 0:
-                slicer_visual = self.page.locator(f"visual-container:has(.slicer-header-text:has-text('{filter_name}'))").first
+                slicer_visual = self.page.locator(
+                    f"visual-container:has(.slicer-header-text:has-text('{filter_name}'))"
+                ).first
 
-            # 3. Click dropdown trigger button
-            dropdown_btn = slicer_visual.locator(".slicer-dropdown-menu, .slicer-rest-item, [role='combobox']").first
+            if await slicer_visual.count() == 0:
+                logger.warning(f"Slicer visual '{filter_name}' not found.")
+                return
+
+            dropdown_btn = slicer_visual.locator(
+                ".slicer-dropdown-menu, .slicer-rest-item, [role='combobox']"
+            ).first
+
+            container = slicer_visual
+
             if await dropdown_btn.count() > 0:
                 await dropdown_btn.click(force=True)
-                await self.page.wait_for_timeout(600)
+                popup = self.page.locator(".slicer-dropdown-popup:visible").first
+                try:
+                    await popup.wait_for(state="visible", timeout=3000)
+                    container = popup
+                except Exception:
+                    logger.warning(f"Popup failed to open for '{filter_name}'.")
+                    return
 
-            # 4. Target freshly opened popup
-            popup = self.page.locator(".slicer-dropdown-popup:visible, .slicer-dropdown-popup.focused").first
+            # Target the specific option whether it's a Checkbox, Radio, or List item
+            target_el = container.locator(
+                f".slicerText:text-is('{option_value}'), "
+                f"[role='checkbox']:has-text('{option_value}'), "
+                f"[role='radio']:has-text('{option_value}'), "
+                f".slicerItemContainer:has-text('{option_value}')"
+            ).first
 
-            # 5. Find matching item row
-            target_row = popup.locator(f".slicerItemContainer:has(.slicerText:text-is('{option_value}'))").first
-            if await target_row.count() == 0:
-                target_row = popup.locator(f".slicerItemContainer:has(.slicerText:has-text('{option_value}'))").first
+            if await target_el.count() == 0:
+                # Fallback for whitespace or partial string matching
+                target_el = container.locator(
+                    f".slicerText:has-text('{option_value}')"
+                ).first
 
-            if await target_row.count() > 0:
-                await target_row.scroll_into_view_if_needed()
-                await self.page.wait_for_timeout(200)
-
-                text_el = target_row.locator(".slicerText").first
-                if await text_el.count() > 0:
-                    await text_el.click(force=True)
-                else:
-                    await target_row.click(force=True)
-
-                logger.info(f"✅ Successfully selected option '{option_value}' under '{filter_name}'.")
+            if await target_el.count() > 0:
+                await target_el.scroll_into_view_if_needed()
+                await target_el.click(force=True)
+                logger.info(f"✅ Successfully clicked option '{option_value}' under '{filter_name}'.")
             else:
-                logger.warning(f"Option '{option_value}' not found in '{filter_name}' dropdown popup.")
+                logger.warning(f"Option '{option_value}' not found in '{filter_name}'.")
 
-            # 6. Close popup menu and pause for DAX recalculations
             await self.page.keyboard.press("Escape")
             await self.page.wait_for_timeout(3000)
 
         except Exception as e:
             logger.error(f"Error applying filter '{filter_name}' = '{option_value}': {e}")
             await self._close_any_open_popups()
+
 
     async def extract_kpi_cards(self, max_retries: int = 2) -> dict:
         """Extracts KPI card values, retrying automatically if visuals return empty or N/A."""
