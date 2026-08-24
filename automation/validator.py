@@ -98,7 +98,7 @@ class DashboardValidator:
                         page_name=page_name,
                     )
 
-                    executions.append(execution)
+                    executions.extend(execution)
 
                 try:
                     self.timer.stop("total_execution")
@@ -555,7 +555,7 @@ class DashboardValidator:
                 "run_id": run_id,
                 "dashboards": public_executions,
                 "metrics": [
-                    item["metrics"]
+                    item.get("metrics", {})
                     for item in executions
                 ],
                 "kpis": [
@@ -921,7 +921,7 @@ class DashboardValidator:
                 comparison_payload.get("kpis", []),
                 comparison_payload.get("visuals", []),
                 comparison_payload.get("summary", {}),
-                [item["metrics"] for item in executions],
+                [item.get("metrics", {}) for item in executions],
                 OUTPUT_DIR / "reports",
                 visual_data={
                     "Source": executions[0]["visual_data"],
@@ -1007,18 +1007,19 @@ class DashboardValidator:
             
             # Structure as standard execution payload
             executions.append({
-                "dashboard": {
-                    **dashboard, 
-                    "page_name": page_name,
-                    "filter_applied": "Default View"
-                },
+            "dashboard": {
+                **dashboard, 
                 "page_name": page_name,
-                "filter_applied": "Default View",
-                "extraction": {"status": "success", "data": default_ai_data, "error": None},
-                "visual_data": default_visual_data,
-                "screenshot": str(default_screenshot),
-                "_page": page,
-            })
+                "filter_applied": "Default View"
+            },
+            "page_name": page_name,
+            "filter_applied": "Default View",
+            "extraction": {"status": "success", "data": default_ai_data, "error": None},
+            "visual_data": default_visual_data,
+            "metrics": metrics,  # <--- MAKE SURE THIS KEY IS INCLUDED
+            "screenshot": str(default_screenshot),
+            "_page": page,
+        })
 
             # ---------------------------------------------------------
             # STEP 2: Find filters and apply random options
