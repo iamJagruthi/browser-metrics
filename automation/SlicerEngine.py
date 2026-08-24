@@ -8,17 +8,6 @@ class SlicerEngine:
     def __init__(self, page: Page):
         self.page = page
 
-    # ... [Keep your existing _close_any_open_popups, count_slicers, extract_filters_from_dom, get_filter_options, apply_filter methods exactly as they are] ...
-    async def _close_any_open_popups(self):
-        """Ensures any currently open dropdown popup is closed before inspecting another slicer."""
-        try:
-            popup = self.page.locator(".slicer-dropdown-popup:visible")
-            if await popup.count() > 0:
-                await self.page.keyboard.press("Escape")
-                await self.page.wait_for_timeout(400)
-        except Exception:
-            pass
-
     async def count_slicers(self) -> int:
         """Counts filter header titles in DOM."""
         try:
@@ -44,31 +33,64 @@ class SlicerEngine:
             logger.error(f"Error extracting DOM filter titles: {e}")
             return filter_names
 
+    async def _close_any_open_popups(self):
+        """Guarantees all floating dropdown overlays are closed and hidden."""
+        try:
+            popup = self.page.locator(".slicer-dropdown-popup")
+            if await popup.count() > 0:
+                # Press Escape twice to ensure multi-level popups close
+                await self.page.keyboard.press("Escape")
+                await self.page.keyboard.press("Escape")
+                # Wait until the popup is detached or hidden from DOM
+                await popup.first.wait_for(state="hidden", timeout=1500)
+        except Exception:
+            # Fallback: click neutral background area to close overlays
+            try:
+                await self.page.mouse.click(10, 10)
+                await self.page.wait_for_timeout(300)
+            except Exception:
+                pass
+
     async def get_filter_options(self, filter_name: str) -> list[str]:
-        """Ensures clean state, opens specific dropdown using exact title matching, and reads items."""
         logger.info(f"Reading options for filter: '{filter_name}'")
         options = []
         try:
-            # 1. Close any previously open dropdown to prevent reading old options
+            # 1. Force close any lingering dropdown
             await self._close_any_open_popups()
 
-            # 2. Locate exact visual container matching the filter title strictly (:text-is)
-            slicer_visual = self.page.locator(f"visual-container:has(.slicer-header-text:text-is('{filter_name}'))").first
+            # 2. Locate exact visual container
+            slicer_visual = self.page.locator(
+                f"visual-container:has(.slicer-header-text:text-is('{filter_name}'))"
+            ).first
             if await slicer_visual.count() == 0:
-                slicer_visual = self.page.locator(f"visual-container:has(.slicer-header-text:has-text('{filter_name}'))").first
+                slicer_visual = self.page.locator(
+                    f"visual-container:has(.slicer-header-text:has-text('{filter_name}'))"
+                ).first
 
             if await slicer_visual.count() == 0:
                 logger.warning(f"Slicer visual '{filter_name}' not found in DOM.")
                 return options
 
-            # 3. Click dropdown trigger button for THIS specific slicer
-            dropdown_btn = slicer_visual.locator(".slicer-dropdown-menu, .slicer-rest-item, [role='combobox']").first
-            if await dropdown_btn.count() > 0:
-                await dropdown_btn.click(force=True)
-                await self.page.wait_for_timeout(600)
+            # 3. Click dropdown trigger
+            dropdown_btn = slicer_visual.locator(
+                ".slicer-dropdown-menu, .slicer-rest-item, [role='combobox']"
+            ).first
+            
+            if await dropdown_btn.count() == 0:
+                logger.warning(f"Dropdown trigger for '{filter_name}' not found.")
+                return options
 
-            # 4. Read items from the newly opened popup overlay
-            popup = self.page.locator(".slicer-dropdown-popup:visible, .slicer-dropdown-popup.focused").first
+            await dropdown_btn.click(force=True)
+
+            # 4. Wait explicitly for a visible popup to appear
+            popup = self.page.locator(".slicer-dropdown-popup:visible").first
+            try:
+                await popup.wait_for(state="visible", timeout=3000)
+            except Exception:
+                logger.warning(f"Popup failed to open for filter '{filter_name}'.")
+                return options
+
+            # 5. Read options from the newly verified popup
             items = popup.locator(".slicerItemContainer .slicerText")
             count = await items.count()
 
@@ -78,9 +100,8 @@ class SlicerEngine:
                 if clean and clean not in options:
                     options.append(clean)
 
-            # 5. Close popup menu cleanly
-            await self.page.keyboard.press("Escape")
-            await self.page.wait_for_timeout(400)
+            # 6. Clean up popup state
+            await self._close_any_open_popups()
 
             logger.info(f"✅ Discovered options for '{filter_name}': {options}")
             return options
@@ -89,7 +110,7 @@ class SlicerEngine:
             logger.error(f"Error reading options for '{filter_name}': {e}")
             await self._close_any_open_popups()
             return options
-
+    
     async def apply_filter(self, filter_name: str, option_value: str):
         """Auto-selects option in active popup after ensuring clean popup state."""
         logger.info(f"Applying filter: [{filter_name} = '{option_value}']")
@@ -178,6 +199,7 @@ class SlicerEngine:
             opt for opt in options 
             if opt.strip().lower() not in {"select all", "all", "(blank)", ""}
         ]
+        print(f"Valid options for '{filter_name}': {valid_options}")
 
         if not valid_options:
             logger.warning(f"No valid random options found for '{filter_name}'.")

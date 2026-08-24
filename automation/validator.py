@@ -983,74 +983,83 @@ class DashboardValidator:
     # ============================================================
 
     async def process_dashboard_page(
-        self,
-        dashboard,
-        page,
-        response,
-        page_name,
-    ):
-        """Process one currently selected dashboard page and run AI on random filter selections."""
-        
-        executions = []
-        engine = SlicerEngine(page)
-
-        # ---------------------------------------------------------
-        # STEP 1: Process the default (unfiltered) page state
-        # ---------------------------------------------------------
-        logger.info(f"Processing default state for page: {page_name}")
-        default_screenshot = SCREENSHOT_DIR / f"{dashboard['name']}_{page_name}_default_{uuid.uuid4().hex[:8]}.png"
-        await page.screenshot(path=str(default_screenshot), full_page=True)
-        
-        default_ai_data = await asyncio.to_thread(extract_dashboard_json, default_screenshot)
-        
-        executions.append({
-            "page_name": page_name,
-            "state": "default",
-            "filter_applied": None,
-            "ai_data": default_ai_data,
-            "screenshot": str(default_screenshot)
-        })
-
-        # ---------------------------------------------------------
-        # STEP 2: Find filters and apply random options
-        # ---------------------------------------------------------
-        detected_filters = await engine.extract_filters_from_dom()
-        
-        if detected_filters:
-            # Grab the first two filters (e.g., "Time Period", "Relative Time")
-            target_filters = detected_filters[:2]
+            self,
+            dashboard,
+            page,
+            response,
+            page_name,
+        ):
+            """Process one currently selected dashboard page and run AI on random filter selections."""
             
-            for f_name in target_filters:
-                logger.info(f"Applying random option to filter: {f_name}")
-                
-                # Apply a random valid option
-                applied_option = await engine.apply_random_valid_option(f_name)
-                
-                if applied_option:
-                    # Wait for DAX queries and visuals to recalculate
-                    logger.info("Waiting 4.5s for Power BI visuals to recalculate...")
-                    await page.wait_for_timeout(4500)
-                    
-                    # Take a new screenshot of the filtered state
-                    filtered_screenshot = SCREENSHOT_DIR / f"{dashboard['name']}_{page_name}_{f_name}_{uuid.uuid4().hex[:8]}.png"
-                    await page.screenshot(path=str(filtered_screenshot), full_page=True)
-                    
-                    # Send the new screenshot to the AI
-                    filtered_ai_data = await asyncio.to_thread(extract_dashboard_json, filtered_screenshot)
-                    
-                    executions.append({
-                        "page_name": page_name,
-                        "state": "filtered",
-                        "filter_applied": f"{f_name} = {applied_option}",
-                        "ai_data": filtered_ai_data,
-                        "screenshot": str(filtered_screenshot)
-                    })
+            executions = []
+            engine = SlicerEngine(page)
 
-        return {
-            "dashboard": {**dashboard, "page_name": page_name},
-            "page_executions": executions,
-            "_page": page,
-        }
+            # ---------------------------------------------------------
+            # STEP 1: Process the default (unfiltered) page state
+            # ---------------------------------------------------------
+            logger.info(f"Processing default state for page: {page_name}")
+            default_screenshot = SCREENSHOT_DIR / f"{dashboard['name']}_{page_name}_default_{uuid.uuid4().hex[:8]}.png"
+            await page.screenshot(path=str(default_screenshot), full_page=True)
+            
+            # Extract visual data from DOM (if available)
+            default_visual_data = await extract_visual_data(page, attempt_export=False)
+            default_ai_data = await asyncio.to_thread(extract_dashboard_json, default_screenshot)
+            
+            # Structure as standard execution payload
+            executions.append({
+                "dashboard": {
+                    **dashboard, 
+                    "page_name": page_name,
+                    "filter_applied": "Default View"
+                },
+                "page_name": page_name,
+                "filter_applied": "Default View",
+                "extraction": {"status": "success", "data": default_ai_data, "error": None},
+                "visual_data": default_visual_data,
+                "screenshot": str(default_screenshot),
+                "_page": page,
+            })
+
+            # ---------------------------------------------------------
+            # STEP 2: Find filters and apply random options
+            # ---------------------------------------------------------
+            detected_filters = await engine.extract_filters_from_dom()
+            
+            if detected_filters:
+                logger.info(f"Detected filters on page '{page_name}': {detected_filters}")
+                target_filters = detected_filters[:2]
+                
+                for f_name in target_filters:
+                    logger.info(f"Applying random option to filter: {f_name}")
+                    applied_option = await engine.apply_random_valid_option(f_name)
+                    
+                    if applied_option:
+                        filter_label = f"{f_name} = '{applied_option}'"
+                        logger.info("Waiting 4.5s for Power BI visuals to recalculate...")
+                        await page.wait_for_timeout(4500)
+                        
+                        filtered_screenshot = SCREENSHOT_DIR / f"{dashboard['name']}_{page_name}_{f_name}_{uuid.uuid4().hex[:8]}.png"
+                        await page.screenshot(path=str(filtered_screenshot), full_page=True)
+                        
+                        filtered_visual_data = await extract_visual_data(page, attempt_export=False)
+                        filtered_ai_data = await asyncio.to_thread(extract_dashboard_json, filtered_screenshot)
+                        
+                        executions.append({
+                            "dashboard": {
+                                **dashboard, 
+                                "page_name": page_name,
+                                "filter_applied": filter_label
+                            },
+                            "page_name": page_name,
+                            "filter_applied": filter_label,
+                            "extraction": {"status": "success", "data": filtered_ai_data, "error": None},
+                            "visual_data": filtered_visual_data,
+                            "screenshot": str(filtered_screenshot),
+                            "_page": page,
+                        })
+
+            # Return the list of executions directly for run_dashboard to collect
+            return executions
     # ============================================================
     # Arun - Multi Page Dashboard Navigation
     # ============================================================
