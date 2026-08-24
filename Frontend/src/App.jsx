@@ -496,142 +496,129 @@ function MatchRing({ percentage }) {
   );
 }
 
+function PageMismatchCard({ pageMismatch }) {
+  const { page_name, filter_applied, kpis, filters, visuals } = pageMismatch;
+
+  return (
+    <div className="dv-surface rounded-3xl overflow-hidden mb-8 border" style={{ borderColor: 'var(--border)' }}>
+      {/* Page & Filter Header */}
+      <div className="px-6 py-4 flex flex-wrap items-center justify-between gap-3" style={{ background: '#0A0A0A', color: 'white' }}>
+        <div className="flex items-center gap-3">
+          <span className="dv-font-display font-bold text-lg">{page_name}</span>
+          <span className="text-xs px-2.5 py-1 rounded-full font-mono bg-white/10 text-white/80 border border-white/20">
+            Filter: {filter_applied || 'Default State'}
+          </span>
+        </div>
+        <span className="text-xs text-white/60 font-mono">
+          {(kpis?.length || 0) + (filters?.length || 0) + (visuals?.length || 0)} Mismatch(es)
+        </span>
+      </div>
+
+      <div className="p-6 space-y-6">
+        {/* KPI Mismatches for this Page & Filter */}
+        {kpis && kpis.length > 0 && (
+          <div>
+            <h4 className="text-sm font-semibold mb-3 flex items-center gap-2" style={{ color: 'var(--text)' }}>
+              <AlertCircle className="w-4 h-4 text-red-500" />
+              KPI Mismatches ({kpis.length})
+            </h4>
+            <div className="overflow-x-auto rounded-xl border" style={{ borderColor: 'var(--border)' }}>
+              <table className="w-full text-sm text-left">
+                <thead style={{ background: 'var(--surface-alt)' }}>
+                  <tr>
+                    <th className="p-3 font-semibold">KPI Name</th>
+                    <th className="p-3 font-semibold">Source</th>
+                    <th className="p-3 font-semibold">Target</th>
+                    <th className="p-3 font-semibold">Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {kpis.map((item, idx) => (
+                    <tr key={idx} className="dv-row dv-diff-row-mismatch" style={{ borderTop: '1px solid var(--border)' }}>
+                      <td className="p-3 font-medium">{item.kpi || item.name}</td>
+                      <td className="p-3 dv-font-mono">{item.source ?? '—'}</td>
+                      <td className="p-3 dv-font-mono">{item.target ?? '—'}</td>
+                      <td className="p-3"><StatusBadge status={item.status} /></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {/* Filter Mismatches for this Page */}
+        {filters && filters.length > 0 && (
+          <div>
+            <h4 className="text-sm font-semibold mb-3 flex items-center gap-2" style={{ color: 'var(--text)' }}>
+              <AlertTriangle className="w-4 h-4 text-yellow-500" />
+              Slicer / Filter Mismatches ({filters.length})
+            </h4>
+            <div className="overflow-x-auto rounded-xl border" style={{ borderColor: 'var(--border)' }}>
+              <table className="w-full text-sm text-left">
+                <thead style={{ background: 'var(--surface-alt)' }}>
+                  <tr>
+                    <th className="p-3 font-semibold">Filter Name</th>
+                    <th className="p-3 font-semibold">Source Selection</th>
+                    <th className="p-3 font-semibold">Target Selection</th>
+                    <th className="p-3 font-semibold">Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filters.map((item, idx) => (
+                    <tr key={idx} className="dv-row dv-diff-row-mismatch" style={{ borderTop: '1px solid var(--border)' }}>
+                      <td className="p-3 font-medium">{item.filter_name}</td>
+                      <td className="p-3 dv-font-mono text-xs">{(item.source_selected || []).join(', ') || '—'}</td>
+                      <td className="p-3 dv-font-mono text-xs">{(item.target_selected || []).join(', ') || '—'}</td>
+                      <td className="p-3"><StatusBadge status={item.status} /></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function ComparisonSection({ mismatches }) {
   if (!mismatches) return null;
 
-  const results = Array.isArray(mismatches?.results) ? mismatches.results : [];
-  const filters = Array.isArray(mismatches?.filters) ? mismatches.filters : [];
-  const tableCells = Array.isArray(mismatches?.table_cells) ? mismatches.table_cells : [];
+  const pageMismatches = Array.isArray(mismatches?.page_mismatches) ? mismatches.page_mismatches : [];
   const summary = mismatches?.summary || {};
-  const totalMismatches = summary.total_mismatches ?? results.length;
+  const totalMismatches = summary.total_mismatches ?? 0;
   const matchPercentage = mismatches?.match_percentage ?? summary.overall_match_percentage ?? 0;
-
-  const hasAny =
-    results.length > 0 ||
-    filters.length > 0 ||
-    tableCells.length > 0 ||
-    (mismatches?.page_mismatches?.length ?? 0) > 0;
 
   return (
     <div className="space-y-8 animate-in fade-in slide-in-from-bottom-8 duration-700 delay-200 fill-mode-both">
+      {/* Overall Score Header */}
       <div className="dv-surface flex flex-col md:flex-row gap-6 items-center p-6 rounded-3xl">
         <MatchRing percentage={matchPercentage} />
         <div>
           <h2 className="dv-font-display text-xl font-bold mb-2 flex items-center gap-2" style={{ color: 'var(--text)' }}>
             <ShieldCheck className="w-5 h-5" style={{ color: 'var(--accent-text)' }} />
-            Mismatches Only
+            Page & Filter Validation Breakdown
           </h2>
           <p className="text-sm leading-relaxed max-w-2xl" style={{ color: 'var(--text-muted)' }}>
-            Showing {totalMismatches} mismatch(es) across KPIs, filters, and table cells.
-            Matching rows are hidden. Download the Excel report for the full comparison.
+            Found {totalMismatches} total mismatch(es) across {pageMismatches.length} report page state(s).
           </p>
         </div>
       </div>
 
-      {!hasAny && (
+      {/* No Mismatches State */}
+      {totalMismatches === 0 && (
         <div className="dv-surface p-8 rounded-3xl text-center" style={{ color: 'var(--success)' }}>
           <CheckCircle2 className="w-8 h-8 mx-auto mb-3" />
-          <p className="font-semibold">No mismatches detected between source and target.</p>
+          <p className="font-semibold">All pages and applied filter permutations match perfectly!</p>
         </div>
       )}
 
-      {results.length > 0 && (
-        <div className="dv-surface rounded-3xl overflow-hidden">
-          <div className="px-5 py-4 font-semibold" style={{ background: '#0A0A0A', color: 'white' }}>
-            KPI Mismatches ({results.length})
-          </div>
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm text-left">
-              <thead style={{ background: 'var(--surface-alt)' }}>
-                <tr>
-                  <th className="p-5 font-semibold">KPI / Metric Name</th>
-                  <th className="p-5 font-semibold">Source</th>
-                  <th className="p-5 font-semibold">Target</th>
-                  <th className="p-5 font-semibold">Status</th>
-                </tr>
-              </thead>
-              <tbody>
-                {results.map((r, i) => (
-                  <tr
-                    key={i}
-                    className="dv-row dv-diff-row-mismatch transition-colors duration-150"
-                    style={{ borderTop: '1px solid var(--border)' }}
-                  >
-                    <td className="p-5 font-medium" style={{ color: 'var(--text)' }}>{r.kpi}</td>
-                    <td className="p-5 dv-font-mono" style={{ color: 'var(--text-muted)' }}>{r.source ?? '—'}</td>
-                    <td className="p-5 dv-font-mono" style={{ color: 'var(--text-muted)' }}>{r.target ?? '—'}</td>
-                    <td className="p-5"><StatusBadge status={r.status} /></td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      )}
-
-      {filters.length > 0 && (
-        <div className="dv-surface rounded-3xl overflow-hidden">
-          <div className="px-5 py-4 font-semibold" style={{ background: '#0A0A0A', color: 'white' }}>
-            Filter Mismatches ({filters.length})
-          </div>
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm text-left">
-              <thead style={{ background: 'var(--surface-alt)' }}>
-                <tr>
-                  <th className="p-5 font-semibold">Filter</th>
-                  <th className="p-5 font-semibold">Source Selected</th>
-                  <th className="p-5 font-semibold">Target Selected</th>
-                  <th className="p-5 font-semibold">Status</th>
-                </tr>
-              </thead>
-              <tbody>
-                {filters.map((f, i) => (
-                  <tr key={i} className="dv-row dv-diff-row-mismatch" style={{ borderTop: '1px solid var(--border)' }}>
-                    <td className="p-5 font-medium">{f.filter_name}</td>
-                    <td className="p-5 dv-font-mono text-xs">{(f.source_selected || []).join(', ') || '—'}</td>
-                    <td className="p-5 dv-font-mono text-xs">{(f.target_selected || []).join(', ') || '—'}</td>
-                    <td className="p-5"><StatusBadge status={f.status} /></td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      )}
-
-      {tableCells.length > 0 && (
-        <div className="dv-surface rounded-3xl overflow-hidden">
-          <div className="px-5 py-4 font-semibold" style={{ background: '#0A0A0A', color: 'white' }}>
-            Table Cell Mismatches ({tableCells.length})
-          </div>
-          <div className="overflow-x-auto max-h-96">
-            <table className="w-full text-sm text-left">
-              <thead style={{ background: 'var(--surface-alt)' }}>
-                <tr>
-                  <th className="p-4 font-semibold">Visual</th>
-                  <th className="p-4 font-semibold">Row</th>
-                  <th className="p-4 font-semibold">Column</th>
-                  <th className="p-4 font-semibold">Source</th>
-                  <th className="p-4 font-semibold">Target</th>
-                  <th className="p-4 font-semibold">Status</th>
-                </tr>
-              </thead>
-              <tbody>
-                {tableCells.map((c, i) => (
-                  <tr key={i} className="dv-row dv-diff-row-mismatch" style={{ borderTop: '1px solid var(--border)' }}>
-                    <td className="p-4">{c.visual}</td>
-                    <td className="p-4 dv-font-mono">{c.row_number}</td>
-                    <td className="p-4">{c.column}</td>
-                    <td className="p-4 dv-font-mono">{c.source_value ?? '—'}</td>
-                    <td className="p-4 dv-font-mono">{c.target_value ?? '—'}</td>
-                    <td className="p-4"><StatusBadge status={c.status} /></td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      )}
+      {/* Render Each Page and Applied Filter Breakdown */}
+      {pageMismatches.map((pageMismatch, idx) => (
+        <PageMismatchCard key={idx} pageMismatch={pageMismatch} />
+      ))}
     </div>
   );
 }

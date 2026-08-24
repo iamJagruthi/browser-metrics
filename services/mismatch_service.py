@@ -101,21 +101,22 @@ def _page_mismatch_sections(page_comparisons: list[dict[str, Any]] | None) -> li
         filters = _filter_mismatches(page.get("filters"))
         kpis = _filter_mismatches(page.get("kpis"))
         visuals = _filter_mismatches(page.get("visuals"))
+        
         if not filters and not kpis and not visuals:
             continue
+            
         sections.append(
             {
-                "page_name": page.get("page_name"),
+                "page_name": page.get("page_name", "Unknown Page"),
+                "filter_applied": page.get("filter_applied", "Default View"),
                 "status": page.get("status"),
                 "summary": page.get("summary") or {},
                 "filters": filters,
                 "kpis": kpis,
                 "visuals": visuals,
-                "results": kpis,
             }
         )
     return sections
-
 
 def build_mismatch_payload(
     comparison: dict[str, Any],
