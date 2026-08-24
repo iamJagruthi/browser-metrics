@@ -453,7 +453,7 @@ class VisualDataExporter:
             "collection_method": "rendered_dom",
         }
         if not metadata.get("is_loading_placeholder"):
-            logger.info(
+            logger.debug(
                 "Visual collected | title=%s | rows=%d | cols=%d | vertical_steps=%d | horizontal_steps=%d",
                 title,
                 len(rows),
@@ -687,14 +687,14 @@ class VisualDataExporter:
             await snapshot()
 
             if merger.col_count() <= columns_before:
-                logger.info(
+                logger.debug(
                     "Horizontal scroll stopped | no new columns after step %d",
                     horizontal_moves,
                 )
                 break
 
         columns, rows = merger.to_table()
-        logger.info(
+        logger.debug(
             "Matrix scan complete | vertical_steps=%d | horizontal_steps=%d | rows=%d | cols=%d",
             vertical_moves,
             horizontal_moves,

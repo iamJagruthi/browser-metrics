@@ -129,7 +129,7 @@ class DashboardValidator:
                 attempt_export=True,
             )
 
-            self.timer.start("ocr")
+            self.timer.start("ai")
 
             try:
                 # A missing Gemini key must not prevent browser data collection.
@@ -155,7 +155,7 @@ class DashboardValidator:
                 extraction["error"] = str(exc)
 
             finally:
-                self.timer.stop("ocr")
+                self.timer.stop("ai")
 
             self.timer.stop("total_execution")
 
