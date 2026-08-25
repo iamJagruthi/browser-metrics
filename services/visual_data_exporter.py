@@ -1,11 +1,14 @@
-"""Browser-side extraction of Power BI visual data.
-
-Jagruthi — features:
-- Null-safe slicer/filter DOM reads via page.evaluate
-- Loading-placeholder detection and skip during visual scan
-- Slicer vs table separation (button filters are not scraped as tables)
-- DOM KPI card/callout extraction to supplement Gemini
-- Vertical and horizontal 2D matrix scroll with merged column headers (Jagruthi)
+"""
+Browser-side extraction of Power BI visual data.
+Jagruthi
+Responsibilities:
+- Extract KPI/card values from the DOM
+- Detect Power BI visual containers
+- Extract table and matrix data
+- Handle vertically and horizontally scrollable visuals
+- Merge table data collected across scroll positions
+- Optionally use Power BI's Export Data functionality
+- Never modify slicer/filter selections
 """
 
 from __future__ import annotations
@@ -141,7 +144,6 @@ class VisualDataExporter:
         result: dict[str, Any] = {
             "status": "success",
             "extracted_at": datetime.now(timezone.utc).isoformat(),
-            "filters": await self._extract_filter_state(),
             "kpi_cards": await self._extract_kpi_cards(),
             "visuals": [],
             "skipped_visuals": [],
@@ -217,123 +219,6 @@ class VisualDataExporter:
         logger.info("Visual extraction completed | visuals=%d | skipped=%d | errors=%d", len(result["visuals"]), len(result["skipped_visuals"]), len(result["errors"]))
         return result
 
-    async def _extract_filter_state(self) -> list[dict[str, Any]]:
-        """Read filters/buttons from the live Power BI accessibility DOM.
-
-        Button slicers often do not expose the ``slicerContainer`` class, so
-        examine visual containers as well and use their pressed/checked state
-        instead of asking Gemini to infer selection from colour.
-        """
-        try:
-            # Jagruthi: use page.evaluate with null-safe reads; avoid evaluate_all on broad selectors.
-            filters = await self.page.evaluate(
-                """() => {
-                    const safeText = item => {
-                        if (!item) return '';
-                        return (item.innerText || item.getAttribute('aria-label') || item.value || '')
-                            .replace(/\\s+/g, ' ').trim();
-                    };
-                    const nodeSelector = '.slicerContainer, [aria-label*="Slicer" i], [data-visual-type*="slicer" i]';
-                    const nodes = [...document.querySelectorAll(nodeSelector)];
-                    if (!nodes.length) {
-                        return [...document.querySelectorAll('.visualContainer, [data-visual-container]')]
-                            .map((visual, index) => {
-                                const controls = [...visual.querySelectorAll(
-                                    '[role="option"], [role="radio"], [role="checkbox"], label, button, input'
-                                )]
-                                    .filter(item => item && !item.disabled)
-                                    .map(item => ({
-                                        value: safeText(item),
-                                        selected: item.matches(
-                                            'input:checked, [aria-selected="true"], [aria-checked="true"], [aria-pressed="true"]'
-                                        ) || /(^|\\s)(selected|active)(\\s|$)/i.test(item.className || ''),
-                                        control_type: item.tagName === 'BUTTON' || item.getAttribute('role') === 'button'
-                                            ? 'button'
-                                            : (item.matches('input[type="radio"], input[type="checkbox"]') ? 'input' : 'option'),
-                                    }))
-                                    .filter(item => item.value);
-                                const title = safeText(
-                                    visual.querySelector('.visualTitle, [class*="visualTitle"], [data-visual-title]')
-                                ) || safeText(visual);
-                                const hasChoiceControl = controls.some(
-                                    item => item.value && !/^(more options|focus mode|drill down|expand)$/i.test(item.value)
-                                );
-                                if (!title || !hasChoiceControl || controls.length < 2) return null;
-                                const selected = controls.filter(item => item.selected).map(item => item.value);
-                                const values = controls.map(item => item.value);
-                                const hasButtons = controls.some(item => item.control_type === 'button');
-                                return {
-                                    id: visual.id || `filter-visual-${index + 1}`,
-                                    name: title,
-                                    filter_type: hasButtons ? 'Buttons' : 'Dropdown',
-                                    selected_values: [...new Set(selected)],
-                                    visible_values: [...new Set(values)].slice(0, 500),
-                                    options: controls,
-                                    looks_like_filter: true,
-                                    extraction_source: 'dom',
-                                };
-                            })
-                            .filter(Boolean);
-                    }
-                    return nodes.map((node, index) => {
-                        const visual = node.closest('.visualContainer, [data-visual-container]') || node;
-                        const title = safeText(
-                            visual.querySelector('.visualTitle, [class*="visualTitle"], [data-visual-title]')
-                        )
-                            || (visual.getAttribute('aria-label') || '').trim()
-                            || safeText(visual.querySelector('[title]'));
-                        const controls = [...node.querySelectorAll(
-                            '[role="option"], [role="radio"], [role="checkbox"], label, button, input'
-                        )]
-                            .filter(item => item && !item.disabled)
-                            .map(item => ({
-                                value: safeText(item),
-                                selected: item.matches(
-                                    'input:checked, [aria-selected="true"], [aria-checked="true"], [aria-pressed="true"]'
-                                ) || /(^|\\s)(selected|active)(\\s|$)/i.test(item.className || ''),
-                                control_type: item.tagName === 'BUTTON' || item.getAttribute('role') === 'button'
-                                    ? 'button'
-                                    : (item.matches('input[type="radio"], input[type="checkbox"]') ? 'input' : 'option'),
-                            }))
-                            .filter(item => item.value);
-                        const selected = controls.filter(item => item.selected).map(item => item.value);
-                        const values = controls.map(item => item.value);
-                        const hasButtons = controls.some(item => item.control_type === 'button');
-                        const hasSlicerMarkup = node.matches(
-                            '.slicerContainer, [class*="slicer" i], [aria-label*="Slicer" i], [data-visual-type*="slicer" i]'
-                        ) || visual.matches('[data-visual-type*="slicer" i]');
-                        const hasChoiceControl = controls.some(
-                            item => item.value && !/^(more options|focus mode|drill down|expand)$/i.test(item.value)
-                        );
-                        const looksLikeFilter = hasSlicerMarkup || (title && hasChoiceControl && controls.length >= 2);
-                        return {
-                            id: node.id || `slicer-${index + 1}`,
-                            name: title,
-                            filter_type: hasButtons ? 'Buttons' : (controls.some(item => item.selected) ? 'Buttons' : 'Dropdown'),
-                            selected_values: [...new Set(selected)],
-                            visible_values: [...new Set(values)].slice(0, 500),
-                            options: controls,
-                            looks_like_filter: looksLikeFilter,
-                            extraction_source: 'dom',
-                        };
-                    }).filter(item => item.looks_like_filter && item.name);
-                }"""
-            )
-            # The selector can overlap (a slicer is also a visual container).
-            # Keep the record with the most actual option/selection evidence,
-            # not simply the last wrapper returned by the DOM query.
-            unique = {}
-            for item in filters:
-                key = " ".join(item["name"].casefold().split())
-                score = len(item.get("visible_values", [])) + (1000 if item.get("selected_values") else 0)
-                previous = unique.get(key)
-                previous_score = len(previous.get("visible_values", [])) + (1000 if previous.get("selected_values") else 0) if previous else -1
-                if score > previous_score:
-                    unique[key] = item
-            return list(unique.values())
-        except Exception:
-            logger.exception("Unable to read slicer state")
-            return []
 
     async def _extract_kpi_cards(self) -> list[dict[str, Any]]:
         """Read compact KPI/card visuals from the DOM when Gemini misses them."""
@@ -482,6 +367,7 @@ class VisualDataExporter:
         fallbacks when scrollLeft does not move.
         """
         merger = _MatrixCellMerger()
+
 
         async def snapshot() -> None:
             payload = await locator.evaluate(
@@ -665,7 +551,8 @@ class VisualDataExporter:
         for h_index in range(max_steps + 1):
             await reset_axis("y")
             await snapshot()
-
+            
+            #scan the entire table vertically
             if scrollable or horizontally_scrollable or merger.row_count() > 0 or merger.col_count() > 0:
                 for _ in range(max_steps):
                     moved = await scroll_axis("y")
@@ -675,23 +562,21 @@ class VisualDataExporter:
                     await wait_after_scroll()
                     await snapshot()
 
+            # Stop horizontal scanning when we reach the end
             if h_index >= max_steps:
                 break
 
-            columns_before = merger.col_count()
             moved_right = await scroll_axis("x")
-            if not moved_right:
-                break
-            horizontal_moves += 1
-            await wait_after_scroll()
-            await snapshot()
 
-            if merger.col_count() <= columns_before:
+            await self.page.wait_for_timeout(150)
+
+            if not moved_right:
                 logger.debug(
-                    "Horizontal scroll stopped | no new columns after step %d",
-                    horizontal_moves,
+                    "Horizontal table scrolling reached the end"
                 )
                 break
+
+            horizontal_moves += 1
 
         columns, rows = merger.to_table()
         logger.debug(
@@ -760,65 +645,6 @@ async def extract_visual_data(page, **kwargs) -> dict[str, Any]:
     return await VisualDataExporter(page, **kwargs).extract_dashboard_data(
         attempt_export=attempt_export
     )
-
-
-async def extract_filter_data(page) -> dict[str, Any]:
-    """Collect slicer/filter state only — skips table/matrix scrolling and exports."""
-    exporter = VisualDataExporter(page)
-    try:
-        filters = await exporter._extract_filter_state()
-        return {
-            "status": "success",
-            "extracted_at": datetime.now(timezone.utc).isoformat(),
-            "filters": filters,
-            "errors": [],
-        }
-    except Exception as exc:
-        logger.exception("Filter-only extraction failed")
-        return {
-            "status": "failed",
-            "extracted_at": datetime.now(timezone.utc).isoformat(),
-            "filters": [],
-            "errors": [str(exc)],
-        }
-
-
-async def apply_slicer_value(page, slicer_name: str, value: str) -> bool:
-    """Select an exact slicer option in the currently loaded Power BI page.
-
-    Returns ``False`` when the accessible DOM does not expose a safe matching
-    control; callers can report this rather than claiming a filter was applied.
-    """
-    try:
-        # Jagruthi: null-safe slicer click via page.evaluate (not evaluate_all).
-        selected = await page.evaluate(
-            """(args) => {
-                const safeText = item => {
-                    if (!item) return '';
-                    return (item.innerText || item.getAttribute('aria-label') || item.value || '')
-                        .replace(/\\s+/g, ' ').trim().toLocaleLowerCase();
-                };
-                const wantedName = safeText({ innerText: args.name });
-                const wantedValue = safeText({ innerText: args.value });
-                const nodes = [...document.querySelectorAll(
-                    '.slicerContainer, [aria-label*="Slicer" i], [data-visual-type*="slicer" i], .visualContainer, [data-visual-container]'
-                )];
-                const container = nodes.find(node => safeText(node).includes(wantedName));
-                if (!container) return false;
-                const option = [...container.querySelectorAll('[role="option"], label, button, input')]
-                    .find(node => safeText(node) === wantedValue);
-                if (!option || option.disabled) return false;
-                option.click();
-                return true;
-            }""",
-            {"name": slicer_name, "value": value},
-        )
-        if selected:
-            await self_wait_for_dashboard(page)
-        return bool(selected)
-    except Exception:
-        logger.exception("Failed to apply slicer value | slicer=%s | value=%s", slicer_name, value)
-        return False
 
 
 async def self_wait_for_dashboard(page) -> None:

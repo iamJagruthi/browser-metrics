@@ -17,7 +17,7 @@ from services.dashboard_inventory_service import (
 )
 from services.mismatch_service import build_mismatch_payload, save_mismatch_snapshot
 from services.filter_service import build_filters_api_payload, save_filters_snapshot
-from services.visual_data_exporter import apply_slicer_value, extract_filter_data, extract_visual_data
+from services.visual_data_exporter import extract_visual_data
 from utils.config import DASHBOARD_CONFIG, OUTPUT_DIR, PAGE_TIMEOUT, SCREENSHOT_DIR
 from ai.Text_Extraction import extract_dashboard_json
 from automation.SlicerEngine import SlicerEngine
@@ -1016,7 +1016,7 @@ class DashboardValidator:
             "filter_applied": "Default View",
             "extraction": {"status": "success", "data": default_ai_data, "error": None},
             "visual_data": default_visual_data,
-            "metrics": metrics,  # <--- MAKE SURE THIS KEY IS INCLUDED
+            # "metrics": metrics,  # <--- MAKE SURE THIS KEY IS INCLUDED
             "screenshot": str(default_screenshot),
             "_page": page,
         })
@@ -1440,53 +1440,99 @@ class DashboardValidator:
     async def _probe_dashboard_executions(self, links):
         executions = []
         resources = []
+
         if not links:
             return executions
+
         try:
             playwright, context, first_page = await launch_browser()
             resources.append((playwright, context))
+
             for index, dashboard in enumerate(links):
-                page = first_page if index == 0 else await context.new_page()
+                page = (
+                    first_page
+                    if index == 0
+                    else await context.new_page()
+                )
+
                 try:
                     await page.goto(
                         dashboard["url"],
                         wait_until="domcontentloaded",
                         timeout=PAGE_TIMEOUT,
                     )
+
                     await wait_for_dashboard(page)
-                    visual_data = await extract_filter_data(page)
+
+                    visual_data = await extract_visual_data(
+                        page,
+                        attempt_export=False,
+                    )
+
                     executions.append({
                         "dashboard": dashboard,
                         "visual_data": visual_data,
-                        "extraction": {"status": "skipped", "data": None, "error": None},
+                        "extraction": {
+                            "status": "skipped",
+                            "data": None,
+                            "error": None,
+                        },
                     })
+
                 except Exception as exc:
-                    logger.exception("Dashboard probe failed | dashboard=%s", dashboard.get("name"))
+                    logger.exception(
+                        "Dashboard probe failed | dashboard=%s",
+                        dashboard.get("name"),
+                    )
+
                     executions.append({
                         "dashboard": dashboard,
-                        "visual_data": {"status": "failed", "filters": [], "errors": [str(exc)]},
-                        "extraction": {"status": "failed", "data": None, "error": str(exc)},
+                        "visual_data": {
+                            "status": "failed",
+                            "visuals": [],
+                            "errors": [str(exc)],
+                        },
+                        "extraction": {
+                            "status": "failed",
+                            "data": None,
+                            "error": str(exc),
+                        },
                     })
+
         except Exception as exc:
-            logger.exception("Unable to launch shared Edge context for dashboard probe")
-            executions = [{
-                "dashboard": dashboard,
-                "visual_data": {"status": "failed", "filters": [], "errors": [str(exc)]},
-                "extraction": {"status": "failed", "data": None, "error": str(exc)},
-            } for dashboard in links]
+            logger.exception(
+                "Unable to launch shared Edge context for dashboard probe"
+            )
+
+            executions = [
+                {
+                    "dashboard": dashboard,
+                    "visual_data": {
+                        "status": "failed",
+                        "visuals": [],
+                        "errors": [str(exc)],
+                    },
+                    "extraction": {
+                        "status": "failed",
+                        "data": None,
+                        "error": str(exc),
+                    },
+                }
+                for dashboard in links
+            ]
+
         finally:
             for playwright, context in resources:
                 try:
                     await context.close()
                     await playwright.stop()
                 except Exception:
-                    logger.exception("Failed to close browser resources after dashboard probe")
-        return executions
+                    logger.exception(
+                        "Failed to close browser resources "
+                        "after dashboard probe"
+                    )
 
-    async def run_all(self):
-        return await self.run_links(
-            self.load_dashboards()
-        )
+        return executions
 
 
 async def main():
