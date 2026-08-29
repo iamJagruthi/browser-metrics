@@ -1,658 +1,1456 @@
 """
-Browser-side extraction of Power BI visual data.
-Jagruthi
+Browser-side DOM extraction for Power BI KPIs and visuals.
+
 Responsibilities:
-- Extract KPI/card values from the DOM
-- Detect Power BI visual containers
-- Extract table and matrix data
-- Handle vertically and horizontally scrollable visuals
-- Merge table data collected across scroll positions
-- Optionally use Power BI's Export Data functionality
-- Never modify slicer/filter selections
+- Extract KPI/card values from the DOM.
+- Extract visual metadata and DOM-visible visual content.
+- Keep KPI data separate from visual data.
+- Preserve scroll/tabular characteristics as metadata.
+- Never modify slicer/filter selections.
+- No Gemini/AI.
+- No table scrolling or table export.
 """
 
 from __future__ import annotations
-
-import asyncio
-import csv
 import logging
-import re
+import inspect
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
-from openpyxl import load_workbook
-from utils.config import MATRIX_MAX_SCROLL_STEPS, SCROLL_STEP_WAIT_MS
+from services.table_exporter import export_table_visuals
 
 
-VISUAL_SELECTOR = ".visualContainer, [data-visual-container]"
-_LOADING_TITLE_RE = re.compile(r"\bvisuals?\s+are\s+loading\b", re.IGNORECASE)
 logger = logging.getLogger(__name__)
 
-
-def _normalise_lines(value: str) -> list[str]:
-    return [line.strip() for line in value.splitlines() if line.strip()]
-
-
-def _safe_filename(value: str, fallback: str) -> str:
-    value = re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("_.")
-    return value or fallback
-
-
-class _MatrixCellMerger:
-    """Merge matrix cells across vertical and horizontal scroll positions."""
-
-    def __init__(self) -> None:
-        self.header_map: dict[str, str] = {}
-        self.col_order: list[str] = []
-        self.row_cells: dict[str, dict[str, str]] = {}
-
-    @staticmethod
-    def _col_key(item: dict[str, Any]) -> str:
-        colindex = item.get("colindex")
-        if colindex is not None and str(colindex).strip():
-            return f"col:{colindex}"
-        return f"left:{int(round(float(item.get("left", 0)) / 4)) * 4}"
-
-    @staticmethod
-    def _row_key(item: dict[str, Any]) -> str:
-        rowindex = item.get("rowindex")
-        if rowindex is not None and str(rowindex).strip():
-            return f"row:{rowindex}"
-        return f"top:{int(round(float(item.get("top", 0)) / 4)) * 4}"
-
-    def ingest(self, payload: dict[str, Any] | None) -> None:
-        if not payload:
-            return
-        for header in payload.get("headers", []):
-            key = self._col_key(header)
-            if header.get("value"):
-                self.header_map.setdefault(key, header["value"])
-            if key not in self.col_order:
-                self.col_order.append(key)
-        for cell in payload.get("cells", []):
-            if cell.get("role") == "columnheader":
-                key = self._col_key(cell)
-                if cell.get("value"):
-                    self.header_map.setdefault(key, cell["value"])
-                if key not in self.col_order:
-                    self.col_order.append(key)
-                continue
-            row_key = self._row_key(cell)
-            col_key = self._col_key(cell)
-            if col_key not in self.col_order:
-                self.col_order.append(col_key)
-            self.row_cells.setdefault(row_key, {})[col_key] = cell["value"]
-
-    def row_count(self) -> int:
-        return len(self.row_cells)
-
-    def col_count(self) -> int:
-        return len(self.col_order)
-
-    def to_table(self) -> tuple[list[str], list[list[str]]]:
-        if not self.col_order and not self.row_cells:
-            return [], []
-        columns = [
-            self.header_map.get(key) or f"Column {index + 1}"
-            for index, key in enumerate(self.col_order)
-        ]
-
-        def sort_key(key: str) -> tuple[int | str, ...]:
-            if key.startswith("row:"):
-                try:
-                    return (0, int(key.split(":", 1)[1]))
-                except ValueError:
-                    return (1, key)
-            if key.startswith("top:"):
-                try:
-                    return (0, int(key.split(":", 1)[1]))
-                except ValueError:
-                    return (1, key)
-            return (1, key)
-
-        rows = []
-        for row_key in sorted(self.row_cells.keys(), key=sort_key):
-            row_data = self.row_cells[row_key]
-            rows.append([row_data.get(col_key, "") for col_key in self.col_order])
-        return columns, rows
+VISUAL_SELECTOR = ".visualContainer, [data-visual-container]"
 
 
 class VisualDataExporter:
-    """Extract visible visual data without modifying the dashboard's filters."""
+    """Extract KPI and visual information directly from the Power BI DOM."""
 
-    def __init__(
-        self,
-        page,
-        *,
-        download_directory: str | Path | None = None,
-        max_scroll_steps: int | None = None,
-        scroll_step_wait_ms: int | None = None,
-    ):
+    def __init__(self, page, dashboard_name: str = "Dashboard",):
         self.page = page
-        self.download_directory = Path(download_directory) if download_directory else None
-        self.max_scroll_steps = max_scroll_steps or MATRIX_MAX_SCROLL_STEPS
-        self.scroll_step_wait_ms = scroll_step_wait_ms or SCROLL_STEP_WAIT_MS
-
-    async def extract_dashboard_data(self, *, attempt_export: bool = False) -> dict[str, Any]:
-        """Return slicer state, visual metadata, visible/scrollable rows and exports.
-
-        ``attempt_export`` is opt-in because Power BI tenants can disable Export
-        data and because clicking the visual menu changes the live UI.  DOM data
-        collection remains available regardless of that setting.
-        """
-        result: dict[str, Any] = {
-            "status": "success",
-            "extracted_at": datetime.now(timezone.utc).isoformat(),
-            "kpi_cards": await self._extract_kpi_cards(),
-            "visuals": [],
-            "skipped_visuals": [],
-            "errors": [],
-        }
-
-        try:
-            visual_count = await self.page.locator(VISUAL_SELECTOR).count()
-        except Exception as exc:
-            result.update(status="failed")
-            result["errors"].append(f"Unable to locate Power BI visuals: {exc}")
-            return result
-
-        if not visual_count:
-            result.update(status="partial")
-            result["errors"].append("No Power BI visual containers were found.")
-            return result
-
-        for index in range(visual_count):
-            locator = self.page.locator(VISUAL_SELECTOR).nth(index)
-            try:
-                if not await locator.is_visible():
-                    result["skipped_visuals"].append({"index": index + 1, "reason": "hidden"})
-                    continue
-                visual = await self._inspect_visual(locator, index)
-                # Jagruthi: skip Power BI loading shells before table/slicer handling.
-                if visual.pop("is_loading_placeholder", False) or _LOADING_TITLE_RE.search(
-                    visual.get("title", "")
-                ):
-                    result["skipped_visuals"].append({
-                        "index": index + 1,
-                        "reason": "Power BI loading placeholder",
-                        "title": visual.get("title"),
-                    })
-                    continue
-                if visual.get("is_slicer"):
-                    visual["data"] = {
-                        "columns": [],
-                        "rows": [],
-                        "row_count": 0,
-                        "collection_method": "slicer_skipped",
-                    }
-                    result["skipped_visuals"].append({
-                        "index": index + 1,
-                        "reason": "slicer_or_button_filter",
-                        "title": visual.get("title"),
-                    })
-                    continue
-                # Native export is the accuracy fallback for virtualised Power
-                # BI tables/matrices: request it only for visuals that expose
-                # a grid/scrollbar, never for every chart on the page.
-                is_tabular = bool(
-                    visual["data"]["columns"]
-                    or visual["scrollable"]
-                    or visual["horizontally_scrollable"]
-                    or (
-                        visual["data"]["rows"]
-                        and max(len(row) for row in visual["data"]["rows"]) > 1
-                    )
-                )
-                if attempt_export and is_tabular and visual["export"]["supported"]:
-                    visual["export"] = await self._try_export(locator, visual, index)
-                    if visual["export"].get("status") == "downloaded":
-                        exported = await asyncio.to_thread(self._read_exported_table, visual["export"]["file_path"])
-                        if exported and exported["rows"]:
-                            visual["data"] = exported
-                            visual["data"]["collection_method"] = "power_bi_export"
-                result["visuals"].append(visual)
-            except Exception as exc:
-                result["status"] = "partial"
-                result["errors"].append(f"Visual {index + 1}: {exc}")
-
-        logger.info("Visual extraction completed | visuals=%d | skipped=%d | errors=%d", len(result["visuals"]), len(result["skipped_visuals"]), len(result["errors"]))
-        return result
-
+        self.dashboard_name = dashboard_name
 
     async def _extract_kpi_cards(self) -> list[dict[str, Any]]:
-        """Read compact KPI/card visuals from the DOM when Gemini misses them."""
+        """
+        Extract KPI/card values directly from the DOM.
+
+        This stays separate from graph/visual extraction.
+        """
         try:
-            return await self.page.evaluate(
+            logger.info("Starting DOM KPI extraction")
+
+            # Useful diagnostic: how many Power BI visual containers exist?
+            visual_count = await self.page.locator(
+                ".visualContainer, [data-visual-container]"
+            ).count()
+
+            logger.info(
+                "DOM KPI extraction | visual containers detected=%d",
+                visual_count,
+            )
+
+            cards = await self.page.evaluate(
                 """() => {
-                    const safeText = item => {
-                        if (!item) return '';
-                        return (item.innerText || item.getAttribute('aria-label') || item.value || '')
-                            .replace(/\\s+/g, ' ').trim();
-                    };
-                    const cards = [];
-                    const visuals = [...document.querySelectorAll('.visualContainer, [data-visual-container]')];
-                    for (const visual of visuals) {
-                        const title = safeText(
-                            visual.querySelector('.visualTitle, [class*="visualTitle"], [data-visual-title]')
-                        ) || safeText(visual.querySelector('[title]'));
-                        const valueNode = visual.querySelector(
-                            '[class*="callout" i] [class*="value" i], [class*="calloutValue" i], [class*="dataLabel" i], [class*="metric" i], [class*="value" i]'
+                    const clean = value =>
+                        String(value || '')
+                            .replace(/\\s+/g, ' ')
+                            .trim();
+
+                    const getText = element => {
+                        if (!element) return '';
+
+                        return clean(
+                            element.innerText ||
+                            element.getAttribute('aria-label') ||
+                            element.textContent ||
+                            ''
                         );
-                        const value = safeText(valueNode);
-                        if (!title || !value) continue;
-                        if (/^(more options|focus mode|drill down|expand)$/i.test(title)) continue;
-                        if (!/[\\d%,.$]/i.test(value)) continue;
+                    };
+
+                    const noise =
+                        /^(more options|focus mode|drill down|drill up|expand|see more)$/i;
+
+                    const visuals = [
+                        ...document.querySelectorAll(
+                            '.visualContainer, [data-visual-container]'
+                        )
+                    ];
+
+                    const cards = [];
+
+                    for (const visual of visuals) {
+                        if (!visual || !visual.isConnected) continue;
+
                         const typeSource = [
-                            visual.className,
                             visual.getAttribute('data-visual-type'),
                             visual.getAttribute('aria-roledescription'),
-                        ].filter(Boolean).join(' ');
-                        if (/slicer|dropdown|button/i.test(typeSource)) continue;
+                            visual.className
+                        ]
+                            .filter(Boolean)
+                            .join(' ')
+                            .toLowerCase();
+
+                        // Skip visuals that should not be treated as KPIs.
+                        if (
+                            /slicer|dropdown|button|table|matrix|legend|axis|tooltip/i
+                                .test(typeSource)
+                        ) {
+                            continue;
+                        }
+
+                        const explicitCard =
+                            /card|kpi|callout|multirowcard/i.test(typeSource);
+
+                        const titleNode = visual.querySelector(
+                            '.visualTitle, [class*="visualTitle" i], [data-visual-title]'
+                        );
+
+                        const title =
+                            getText(titleNode) ||
+                            getText(visual.querySelector('[title]'));
+
+                        if (!title || noise.test(title)) {
+                            continue;
+                        }
+
+                        const valueSelectors = [
+                            '[class*="calloutValue" i]',
+                            '[class*="callout-value" i]',
+                            '[class*="value-label" i]',
+                            '[class*="dataLabel" i]',
+                            '[class*="cardValue" i]',
+                            '[class*="kpiValue" i]'
+                        ];
+
+                        let valueNode = null;
+
+                        // First priority:
+                        // Look for known KPI/card value elements.
+                        for (const selector of valueSelectors) {
+                            const candidate =
+                                visual.querySelector(selector);
+
+                            if (candidate && getText(candidate)) {
+                                valueNode = candidate;
+                                break;
+                            }
+                        }
+
+                        // Fallback only when this visual looks explicitly
+                        // like a KPI/card visual.
+                        if (!valueNode && explicitCard) {
+                            const candidates = [
+                                ...visual.querySelectorAll(
+                                    '[class*="value" i], [class*="metric" i]'
+                                )
+                            ].filter(element => {
+                                const text = getText(element);
+
+                                return (
+                                    text &&
+                                    text !== title &&
+                                    text.length <= 150
+                                );
+                            });
+
+                            valueNode = candidates[0] || null;
+                        }
+
+                        const value = getText(valueNode);
+
+                        if (!value) {
+                            continue;
+                        }
+
                         cards.push({
                             name: title,
                             value,
                             previous_value: null,
                             variance: null,
-                            extraction_source: 'dom',
+                            extraction_source: 'dom'
                         });
                     }
-                    return cards;
+
+                    // Remove duplicate name/value pairs.
+                    const unique = new Map();
+
+                    for (const card of cards) {
+                        const key =
+                            clean(card.name).toLowerCase() +
+                            '|' +
+                            clean(card.value).toLowerCase();
+
+                        if (!unique.has(key)) {
+                            unique.set(key, card);
+                        }
+                    }
+
+                    return {
+                        raw_count: cards.length,
+                        unique_cards: [...unique.values()]
+                    };
                 }"""
             )
+
+            raw_count = cards.get("raw_count", 0)
+            unique_cards = cards.get("unique_cards", [])
+
+            logger.info(
+                "DOM KPI extraction | raw KPI candidates=%d | unique KPIs=%d",
+                raw_count,
+                len(unique_cards),
+            )
+
+            if raw_count > len(unique_cards):
+                logger.debug(
+                    "DOM KPI extraction | removed duplicate KPI entries=%d",
+                    raw_count - len(unique_cards),
+                )
+
+            # Debug only: avoids filling normal logs with every KPI.
+            for card in unique_cards:
+                logger.debug(
+                    "DOM KPI detected | name=%r | value=%r",
+                    card.get("name"),
+                    card.get("value"),
+                )
+
+            if not unique_cards:
+                logger.warning(
+                    "DOM KPI extraction completed but no KPI cards were detected"
+                )
+            else:
+                logger.info(
+                    "DOM KPI extraction completed successfully | KPI count=%d",
+                    len(unique_cards),
+                )
+
+            return unique_cards
+
         except Exception:
-            logger.exception("Unable to read DOM KPI cards")
+            logger.exception("Unable to extract DOM KPI cards")
             return []
 
-    async def _inspect_visual(self, locator, index: int) -> dict[str, Any]:
-        metadata = await locator.evaluate(
-            r"""(node, index) => {
-                const text = (node.innerText || '').trim();
-                const titleNode = node.querySelector('[title], [aria-label], .title, .visualTitle');
-                const typeSource = [node.className, node.getAttribute('data-visual-type'), node.getAttribute('aria-roledescription')]
-                    .filter(Boolean).join(' ');
-                const canScrollY = (el) => el.scrollHeight > el.clientHeight + 2;
-                const canScrollX = (el) => el.scrollWidth > el.clientWidth + 2;
-                const grid = node.querySelector('[role="grid"], [role="table"], .mid-viewport, [class*="scrollRegion" i]');
-                const scrollable = Boolean(grid && canScrollY(grid))
-                    || [...node.querySelectorAll('*')].some(el => {
-                        const style = getComputedStyle(el);
-                        return canScrollY(el) && /(auto|scroll|hidden)/i.test(style.overflowY);
-                    });
-                const horizontallyScrollable = Boolean(grid && canScrollX(grid))
-                    || [...node.querySelectorAll('*')].some(el => {
-                        const style = getComputedStyle(el);
-                        return canScrollX(el) && /(auto|scroll|hidden)/i.test(style.overflowX);
-                    });
-                const exportLabel = [...node.querySelectorAll('button, [role="button"]')]
-                    .map(el => `${el.getAttribute('aria-label') || ''} ${el.title || ''} ${el.innerText || ''}`)
-                    .some(text => /export data|more options|more/i.test(text));
-                const isSlicer = /slicer/i.test(typeSource)
-                    || node.matches('.slicerContainer, [class*="slicer" i], [aria-label*="Slicer" i], [data-visual-type*="slicer" i]')
-                    || node.querySelector('.slicerContainer, [class*="slicer" i], [aria-label*="Slicer" i]');
-                return {
-                    id: node.getAttribute('data-visual-id') || node.id || `visual-${index + 1}`,
-                    title: (titleNode?.getAttribute('title') || titleNode?.getAttribute('aria-label') || '').trim(),
-                    visual_type: typeSource || 'unknown',
-                    accessible_text: text,
-                    is_loading_placeholder: /\bvisuals?\s+are\s+loading\b/i.test(text) || /^loading\.\.\.?$/i.test(text),
-                    is_slicer: Boolean(isSlicer),
-                    scrollable,
-                    horizontally_scrollable: horizontallyScrollable,
-                    export_menu_present: exportLabel,
-                };
-            }""",
-            index,
-        )
-        rows: list[list[str]] = []
-        columns: list[str] = []
-        scanned_columns = 0
-        horizontal_steps = 0
-        vertical_steps = 0
-        if not metadata.get("is_slicer"):
-            columns, rows, scanned_columns, horizontal_steps, vertical_steps = await self._collect_rows(
-                locator,
-                metadata.get("scrollable", False),
-                metadata.get("horizontally_scrollable", False),
-            )
-        if not columns:
-            columns = await locator.evaluate(
-                """node => [...node.querySelectorAll('[role="columnheader"], th, .columnHeader, [class*="columnHeader" i]')]
-                    .map(cell => (cell.innerText || cell.getAttribute('aria-label') || '').trim())
-                    .filter(Boolean)"""
-            )
-        if columns and rows and rows[0] == columns:
-            rows = rows[1:]
-        lines = _normalise_lines(metadata.pop("accessible_text", ""))
-        title = metadata["title"] or (lines[0] if lines else metadata["id"])
-        metadata["title"] = title
-        if _LOADING_TITLE_RE.search(title) or _LOADING_TITLE_RE.search(metadata.get("title", "")):
-            metadata["is_loading_placeholder"] = True
-        metadata["data"] = {
-            "columns": columns,
-            "rows": rows,
-            "row_count": len(rows),
-            "scanned_columns": scanned_columns,
-            "horizontal_scroll_steps": horizontal_steps,
-            "vertical_scroll_steps": vertical_steps,
-            "collection_method": "rendered_dom",
-        }
-        if not metadata.get("is_loading_placeholder"):
-            logger.debug(
-                "Visual collected | title=%s | rows=%d | cols=%d | vertical_steps=%d | horizontal_steps=%d",
-                title,
-                len(rows),
-                len(columns),
-                vertical_steps,
-                horizontal_steps,
-            )
-        metadata["export"] = {
-            "supported": metadata.pop("export_menu_present"),
-            "attempted": False,
-            "status": "not_attempted",
-            "file_path": None,
-        }
-        return metadata
-
-    async def _collect_rows(
+    async def _inspect_visual(
         self,
         locator,
-        scrollable: bool,
-        horizontally_scrollable: bool,
-    ) -> tuple[list[str], list[list[str]], int, int, int]:
-        """Collect matrix/table cells with combined vertical and horizontal scrolling.
-
-        Jagruthi: Power BI matrices virtualise both axes.  Always attempts a full
-        2D scan (horizontal slices × vertical steps) with wheel/scrollIntoView
-        fallbacks when scrollLeft does not move.
+        index: int,
+    ) -> dict[str, Any]:
         """
-        merger = _MatrixCellMerger()
+        Inspect one Power BI visual and extract DOM-based metadata/content.
 
+        Responsibilities:
+        - Identify visual type and title.
+        - Detect KPI/card visuals.
+        - Detect slicers.
+        - Detect table/matrix/tabular visuals.
+        - Preserve scrollability metadata.
+        - Extract DOM-visible graph content.
+        - Do NOT compare source and target.
+        - Do NOT export table data here.
+        - Do NOT call AI/LLM.
+        """
 
-        async def snapshot() -> None:
-            payload = await locator.evaluate(
-                """node => {
-                    const text = el => {
-                        if (!el) return '';
-                        return (el.innerText || el.getAttribute('aria-label') || '').trim();
-                    };
-                    const headers = [];
-                    const cells = [];
-                    node.querySelectorAll(
-                        '[role="columnheader"], th, .columnHeader, [class*="columnHeader" i]'
-                    ).forEach(cell => {
-                        const value = text(cell);
-                        const box = cell.getBoundingClientRect();
-                        if (!value || box.width < 1) return;
-                        headers.push({
-                            value,
-                            colindex: cell.getAttribute('aria-colindex'),
-                            left: box.left,
-                        });
-                    });
-                    const selectors = '[role="gridcell"], [role="rowheader"], [role="columnheader"], td, th';
-                    node.querySelectorAll(selectors).forEach(cell => {
-                        const value = text(cell);
-                        if (!value) return;
-                        const box = cell.getBoundingClientRect();
-                        if (box.width < 1 || box.height < 1) return;
-                        cells.push({
-                            value,
-                            rowindex: cell.getAttribute('aria-rowindex'),
-                            colindex: cell.getAttribute('aria-colindex'),
-                            left: box.left,
-                            top: box.top,
-                            role: cell.getAttribute('role') || '',
-                        });
-                    });
-                    if (!cells.length) {
-                        [...node.querySelectorAll('[role="row"], tr')].forEach(row => {
-                            const rowCells = [...row.querySelectorAll(
-                                '[role="gridcell"], [role="columnheader"], td, th, .cell, [class*="cell" i]'
-                            )].map(cell => text(cell)).filter(Boolean);
-                            if (!rowCells.length) return;
-                            rowCells.forEach((value, index) => {
-                                cells.push({
-                                    value,
-                                    rowindex: null,
-                                    colindex: String(index + 1),
-                                    left: index * 100,
-                                    top: row.offsetTop || 0,
-                                    role: 'gridcell',
-                                });
-                            });
-                        });
-                    }
-                    return { headers, cells };
-                }"""
-            )
-            merger.ingest(payload)
-
-        async def wait_after_scroll() -> None:
-            await self.page.wait_for_timeout(self.scroll_step_wait_ms)
-
-        async def reset_axis(axis: str) -> None:
-            await locator.evaluate(
-                """(node, axis) => {
-                    const isY = axis === 'y';
-                    const targets = [
-                        ...node.querySelectorAll(
-                            '[role="grid"], [role="table"], .mid-viewport, [class*="scrollRegion" i], [class*="scrollable-region" i]'
-                        ),
-                        ...node.querySelectorAll('*'),
-                    ];
-                    const seen = new Set();
-                    for (const el of targets) {
-                        if (seen.has(el)) continue;
-                        seen.add(el);
-                        const size = isY
-                            ? el.scrollHeight - el.clientHeight
-                            : el.scrollWidth - el.clientWidth;
-                        if (size > 2) {
-                            if (isY) el.scrollTop = 0;
-                            else el.scrollLeft = 0;
-                        }
-                    }
-                }""",
-                axis,
+        try:
+            logger.debug(
+                "Inspecting visual | dashboard=%s | index=%d",
+                self.dashboard_name,
+                index + 1,
             )
 
-        async def scroll_axis(axis: str) -> bool:
-            return await locator.evaluate(
-                """(node, axis) => {
-                    const isY = axis === 'y';
-                    const canScroll = (el) => isY
-                        ? el.scrollHeight > el.clientHeight + 2
-                        : el.scrollWidth > el.clientWidth + 2;
-                    const preferred = [
-                        ...node.querySelectorAll(
-                            '[role="grid"], [role="table"], .mid-viewport, [class*="scrollRegion" i], [class*="scrollable-region" i], [class*="pivotTable" i], [class*="matrix" i]'
-                        ),
-                    ];
-                    const generic = [...node.querySelectorAll('*')].filter(el => canScroll(el));
-                    generic.sort((a, b) => {
-                        const aDelta = isY ? a.scrollHeight - a.clientHeight : a.scrollWidth - a.clientWidth;
-                        const bDelta = isY ? b.scrollHeight - b.clientHeight : b.scrollWidth - b.clientWidth;
-                        return bDelta - aDelta;
-                    });
-                    const seen = new Set();
-                    const candidates = [];
-                    for (const el of preferred) {
-                        if (!seen.has(el) && canScroll(el)) {
-                            seen.add(el);
-                            candidates.push(el);
-                        }
-                    }
-                    for (const el of generic) {
-                        if (!seen.has(el)) {
-                            seen.add(el);
-                            candidates.push(el);
-                        }
-                    }
-                    const tryElement = (element) => {
-                        const before = isY ? element.scrollTop : element.scrollLeft;
-                        const max = isY
-                            ? element.scrollHeight - element.clientHeight
-                            : element.scrollWidth - element.clientWidth;
-                        const step = Math.max(
-                            (isY ? element.clientHeight : element.clientWidth) * 0.8,
-                            48,
+            metadata = await locator.evaluate(
+                r"""(node, index) => {
+
+                    const clean = value =>
+                        String(value || '')
+                            .replace(/\s+/g, ' ')
+                            .trim();
+
+
+                    const getText = element => {
+
+                        if (!element) return '';
+
+                        return clean(
+                            element.innerText ||
+                            element.getAttribute('aria-label') ||
+                            element.textContent ||
+                            ''
                         );
-                        if (isY) {
-                            element.scrollTop = Math.min(element.scrollTop + step, max);
-                        } else {
-                            element.scrollLeft = Math.min(element.scrollLeft + step, max);
-                        }
-                        element.dispatchEvent(new Event('scroll', { bubbles: true }));
-                        let after = isY ? element.scrollTop : element.scrollLeft;
-                        if (after > before + 0.5) return true;
-                        if (!isY) {
-                            element.dispatchEvent(new WheelEvent('wheel', {
-                                deltaX: step,
-                                deltaY: 0,
-                                bubbles: true,
-                                cancelable: true,
-                            }));
-                            after = element.scrollLeft;
-                            if (after > before + 0.5) return true;
-                        }
-                        return false;
                     };
-                    for (const element of candidates) {
-                        if (tryElement(element)) return true;
+
+
+                    const unique = values =>
+                        [...new Set(
+                            values
+                                .map(value => clean(value))
+                                .filter(Boolean)
+                        )];
+
+
+                    const typeAttributes = [
+                        node.getAttribute('data-visual-type'),
+                        node.getAttribute('aria-roledescription'),
+                        node.getAttribute('role'),
+                        typeof node.className === 'string'
+                            ? node.className
+                            : ''
+                    ].filter(Boolean);
+
+
+                    const typeSource = typeAttributes.join(' ');
+
+
+                    // ------------------------------------------
+                    // VISUAL TYPE DETECTION
+                    // ------------------------------------------
+
+                    const isKpiOrCard =
+                        /card|kpi|callout|multirowcard/i
+                            .test(typeSource);
+
+
+                    const isSlicer =
+                        /slicer/i.test(typeSource) ||
+
+                        node.matches(
+                            '.slicerContainer, ' +
+                            '[class*="slicer" i], ' +
+                            '[aria-label*="Slicer" i], ' +
+                            '[data-visual-type*="slicer" i]'
+                        ) ||
+
+                        Boolean(
+                            node.querySelector(
+                                '.slicerContainer, ' +
+                                '[class*="slicer" i], ' +
+                                '[aria-label*="Slicer" i]'
+                            )
+                        );
+
+
+                    // ------------------------------------------
+                    // TABLE / MATRIX DETECTION
+                    // ------------------------------------------
+
+                    const visualType = clean(
+                        node.getAttribute('data-visual-type')
+                    ).toLowerCase();
+
+                    const ariaRoleDescription = clean(
+                        node.getAttribute('aria-roledescription')
+                    ).toLowerCase();
+
+                    const classSource = [
+                        typeof node.className === 'string'
+                            ? node.className
+                            : '',
+
+                        ...[...node.querySelectorAll('*')]
+                            .slice(0, 300)
+                            .map(element =>
+                                typeof element.className === 'string'
+                                    ? element.className
+                                    : ''
+                            )
+                    ].join(' ');
+
+
+                    // ------------------------------------------
+                    // POWER BI TABULAR DOM SIGNALS
+                    // ------------------------------------------
+
+                    const hasTableElement =
+                        Boolean(
+                            node.querySelector(
+                                'table, thead, tbody, tr, td, th'
+                            )
+                        );
+
+                    const hasGrid =
+                        Boolean(
+                            node.querySelector(
+                                '[role="grid"], ' +
+                                '[role="table"], ' +
+                                '[role="row"], ' +
+                                '[role="gridcell"], ' +
+                                '[role="columnheader"], ' +
+                                '[role="rowheader"]'
+                            )
+                        );
+
+                    const hasPowerBITabularClass =
+                        /table|matrix|pivot|tabular|grid|bodycells|headercells|rowcells/i
+                            .test(classSource);
+
+                    const hasPowerBITabularStructure =
+                        Boolean(
+                            node.querySelector(
+                                '.mid-viewport, ' +
+                                '[class*="table" i], ' +
+                                '[class*="matrix" i], ' +
+                                '[class*="pivot" i], ' +
+                                '[class*="grid" i], ' +
+                                '[class*="bodyCell" i], ' +
+                                '[class*="headerCell" i], ' +
+                                '[class*="rowCell" i]'
+                            )
+                        );
+
+
+                    // ------------------------------------------
+                    // EXPLICIT TYPE DETECTION
+                    // ------------------------------------------
+
+                    const isTable =
+                        visualType === 'table' ||
+                        ariaRoleDescription === 'table' ||
+                        /\btable\b/i.test(typeSource) ||
+                        /\btable\b/i.test(classSource);
+
+                    const isMatrix =
+                        visualType === 'matrix' ||
+                        ariaRoleDescription === 'matrix' ||
+                        /\bmatrix\b/i.test(typeSource) ||
+                        /\bmatrix\b/i.test(classSource);
+
+
+                    // ------------------------------------------
+                    // FINAL TABULAR DECISION
+                    // ------------------------------------------
+
+                    const isTabular =
+                        Boolean(
+                            isTable ||
+                            isMatrix ||
+                            (
+                                (
+                                    hasGrid ||
+                                    hasTableElement ||
+                                    hasPowerBITabularStructure ||
+                                    hasPowerBITabularClass
+                                ) &&
+                                !isSlicer &&
+                                !isKpiOrCard
+                            )
+                        );
+                    // ------------------------------------------
+                    // TITLE EXTRACTION
+                    // ------------------------------------------
+
+                    const titleSelectors = [
+                        '.visualTitle',
+                        '[class*="visualTitle" i]',
+                        '[data-visual-title]',
+                        '[class*="title" i]'
+                    ];
+
+
+                    let title = '';
+
+                    for (const selector of titleSelectors) {
+
+                        const titleNode =
+                            node.querySelector(selector);
+
+                        const candidate =
+                            getText(titleNode);
+
+                        if (candidate) {
+                            title = candidate;
+                            break;
+                        }
                     }
-                    if (!isY) {
-                        const cells = [...node.querySelectorAll('[role="gridcell"], td, th')]
-                            .filter(cell => cell.getBoundingClientRect().width > 0);
-                        if (!cells.length) return false;
-                        const rightCell = cells.reduce((best, cell) => {
-                            const box = cell.getBoundingClientRect();
-                            const bestBox = best.getBoundingClientRect();
-                            return box.right > bestBox.right ? cell : best;
-                        }, cells[0]);
-                        const before = candidates[0]?.scrollLeft ?? 0;
-                        rightCell.scrollIntoView({ block: 'nearest', inline: 'end', behavior: 'instant' });
-                        const after = candidates[0]?.scrollLeft ?? 0;
-                        return after > before + 0.5;
+
+
+                    if (!title) {
+
+                        const labelled =
+                            clean(
+                                node.getAttribute(
+                                    'aria-label'
+                                )
+                            );
+
+                        if (labelled) {
+                            title = labelled;
+                        }
                     }
-                    return false;
+
+
+                    if (!title) {
+
+                        const titled =
+                            clean(
+                                node.getAttribute(
+                                    'title'
+                                )
+                            );
+
+                        if (titled) {
+                            title = titled;
+                        }
+                    }
+
+
+                    // ------------------------------------------
+                    // SCROLL DETECTION
+                    // ------------------------------------------
+
+                    const canScrollY = element =>
+                        element.scrollHeight >
+                        element.clientHeight + 2;
+
+
+                    const canScrollX = element =>
+                        element.scrollWidth >
+                        element.clientWidth + 2;
+
+
+                    const grid = node.querySelector(
+                        '[role="grid"], ' +
+                        '[role="table"], ' +
+                        '.mid-viewport, ' +
+                        '[class*="scrollRegion" i]'
+                    );
+
+
+                    const scrollable =
+                        Boolean(
+                            grid &&
+                            canScrollY(grid)
+                        ) ||
+
+                        [...node.querySelectorAll('*')]
+                            .some(element => {
+
+                                const style =
+                                    getComputedStyle(element);
+
+                                return (
+                                    canScrollY(element) &&
+                                    /(auto|scroll|hidden)/i
+                                        .test(
+                                            style.overflowY
+                                        )
+                                );
+                            });
+
+
+                    const horizontallyScrollable =
+                        Boolean(
+                            grid &&
+                            canScrollX(grid)
+                        ) ||
+
+                        [...node.querySelectorAll('*')]
+                            .some(element => {
+
+                                const style =
+                                    getComputedStyle(element);
+
+                                return (
+                                    canScrollX(element) &&
+                                    /(auto|scroll|hidden)/i
+                                        .test(
+                                            style.overflowX
+                                        )
+                                );
+                            });
+
+
+                    // ------------------------------------------
+                    // GRAPH / VISUAL CONTENT EXTRACTION
+                    // ------------------------------------------
+                    //
+                    // Works generically for visuals where Power BI
+                    // exposes labels/data through:
+                    //
+                    // - SVG text
+                    // - aria-label
+                    // - title
+                    // - graphics symbols
+                    // - canvas accessibility layers
+                    //
+                    // This does NOT assume a specific chart type.
+                    //
+                    // Therefore it can preserve information from:
+                    //
+                    // - bar charts
+                    // - column charts
+                    // - line charts
+                    // - area charts
+                    // - pie/donut charts
+                    // - scatter plots
+                    // - heatmaps
+                    // - histograms
+                    // - box plots
+                    // - combo charts
+                    // ------------------------------------------
+
+                    const contentSelectors = [
+                        'svg text',
+                        '[aria-label]',
+                        '[title]',
+                        '[role="img"]',
+                        '[role="graphics-symbol"]',
+                        '[role="graphics-document"]',
+                        '[role="listitem"]'
+                    ];
+
+
+                    const elements = [
+                        ...node.querySelectorAll(
+                            contentSelectors.join(',')
+                        )
+                    ];
+
+
+                    const domContent = [];
+
+                    const seenContent = new Set();
+
+
+                    for (const element of elements) {
+
+                        if (!element || !element.isConnected) {
+                            continue;
+                        }
+
+
+                        const text =
+                            getText(element) ||
+
+                            clean(
+                                element.getAttribute(
+                                    'aria-label'
+                                )
+                            ) ||
+
+                            clean(
+                                element.getAttribute(
+                                    'title'
+                                )
+                            );
+
+
+                        if (!text) {
+                            continue;
+                        }
+
+
+                        const item = {
+                            tag:
+                                clean(
+                                    element.tagName
+                                ).toLowerCase(),
+
+                            role:
+                                clean(
+                                    element.getAttribute(
+                                        'role'
+                                    )
+                                ),
+
+                            aria_label:
+                                clean(
+                                    element.getAttribute(
+                                        'aria-label'
+                                    )
+                                ),
+
+                            title:
+                                clean(
+                                    element.getAttribute(
+                                        'title'
+                                    )
+                                ),
+
+                            text
+                        };
+
+
+                        const key = [
+                            item.tag,
+                            item.role,
+                            item.aria_label,
+                            item.title,
+                            item.text
+                        ].join('|');
+
+
+                        if (seenContent.has(key)) {
+                            continue;
+                        }
+
+
+                        seenContent.add(key);
+
+                        domContent.push(item);
+                    }
+
+
+                    // ------------------------------------------
+                    // SVG TEXT
+                    // ------------------------------------------
+
+                    const svgText = unique(
+                        [
+                            ...node.querySelectorAll(
+                                'svg text'
+                            )
+                        ].map(
+                            element =>
+                                clean(
+                                    element.textContent
+                                )
+                        )
+                    );
+
+
+                    // ------------------------------------------
+                    // ARIA LABELS
+                    // ------------------------------------------
+
+                    const ariaLabels = unique(
+                        [
+                            ...node.querySelectorAll(
+                                '[aria-label]'
+                            )
+                        ].map(
+                            element =>
+                                clean(
+                                    element.getAttribute(
+                                        'aria-label'
+                                    )
+                                )
+                        )
+                    );
+
+
+                    // ------------------------------------------
+                    // TITLE ATTRIBUTES
+                    // ------------------------------------------
+
+                    const titles = unique(
+                        [
+                            ...node.querySelectorAll(
+                                '[title]'
+                            )
+                        ].map(
+                            element =>
+                                clean(
+                                    element.getAttribute(
+                                        'title'
+                                    )
+                                )
+                        )
+                    );
+
+
+                    // ------------------------------------------
+                    // ACCESSIBLE / VISIBLE TEXT
+                    // ------------------------------------------
+
+                    const accessibleText =
+                        clean(node.innerText);
+
+
+                    // ------------------------------------------
+                    // POSITION
+                    // ------------------------------------------
+
+                    const rect =
+                        node.getBoundingClientRect();
+
+
+                    // ------------------------------------------
+                    // LOADING DETECTION
+                    // ------------------------------------------
+
+                    const loadingText =
+                        clean(node.innerText);
+
+
+                    const isLoadingPlaceholder =
+                        /\bvisuals?\s+are\s+loading\b/i
+                            .test(loadingText) ||
+
+                        /^loading(\.{3}|…)?$/i
+                            .test(loadingText);
+
+
+                    // ------------------------------------------
+                    // FINAL METADATA
+                    // ------------------------------------------
+
+                    return {
+
+                        id:
+                            node.getAttribute(
+                                'data-visual-id'
+                            ) ||
+
+                            node.id ||
+
+                            `visual-${index + 1}`,
+
+
+                        index: index,
+
+
+                        title:
+                            title ||
+                            `Visual ${index + 1}`,
+
+
+                        visual_type:
+                            clean(
+                                node.getAttribute(
+                                    'data-visual-type'
+                                )
+                            ) ||
+
+                            clean(
+                                node.getAttribute(
+                                    'aria-roledescription'
+                                )
+                            ) ||
+
+                            'unknown',
+
+
+                        aria_role:
+                            clean(
+                                node.getAttribute(
+                                    'aria-roledescription'
+                                )
+                            ),
+
+
+                        type_source:
+                            clean(typeSource),
+
+
+                        accessible_text:
+                            accessibleText,
+                        "accessible_text_length": 
+                            accessibleText.length,
+                            
+
+                        // DOM graph/visual data
+                        dom_content:
+                            domContent,
+
+
+                        svg_text:
+                            svgText,
+
+
+                        aria_labels:
+                            ariaLabels,
+
+
+                        titles,
+
+
+                        // Position metadata
+                        position: {
+                            x:
+                                Math.round(rect.x),
+
+                            y:
+                                Math.round(rect.y),
+
+                            width:
+                                Math.round(rect.width),
+
+                            height:
+                                Math.round(rect.height)
+                        },
+
+
+                        // Visual classification
+                        is_kpi_or_card:
+                            Boolean(isKpiOrCard),
+
+
+                        is_slicer:
+                            Boolean(isSlicer),
+
+
+                        is_tabular:
+                            Boolean(isTabular),
+
+
+                        is_table:
+                            Boolean(isTable),
+
+
+                        is_matrix:
+                            Boolean(isMatrix),
+
+
+                        // Preserve scroll metadata
+                        scrollable:
+                            Boolean(scrollable),
+
+
+                        horizontally_scrollable:
+                            Boolean(
+                                horizontallyScrollable
+                            ),
+
+
+                        is_loading_placeholder:
+                            Boolean(
+                                isLoadingPlaceholder
+                            )
+                    };
+
                 }""",
-                axis,
+                index,
             )
 
-        horizontal_moves = 0
-        vertical_moves = 0
-        max_steps = self.max_scroll_steps
+            logger.debug(
+                "Visual inspection completed | "
+                "dashboard=%s | index=%d | "
+                "title=%s | type=%s | "
+                "kpi=%s | slicer=%s | "
+                "tabular=%s | dom_items=%d",
+                self.dashboard_name,
+                index + 1,
+                metadata.get("title"),
+                metadata.get("visual_type"),
+                metadata.get("is_kpi_or_card"),
+                metadata.get("is_slicer"),
+                metadata.get("is_tabular"),
+                len(metadata.get("dom_content", [])),
+            )
 
-        await reset_axis("x")
-        await reset_axis("y")
-        await snapshot()
+            return metadata
 
-        for h_index in range(max_steps + 1):
-            await reset_axis("y")
-            await snapshot()
-            
-            #scan the entire table vertically
-            if scrollable or horizontally_scrollable or merger.row_count() > 0 or merger.col_count() > 0:
-                for _ in range(max_steps):
-                    moved = await scroll_axis("y")
-                    if not moved:
-                        break
-                    vertical_moves += 1
-                    await wait_after_scroll()
-                    await snapshot()
-
-            # Stop horizontal scanning when we reach the end
-            if h_index >= max_steps:
-                break
-
-            moved_right = await scroll_axis("x")
-
-            await self.page.wait_for_timeout(150)
-
-            if not moved_right:
-                logger.debug(
-                    "Horizontal table scrolling reached the end"
-                )
-                break
-
-            horizontal_moves += 1
-
-        columns, rows = merger.to_table()
-        logger.debug(
-            "Matrix scan complete | vertical_steps=%d | horizontal_steps=%d | rows=%d | cols=%d",
-            vertical_moves,
-            horizontal_moves,
-            len(rows),
-            len(columns),
-        )
-        return columns, rows, len(columns), horizontal_moves, vertical_moves
-
-    async def _try_export(self, locator, visual: dict[str, Any], index: int) -> dict[str, Any]:
-        export = dict(visual["export"], attempted=True, status="unavailable")
-        try:
-            menu = locator.locator("button, [role='button']").filter(has_text=re.compile("more options|more", re.I))
-            if await menu.count() == 0:
-                return export
-            await menu.first.click()
-            item = self.page.get_by_text(re.compile(r"export data", re.I)).first
-            if await item.count() == 0:
-                return export
-            async with self.page.expect_download(timeout=10_000) as download_info:
-                await item.click()
-            download = await download_info.value
-            if self.download_directory:
-                self.download_directory.mkdir(parents=True, exist_ok=True)
-                path = self.download_directory / _safe_filename(visual["title"], f"visual-{index + 1}")
-                path = path.with_suffix(Path(download.suggested_filename).suffix or ".csv")
-                await download.save_as(str(path))
-                export["file_path"] = str(path)
-            export["status"] = "downloaded"
         except Exception as exc:
-            export["error"] = str(exc)
-        return export
 
-    @staticmethod
-    def _read_exported_table(file_path: str | None) -> dict[str, Any] | None:
-        """Read a Power BI CSV/XLSX export into the common table schema."""
-        if not file_path:
-            return None
-        path = Path(file_path)
+            logger.exception(
+                "Visual inspection failed | "
+                "dashboard=%s | index=%d | error=%s",
+                self.dashboard_name,
+                index + 1,
+                exc,
+            )
+
+            return {
+                "id": f"visual-{index + 1}",
+                "index": index,
+                "title": f"Visual {index + 1}",
+                "visual_type": "unknown",
+                "aria_role": "",
+                "type_source": "",
+                "accessible_text": "",
+                "dom_content": [],
+                "svg_text": [],
+                "aria_labels": [],
+                "titles": [],
+                "position": {
+                    "x": 0,
+                    "y": 0,
+                    "width": 0,
+                    "height": 0,
+                },
+                "is_kpi_or_card": False,
+                "is_slicer": False,
+                "is_tabular": False,
+                "is_table": False,
+                "is_matrix": False,
+                "scrollable": False,
+                "horizontally_scrollable": False,
+                "is_loading_placeholder": False,
+                "inspection_error": str(exc),
+            }
+        
+    async def _extract_table_data(
+        self,
+        visual: dict[str, Any],
+        index: int,
+    ) -> dict[str, Any]:
+        """
+        Delegate a single identified table/matrix visual to table_exporter.
+
+        VisualDataExporter:
+        - identifies the table/matrix
+
+        table_exporter:
+        - exports the actual data
+
+        No AI/LLM is used here.
+        """
+
+        table_result: dict[str, Any] = {
+            "visual_id": visual.get("id"),
+            "index": index,
+            "title": visual.get("title"),
+            "visual_type": visual.get("visual_type"),
+            "is_table": visual.get("is_table", False),
+            "is_matrix": visual.get("is_matrix", False),
+            "is_tabular": visual.get("is_tabular", False),
+            "scrollable": visual.get("scrollable", False),
+            "horizontally_scrollable": visual.get(
+                "horizontally_scrollable",
+                False,
+            ),
+            "status": "not_attempted",
+            "data": None,
+            "error": None,
+        }
+
         try:
-            if path.suffix.lower() == ".csv":
-                with path.open("r", encoding="utf-8-sig", newline="") as handle:
-                    values = list(csv.reader(handle))
-            elif path.suffix.lower() in {".xlsx", ".xlsm"}:
-                workbook = load_workbook(path, read_only=True, data_only=True)
-                sheet = workbook.active
-                values = [list(row) for row in sheet.iter_rows(values_only=True)]
-                workbook.close()
-            else:
-                logger.warning("Unsupported Power BI export format | %s", path.suffix)
-                return None
-            values = [["" if value is None else str(value) for value in row] for row in values if any(value is not None and str(value).strip() for value in row)]
-            if not values:
-                return None
-            return {"columns": values[0], "rows": values[1:], "row_count": max(0, len(values) - 1)}
-        except Exception:
-            logger.exception("Unable to parse Power BI export | %s", path)
-            return None
+            logger.info(
+                "Delegating table visual to table_exporter | "
+                "dashboard=%s | index=%d | title=%s",
+                self.dashboard_name,
+                index + 1,
+                visual.get("title"),
+            )
+
+            exported_tables = await export_table_visuals(
+                page=self.page,
+                table_visuals=[visual],
+                dashboard_name=self.dashboard_name,
+            )
+
+            if not exported_tables:
+                logger.warning(
+                    "Table exporter returned no results | "
+                    "dashboard=%s | title=%s",
+                    self.dashboard_name,
+                    visual.get("title"),
+                )
+
+                table_result["status"] = "no_data"
+
+                return table_result
+
+            exported = exported_tables[0]
+
+            table_result["status"] = exported.get(
+                "status",
+                "unknown",
+            )
+
+            table_result["data"] = exported.get(
+                "data"
+            )
+
+            table_result["error"] = exported.get(
+                "error"
+            )
+
+            table_result["file_path"] = exported.get(
+                "file_path"
+            )
+
+            table_result["validation_data_type"] = (
+                exported.get("validation_data_type")
+            )
+
+            table_result["validation_option"] = (
+                exported.get("validation_option")
+            )
+
+            table_result["validation_note"] = (
+                exported.get("validation_note")
+            )
+
+            logger.info(
+                "Table export completed | "
+                "dashboard=%s | title=%s | status=%s",
+                self.dashboard_name,
+                visual.get("title"),
+                table_result["status"],
+            )
+
+            return table_result
+
+        except Exception as exc:
+
+            logger.exception(
+                "Table exporter failed | "
+                "dashboard=%s | index=%d | title=%s",
+                self.dashboard_name,
+                index + 1,
+                visual.get("title"),
+            )
+
+            table_result["status"] = "failed"
+            table_result["error"] = str(exc)
+
+            return table_result
+
+    async def extract_dashboard_data(self) -> dict[str, Any]:
+        """
+        Extract dashboard data using DOM inspection.
+
+        Responsibilities:
+        - Extract KPI/card values from the DOM.
+        - Extract graph/visual information from the DOM.
+        - Detect tables and matrices.
+        - Delegate table/matrix extraction to table_exporter.
+
+        This function does NOT:
+        - Compare source and target dashboards.
+        - Call Gemini or any LLM.
+        - Scroll tables manually.
+        """
+
+        result: dict[str, Any] = {
+            "status": "success",
+            "extracted_at": datetime.now(timezone.utc).isoformat(),
+            "kpi_cards": [],
+            "visuals": [],
+            "table_visuals": [],
+            "table_exports": [],
+            "skipped_visuals": [],
+            "errors": [],
+        }
+
+        logger.info(
+            "Starting dashboard DOM extraction"
+        )
+
+        # --------------------------------------------------
+        # KPI EXTRACTION
+        # --------------------------------------------------
+        try:
+            logger.info(
+                "Starting KPI extraction"
+            )
+
+            result["kpi_cards"] = (
+                await self._extract_kpi_cards()
+            )
+
+            logger.info(
+                "KPI extraction completed | kpis=%d",
+                len(result["kpi_cards"]),
+            )
+
+        except Exception as exc:
+            logger.exception(
+                "KPI extraction failed"
+            )
+
+            result["status"] = "partial"
+
+            result["errors"].append(
+                f"KPI extraction failed: {exc}"
+            )
+
+        # --------------------------------------------------
+        # LOCATE VISUALS
+        # --------------------------------------------------
+        try:
+            visual_count = (
+                await self.page.locator(
+                    VISUAL_SELECTOR
+                ).count()
+            )
+
+            logger.info(
+                "Power BI visual containers found | count=%d",
+                visual_count,
+            )
+
+        except Exception as exc:
+            logger.exception(
+                "Unable to locate Power BI visuals"
+            )
+
+            result["status"] = "failed"
+
+            result["errors"].append(
+                f"Unable to locate Power BI visuals: {exc}"
+            )
+
+            return result
+
+        # --------------------------------------------------
+        # NO VISUALS
+        # --------------------------------------------------
+        if visual_count == 0:
+
+            logger.warning(
+                "No Power BI visual containers found"
+            )
+
+            result["status"] = "partial"
+
+            result["errors"].append(
+                "No Power BI visual containers were found."
+            )
+
+            return result
+
+        # --------------------------------------------------
+        # PROCESS VISUALS
+        # --------------------------------------------------
+        for index in range(visual_count):
+
+            locator = (
+                self.page
+                .locator(VISUAL_SELECTOR)
+                .nth(index)
+            )
+
+            try:
+
+                # ------------------------------------------
+                # VISIBILITY CHECK
+                # ------------------------------------------
+                if not await locator.is_visible():
+
+                    logger.debug(
+                        "Skipping hidden visual | index=%d",
+                        index + 1,
+                    )
+
+                    result["skipped_visuals"].append(
+                        {
+                            "index": index + 1,
+                            "reason": "hidden",
+                        }
+                    )
+
+                    continue
+
+                # ------------------------------------------
+                # DOM INSPECTION
+                # ------------------------------------------
+                logger.debug(
+                    "Inspecting visual | index=%d",
+                    index + 1,
+                )
+
+                visual = await self._inspect_visual(
+                    locator,
+                    index,
+                )
+
+                logger.debug(
+                    "Visual inspected | "
+                    "index=%d | title=%s | type=%s",
+                    index + 1,
+                    visual.get("title"),
+                    visual.get("visual_type"),
+                )
+
+                # ------------------------------------------
+                # LOADING PLACEHOLDER
+                # ------------------------------------------
+                if visual.get(
+                    "is_loading_placeholder"
+                ):
+
+                    logger.info(
+                        "Skipping loading visual | "
+                        "index=%d | title=%s",
+                        index + 1,
+                        visual.get("title"),
+                    )
+
+                    result["skipped_visuals"].append(
+                        {
+                            "index": index + 1,
+                            "reason": "loading_placeholder",
+                            "title": visual.get("title"),
+                        }
+                    )
+
+                    continue
+
+                # ------------------------------------------
+                # KPI / CARD
+                # ------------------------------------------
+                #
+                # KPI extraction is already handled by
+                # _extract_kpi_cards().
+                #
+                # Do not add KPI visuals to graph visuals.
+                #
+                # ------------------------------------------
+
+                if visual.get("is_kpi_or_card"):
+
+                    logger.debug(
+                        "Skipping KPI/card visual from "
+                        "visual extraction | index=%d | title=%s",
+                        index + 1,
+                        visual.get("title"),
+                    )
+
+                    result["skipped_visuals"].append(
+                        {
+                            "index": index + 1,
+                            "reason": "kpi_or_card",
+                            "title": visual.get("title"),
+                        }
+                    )
+
+                    continue
+
+                # ------------------------------------------
+                # SLICER
+                # ------------------------------------------
+
+                if visual.get("is_slicer"):
+
+                    logger.debug(
+                        "Skipping slicer from visual extraction | "
+                        "index=%d | title=%s",
+                        index + 1,
+                        visual.get("title"),
+                    )
+
+                    result["skipped_visuals"].append(
+                        {
+                            "index": index + 1,
+                            "reason": "slicer",
+                            "title": visual.get("title"),
+                        }
+                    )
+
+                    continue
+
+                # ---------------------------------------------------------
+                # TABLE / MATRIX EXPORT
+                # ---------------------------------------------------------
+
+                if result["table_visuals"]:
+
+                    try:
+
+                        logger.info(
+                            "Starting delegated table export | "
+                            "dashboard=%s | tables=%d",
+                            self.dashboard_name,
+                            len(result["table_visuals"]),
+                        )
+
+                        result["table_exports"] = (
+                            await export_table_visuals(
+                                page=self.page,
+                                table_visuals=result["table_visuals"],
+                                dashboard_name=self.dashboard_name,
+                            )
+                        )
+
+                        successful_exports = sum(
+                            1
+                            for item in result["table_exports"]
+                            if item.get("status") == "downloaded"
+                        )
+
+                        logger.info(
+                            "Delegated table export completed | "
+                            "dashboard=%s | successful=%d | total=%d",
+                            self.dashboard_name,
+                            successful_exports,
+                            len(result["table_exports"]),
+                        )
+
+                    except Exception as exc:
+
+                        logger.exception(
+                            "Delegated table export failed | dashboard=%s",
+                            self.dashboard_name,
+                        )
+
+                        result["status"] = "partial"
+
+                        result["errors"].append(
+                            f"Table export failed: {exc}"
+                        )
+
+                else:
+
+                    logger.info(
+                        "No table or matrix visuals detected | dashboard=%s",
+                        self.dashboard_name,
+                    )
+
+                # ------------------------------------------
+                # NORMAL GRAPH / VISUAL
+                # ------------------------------------------
+
+                logger.debug(
+                    "Adding DOM visual | "
+                    "index=%d | title=%s | type=%s",
+                    index + 1,
+                    visual.get("title"),
+                    visual.get("visual_type"),
+                )
+
+                result["visuals"].append(
+                    visual
+                )
+
+            except Exception as exc:
+
+                logger.exception(
+                    "Visual extraction failed | index=%d",
+                    index + 1,
+                )
+
+                result["status"] = "partial"
+
+                result["errors"].append(
+                    f"Visual {index + 1}: {exc}"
+                )
+
+        # --------------------------------------------------
+        # FINAL LOG
+        # --------------------------------------------------
+
+        logger.info(
+            "Dashboard DOM extraction completed | "
+            "kpis=%d | visuals=%d | table_visuals=%d | "
+            "table_exports=%d | skipped=%d | errors=%d",
+            len(result["kpi_cards"]),
+            len(result["visuals"]),
+            len(result["table_visuals"]),
+            len(result["table_exports"]),
+            len(result["skipped_visuals"]),
+            len(result["errors"]),
+        )
+
+        return result
 
 
-async def extract_visual_data(page, **kwargs) -> dict[str, Any]:
-    """Convenience API used by the validator and future API/frontend callers."""
-    attempt_export = kwargs.pop("attempt_export", False)
-    return await VisualDataExporter(page, **kwargs).extract_dashboard_data(
-        attempt_export=attempt_export
+async def extract_visual_data(
+    page,
+    **kwargs,
+) -> dict[str, Any]:
+    """
+    Public convenience API for DOM KPI, visual,
+    and table data extraction.
+    """
+
+    dashboard_name = kwargs.pop(
+        "dashboard_name",
+        "Dashboard",
     )
 
+    if kwargs:
+        logger.debug(
+            "Ignoring unsupported extract_visual_data kwargs: %s",
+            list(kwargs.keys()),
+        )
 
-async def self_wait_for_dashboard(page) -> None:
-    """Wait briefly for a slicer action to repaint without reloading the page."""
-    await page.wait_for_timeout(500)
-    for _ in range(8):
-        loading = await page.locator(".loading, [aria-label*='loading' i], [aria-busy='true']").count()
-        if not loading:
-            await page.wait_for_timeout(350)
-            return
-        await page.wait_for_timeout(350)
+    exporter = VisualDataExporter(
+        page,
+        dashboard_name=dashboard_name,
+    )
+
+    return await exporter.extract_dashboard_data()

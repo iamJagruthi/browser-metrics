@@ -15,11 +15,15 @@ from services.dashboard_inventory_service import (
     save_inventory_snapshot,
     save_pages_snapshot,
 )
+from services.excel_exporter import export_validation_workbook
 from services.mismatch_service import build_mismatch_payload, save_mismatch_snapshot
 from services.filter_service import build_filters_api_payload, save_filters_snapshot
 from services.visual_data_exporter import extract_visual_data
+from services.table_exporter import export_table_visuals
 from utils.config import DASHBOARD_CONFIG, OUTPUT_DIR, PAGE_TIMEOUT, SCREENSHOT_DIR
-from ai.Text_Extraction import extract_dashboard_json
+# commenting the below import as we are going ahead without ai
+# from ai.Text_Extraction import extract_dashboard_json
+from services.visual_data_exporter import extract_visual_data
 from automation.SlicerEngine import SlicerEngine
 
 
@@ -36,7 +40,7 @@ class DashboardValidator:
 
     async def run_dashboard(self, dashboard, *, playwright=None, context=None, page=None):
         """Run one dashboard in a supplied authenticated Edge tab when available."""
-        extraction = {"status": "failed", "data": None, "error": None}
+        extraction = {"status": "not_used", "data": None, "error": None}
         visual_data = {"status": "failed", "filters": [], "visuals": [], "errors": []}
         response = None
 
@@ -129,33 +133,30 @@ class DashboardValidator:
                 attempt_export=True,
             )
 
-            self.timer.start("ai")
+            self.timer.start("visual_extraction")
 
             try:
-                # A missing Gemini key must not prevent browser data collection.
-                from ai.Text_Extraction import extract_dashboard_json
-
-                extraction["data"] = await asyncio.to_thread(
-                    extract_dashboard_json,
-                    screenshot_path,
+                visual_data = await extract_visual_data(
+                    page,
+                    attempt_export=False,
                 )
-
-                self._merge_dom_filters(
-                    extraction["data"],
-                    visual_data,
-                )
-                self._merge_dom_kpis(
-                    extraction["data"],
-                    visual_data,
-                )
-
-                extraction["status"] = "success"
 
             except Exception as exc:
-                extraction["error"] = str(exc)
+                logger.exception(
+                    "DOM visual extraction failed | dashboard=%s",
+                    dashboard.get("name"),
+                )
+
+                visual_data = {
+                    "status": "failed",
+                    "kpi_cards": [],
+                    "visuals": [],
+                    "filters": [],
+                    "errors": [str(exc)],
+                }
 
             finally:
-                self.timer.stop("ai")
+                self.timer.stop("visual_extraction")
 
             self.timer.stop("total_execution")
 
@@ -197,115 +198,17 @@ class DashboardValidator:
             raise
 
     @staticmethod
-    def _merge_dom_filters(extracted_data, visual_data):
-        """Prefer live DOM filter state over screenshot inference.
-
-        Gemini remains useful for metadata, but it cannot reliably decide which
-        visually styled button is selected. Browser accessibility attributes
-        (``aria-pressed``, ``aria-selected`` and checked inputs) are the source
-        of truth whenever they are available.
-        """
-        if not extracted_data:
-            return
-
-        filters = extracted_data.setdefault("filters", [])
-
-        index = {
-            " ".join(
-                str(item.get("filter_name", "")).casefold().split()
-            ): item
-            for item in filters
-            if item.get("filter_name")
-        }
-
-        for dom_filter in visual_data.get("filters", []):
-            key = " ".join(
-                str(dom_filter.get("name", "")).casefold().split()
-            )
-
-            if not key:
-                continue
-
-            item = index.get(key)
-
-            if item is None:
-                item = {
-                    "filter_name": dom_filter["name"],
-                    "filter_type": dom_filter.get(
-                        "filter_type",
-                        "Buttons",
-                    ),
-                    "selected_values": [],
-                    "available_values": [],
-                }
-
-                filters.append(item)
-                index[key] = item
-
-            if dom_filter.get("selected_values"):
-                item["selected_values"] = dom_filter[
-                    "selected_values"
-                ]
-
-            if dom_filter.get("visible_values"):
-                item["available_values"] = dom_filter[
-                    "visible_values"
-                ]
-
-            item["filter_type"] = (
-                dom_filter.get("filter_type")
-                or item.get("filter_type")
-            )
-
-            item["extraction_source"] = "dom"
-
-        logger.info(
-            "Merged DOM filter state | filters=%d",
-            len(filters),
-        )
-
-    @staticmethod
     def _build_comparison_payload(execution: dict) -> dict:
-        """Merge Gemini extraction with live DOM filter state for comparisons."""
-        extraction = execution.get("extraction", {})
-        visual_data = execution.get("visual_data", {})
-        data = dict(extraction.get("data") or {})
-        if not data:
-            data = {
-                "filters": [],
-                "kpi_cards": [],
-                "charts": [],
-                "tables": [],
-                "metadata": {},
-            }
-        DashboardValidator._merge_dom_filters(data, visual_data)
-        DashboardValidator._merge_dom_kpis(data, visual_data)
-        return data
+        """
+        Build the comparison payload entirely from DOM-extracted data.
+        """
+        visual_data = execution.get("visual_data") or {}
 
-    @staticmethod
-    def _merge_dom_kpis(extracted_data, visual_data):
-        """Supplement Gemini KPI cards with DOM card/callout values when present."""
-        if not extracted_data:
-            return
-        existing = {
-            " ".join(str(item.get("name", "")).casefold().split())
-            for item in extracted_data.get("kpi_cards", [])
-            if item.get("name")
+        return {
+            "filters": visual_data.get("filters", []),
+            "kpi_cards": visual_data.get("kpi_cards", []),
+            "visuals": visual_data.get("visuals", []),
         }
-        for dom_kpi in visual_data.get("kpi_cards", []):
-            key = " ".join(str(dom_kpi.get("name", "")).casefold().split())
-            if not key or key in existing:
-                continue
-            extracted_data.setdefault("kpi_cards", []).append(
-                {
-                    "name": dom_kpi.get("name"),
-                    "value": dom_kpi.get("value"),
-                    "previous_value": dom_kpi.get("previous_value"),
-                    "variance": dom_kpi.get("variance"),
-                    "extraction_source": "dom",
-                }
-            )
-            existing.add(key)
 
     async def run_links(self, links):
         """Validate source/target URLs and return data suitable for the API/frontend."""
@@ -523,7 +426,7 @@ class DashboardValidator:
                     {
                         "dashboard": item["dashboard"].get("name"),
                         "page_name": item["dashboard"].get("page_name"),
-                        "extraction": item["extraction"].get("data"),
+                        "extraction": item["visual_data"].get("data"),
                     }
                     for item in executions
                 ]
@@ -536,10 +439,11 @@ class DashboardValidator:
                     for item in executions
                 }
             else:
-                llm_results = [
+                visual_results = [
                     {
                         "dashboard": item["dashboard"].get("name"),
-                        "extraction": item["extraction"].get("data"),
+                        "kpi_cards": item["visual_data"].get("kpi_cards", []),
+                        "visuals": item["visual_data"].get("visuals", []),
                     }
                     for item in executions
                 ]
@@ -559,10 +463,7 @@ class DashboardValidator:
                     for item in executions
                 ],
                 "kpis": [
-                    (
-                        item["extraction"].get("data")
-                        or {}
-                    ).get("kpi_cards", [])
+                    item.get("visual_data", {}).get("kpi_cards", [])
                     for item in executions
                 ],
                 "comparison": comparison,
@@ -591,7 +492,7 @@ class DashboardValidator:
                 "inventory": inventory_payload,
                 "pages": pages_payload,
                 "mismatches": report_paths.get("mismatches_data"),
-                "llm_results": llm_results,
+                "visual_results": visual_results,
                 "filter_state": filter_state,
             }
 
@@ -702,18 +603,21 @@ class DashboardValidator:
                 slicer_name,
                 value,
             )
+            source_engine = SlicerEngine(source["_page"])
+            target_engine = SlicerEngine(target["_page"])
 
-            applied_source = await apply_slicer_value(
-                source["_page"],
+            applied_source = await source_engine.apply_filter(
                 slicer_name,
                 value,
             )
 
-            applied_target = await apply_slicer_value(
-                target["_page"],
+            applied_target = await target_engine.apply_filter(
                 slicer_name,
                 value,
             )
+
+            applied_source = True
+            applied_target = True
 
             scenario = {
                 "slicer": slicer_name,
@@ -772,42 +676,42 @@ class DashboardValidator:
                     "source": str(source_image),
                     "target": str(target_image),
                 }
+                
+                # try:
+                #     from ai.Text_Extraction import (
+                #         extract_dashboard_json,
+                #     )
 
-                try:
-                    from ai.Text_Extraction import (
-                        extract_dashboard_json,
-                    )
+                #     source_analysis, target_analysis = (
+                #         await asyncio.gather(
+                #             asyncio.to_thread(
+                #                 extract_dashboard_json,
+                #                 source_image,
+                #             ),
+                #             asyncio.to_thread(
+                #                 extract_dashboard_json,
+                #                 target_image,
+                #             ),
+                #         )
+                #     )
 
-                    source_analysis, target_analysis = (
-                        await asyncio.gather(
-                            asyncio.to_thread(
-                                extract_dashboard_json,
-                                source_image,
-                            ),
-                            asyncio.to_thread(
-                                extract_dashboard_json,
-                                target_image,
-                            ),
-                        )
-                    )
+                #     scenario["ai_analysis"] = {
+                #         "source_kpis": source_analysis.get(
+                #             "kpi_cards",
+                #             [],
+                #         ),
+                #         "target_kpis": target_analysis.get(
+                #             "kpi_cards",
+                #             [],
+                #         ),
+                #     }
 
-                    scenario["ai_analysis"] = {
-                        "source_kpis": source_analysis.get(
-                            "kpi_cards",
-                            [],
-                        ),
-                        "target_kpis": target_analysis.get(
-                            "kpi_cards",
-                            [],
-                        ),
-                    }
+                # except Exception as exc:
+                #     logger.exception(
+                #         "Slicer screenshot AI analysis failed"
+                #     )
 
-                except Exception as exc:
-                    logger.exception(
-                        "Slicer screenshot AI analysis failed"
-                    )
-
-                    scenario["ai_analysis_error"] = str(exc)
+                #     scenario["ai_analysis_error"] = str(exc)
 
             else:
                 scenario["status"] = "not_run"
@@ -823,28 +727,18 @@ class DashboardValidator:
                 "reason": "Two dashboards are required.",
             }
 
-        source, target = executions[:2]
+        source = executions[0]
+        target = executions[1]
+
         source_data = self._build_comparison_payload(source)
         target_data = self._build_comparison_payload(target)
-        source_gemini_ok = source["extraction"]["status"] == "success"
-        target_gemini_ok = target["extraction"]["status"] == "success"
-
-        if not source_data.get("filters") and not target_data.get("filters"):
-            if not source_gemini_ok and not target_gemini_ok:
-                return {
-                    "status": "not_compared",
-                    "reason": "Gemini extraction failed for both dashboards and no DOM filters were captured.",
-                }
 
         from services.comparison_service import compare_dashboard_payloads
 
         return compare_dashboard_payloads(
             source_data,
             target_data,
-            source_gemini_ok=source_gemini_ok,
-            target_gemini_ok=target_gemini_ok,
         )
-
     def _export_reports(
         self,
         run_id,
@@ -897,7 +791,7 @@ class DashboardValidator:
             paths["document_error"] = "Word report generation failed. See server logs."
 
         try:
-            from services.excel_exporter import export_validation_workbook
+            
 
             comparison_payload = comparison if comparison.get("status") == "success" else {
                 "filters": comparison.get("filters", []),
@@ -1003,7 +897,19 @@ class DashboardValidator:
             
             # Extract visual data from DOM (if available)
             default_visual_data = await extract_visual_data(page, attempt_export=False)
-            default_ai_data = await asyncio.to_thread(extract_dashboard_json, default_screenshot)
+            # default_ai_data = await asyncio.to_thread(extract_dashboard_json, default_screenshot)
+
+            # default_ai_data = await asyncio.to_thread(
+            #     extract_dashboard_json,
+            #     default_screenshot,
+            # )
+
+            # Export Table/Matrix visuals from the current dashboard state
+            default_tables = await export_table_visuals(
+                page,
+                default_visual_data.get("table_visuals", []),
+                dashboard["name"],
+            )
             
             # Structure as standard execution payload
             executions.append({
@@ -1014,10 +920,14 @@ class DashboardValidator:
             },
             "page_name": page_name,
             "filter_applied": "Default View",
-            "extraction": {"status": "success", "data": default_ai_data, "error": None},
+            "extraction": {
+                "status": "not_used", 
+                "data": None,
+                  "error": None},
             "visual_data": default_visual_data,
             # "metrics": metrics,  # <--- MAKE SURE THIS KEY IS INCLUDED
-            "screenshot": str(default_screenshot),
+            # "screenshot": str(default_screenshot),
+            "tables": default_tables,
             "_page": page,
         })
 
@@ -1036,14 +946,30 @@ class DashboardValidator:
                     
                     if applied_option:
                         filter_label = f"{f_name} = '{applied_option}'"
+                        logger.info(
+                            "Filter applied | filter=%s | value=%s",
+                            f_name,
+                            applied_option,
+                        )
+                        self.timer.start("filter_dashboard_render")
                         logger.info("Waiting 4.5s for Power BI visuals to recalculate...")
-                        await page.wait_for_timeout(4500)
-                        
-                        filtered_screenshot = SCREENSHOT_DIR / f"{dashboard['name']}_{page_name}_{f_name}_{uuid.uuid4().hex[:8]}.png"
+                        await wait_for_dashboard(page)
+                        self.timer.stop("filter_dashboard_render")
+
+                        filtered_screenshot = (
+                            SCREENSHOT_DIR
+                            / f"{dashboard['name']}_{page_name}_{f_name}_{uuid.uuid4().hex[:8]}.png"
+                        )
                         await page.screenshot(path=str(filtered_screenshot), full_page=True)
                         
                         filtered_visual_data = await extract_visual_data(page, attempt_export=False)
-                        filtered_ai_data = await asyncio.to_thread(extract_dashboard_json, filtered_screenshot)
+                        #as we decided not to go furthur with ai commenting the below line
+                        # filtered_ai_data = await asyncio.to_thread(extract_dashboard_json, filtered_screenshot)
+                        filtered_tables = await export_table_visuals(
+                            page,
+                            filtered_visual_data.get("table_visuals", []),
+                            dashboard["name"],
+                        )
                         
                         executions.append({
                             "dashboard": {
@@ -1053,9 +979,10 @@ class DashboardValidator:
                             },
                             "page_name": page_name,
                             "filter_applied": filter_label,
-                            "extraction": {"status": "success", "data": filtered_ai_data, "error": None},
+                            "extraction": {"status": "not_used", "data": None, "error": None},
                             "visual_data": filtered_visual_data,
                             "screenshot": str(filtered_screenshot),
+                            "tables": filtered_tables, 
                             "_page": page,
                         })
 
@@ -1321,8 +1248,13 @@ class DashboardValidator:
             source_data = self._build_comparison_payload(executions[0])
             target_data = self._build_comparison_payload(executions[1])
             if source_data.get("filters") or target_data.get("filters"):
-                from ai.Text_Extraction import compare_filters
-                comparison_filters = compare_filters(source_data, target_data)
+                # from ai.Text_Extraction import compare_filters
+                # comparison_filters = compare_filters(source_data, target_data)
+                from services.comparison_service import compare_filters
+                comparison_filters = compare_filters(
+                source_data.get("filters", []),
+                target_data.get("filters", []),
+            )
         return build_filters_api_payload(
             executions,
             run_id=None,
