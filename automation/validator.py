@@ -38,8 +38,26 @@ class DashboardValidator:
         with open(DASHBOARD_CONFIG, "r", encoding="utf-8") as file:
             return json.load(file)["dashboards"]
 
-    async def run_dashboard(self, dashboard, *, playwright=None, context=None, page=None):
-        """Run one dashboard in a supplied authenticated Edge tab when available."""
+    async def run_dashboard(
+        self,
+        dashboard,
+        *,
+        playwright=None,
+        context=None,
+        page=None,
+        filter_selections=None,
+    ):
+        """Run one dashboard in a supplied authenticated Edge tab when available.
+
+        `filter_selections`, if provided, is a {page_name: {filter_name: value}}
+        map captured from an earlier (source) dashboard run. When present,
+        each report page replays exactly those filter/value pairs instead of
+        picking new random ones, so the two dashboards end up compared in the
+        same filtered state. Returns a 4th value: a {page_name: {filter_name:
+        value}} map of whatever this dashboard actually applied, so a later
+        (target) dashboard can replay it. This is empty for the single-page
+        path, since no page-level filter randomization happens there.
+        """
         extraction = {"status": "not_used", "data": None, "error": None}
         visual_data = {"status": "failed", "filters": [], "visuals": [], "errors": []}
         response = None
@@ -79,6 +97,7 @@ class DashboardValidator:
             # actually contains more than one report page.
             if len(pages) > 1:
                 executions = []
+                page_filter_selections = {}
 
                 for page_info in pages:
                     page_name = page_info["name"]
@@ -95,21 +114,25 @@ class DashboardValidator:
                             page_name,
                         )
 
-                    execution = await self.process_dashboard_page(
+                    predetermined = (filter_selections or {}).get(page_name)
+
+                    execution, applied = await self.process_dashboard_page(
                         dashboard=dashboard,
                         page=page,
                         response=response,
                         page_name=page_name,
+                        predetermined_filters=predetermined,
                     )
 
                     executions.extend(execution)
+                    page_filter_selections[page_name] = applied
 
                 try:
                     self.timer.stop("total_execution")
                 except Exception:
                     pass
 
-                return playwright, context, executions
+                return playwright, context, executions, page_filter_selections
 
             # ============================================================
             # Existing single-page processing
@@ -182,7 +205,7 @@ class DashboardValidator:
                 "extraction": extraction,
                 "visual_data": visual_data,
                 "_page": page,
-            }
+            }, {}
 
         except Exception:
             logger.exception(
@@ -222,6 +245,14 @@ class DashboardValidator:
         executions_by_dashboard = []
         multi_page_mode = False
 
+        # ============================================================
+        # Filter replay: the first dashboard picks filters randomly per
+        # page; every dashboard after it replays those exact selections
+        # instead of randomizing its own, so source and target are always
+        # compared in the same filtered state.
+        # ============================================================
+        source_filter_selections = None
+
         if not links:
             return {
                 "run_id": uuid.uuid4().hex,
@@ -248,12 +279,18 @@ class DashboardValidator:
                 )
 
                 try:
-                    _, _, execution = await self.run_dashboard(
+                    _, _, execution, page_filters = await self.run_dashboard(
                         dashboard,
                         playwright=playwright,
                         context=context,
                         page=page,
+                        filter_selections=source_filter_selections,
                     )
+
+                    if index == 0:
+                        # Whatever the first (source) dashboard actually
+                        # applied is what every later dashboard will replay.
+                        source_filter_selections = page_filters
 
                     # ========================================================
                     # Arun - Accept Single or Multiple Page Executions
@@ -374,6 +411,29 @@ class DashboardValidator:
 
             run_id = uuid.uuid4().hex
 
+            # Persist exactly what filter values were applied on the source
+            # dashboard (and therefore replayed on every dashboard after it),
+            # so the run's filtered state is auditable independent of the
+            # comparison/mismatch report.
+            if multi_page_mode and source_filter_selections:
+                try:
+                    applied_filters_path = (
+                        OUTPUT_DIR / "reports" / f"{run_id}_applied_filters.json"
+                    )
+                    applied_filters_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(applied_filters_path, "w", encoding="utf-8") as f:
+                        json.dump(
+                            source_filter_selections,
+                            f,
+                            indent=2,
+                            ensure_ascii=False,
+                        )
+                except Exception:
+                    logger.exception(
+                        "Failed to save applied filter selections | run_id=%s",
+                        run_id,
+                    )
+
             report_paths = self._export_reports(
                 run_id,
                 report_executions,
@@ -427,6 +487,16 @@ class DashboardValidator:
                         "dashboard": item["dashboard"].get("name"),
                         "page_name": item["dashboard"].get("page_name"),
                         "extraction": item["visual_data"].get("data"),
+                    }
+                    for item in executions
+                ]
+
+                visual_results = [
+                    {
+                        "dashboard": item["dashboard"].get("name"),
+                        "page_name": item["dashboard"].get("page_name"),
+                        "kpi_cards": item["visual_data"].get("kpi_cards", []),
+                        "visuals": item["visual_data"].get("visuals", []),
                     }
                     for item in executions
                 ]
@@ -494,6 +564,7 @@ class DashboardValidator:
                 "mismatches": report_paths.get("mismatches_data"),
                 "visual_results": visual_results,
                 "filter_state": filter_state,
+                "applied_filter_selections": source_filter_selections,
             }
 
         finally:
@@ -616,9 +687,6 @@ class DashboardValidator:
                 value,
             )
 
-            applied_source = True
-            applied_target = True
-
             scenario = {
                 "slicer": slicer_name,
                 "value": value,
@@ -676,7 +744,7 @@ class DashboardValidator:
                     "source": str(source_image),
                     "target": str(target_image),
                 }
-                
+
                 # try:
                 #     from ai.Text_Extraction import (
                 #         extract_dashboard_json,
@@ -739,6 +807,7 @@ class DashboardValidator:
             source_data,
             target_data,
         )
+
     def _export_reports(
         self,
         run_id,
@@ -791,8 +860,6 @@ class DashboardValidator:
             paths["document_error"] = "Word report generation failed. See server logs."
 
         try:
-            
-
             comparison_payload = comparison if comparison.get("status") == "success" else {
                 "filters": comparison.get("filters", []),
                 "kpis": comparison.get("kpis", []),
@@ -861,7 +928,7 @@ class DashboardValidator:
                     "Source": executions[0]["visual_data"],
                     "Target": executions[1]["visual_data"],
                 },
-                metrics=[item["metrics"] for item in executions],
+                metrics=[item.get("metrics", {}) for item in executions],
                 run_id=run_id,
             )
             save_mismatch_snapshot(run_id, mismatch_payload, OUTPUT_DIR / "reports")
@@ -877,117 +944,185 @@ class DashboardValidator:
     # ============================================================
 
     async def process_dashboard_page(
-            self,
-            dashboard,
+        self,
+        dashboard,
+        page,
+        response,
+        page_name,
+        predetermined_filters=None,
+    ):
+        """Process one currently selected dashboard page.
+
+        If `predetermined_filters` is None, this dashboard's filters are
+        chosen randomly for this page (this is the "source" role); the
+        filter/value pairs actually applied are returned so a later
+        dashboard can replay them.
+
+        If `predetermined_filters` is a {filter_name: value} dict, this
+        dashboard replays exactly those values instead of randomizing (this
+        is the "target" role), so it ends up compared against the source in
+        the same filtered state. If a value can't be reproduced on this
+        dashboard, that's recorded as an explicit failed execution rather
+        than silently skipped, so the mismatch report can show *why* a
+        filter state is missing here instead of it just looking like an
+        unrelated data mismatch.
+
+        Returns (executions, applied_selection) where applied_selection is
+        the {filter_name: value} map of whatever was actually applied on
+        this page.
+        """
+
+        executions = []
+        engine = SlicerEngine(page)
+        applied_selection = {}
+
+        # ---------------------------------------------------------
+        # STEP 1: Process the default (unfiltered) page state
+        # ---------------------------------------------------------
+
+        # Extract visual data from DOM (if available)
+        default_visual_data = await extract_visual_data(page, attempt_export=False)
+        # default_ai_data = await asyncio.to_thread(extract_dashboard_json, default_screenshot)
+
+        # default_ai_data = await asyncio.to_thread(
+        #     extract_dashboard_json,
+        #     default_screenshot,
+        # )
+
+        # Export Table/Matrix visuals from the current dashboard state
+        default_tables = await export_table_visuals(
             page,
-            response,
-            page_name,
-        ):
-            """Process one currently selected dashboard page and run AI on random filter selections."""
-            
-            executions = []
-            engine = SlicerEngine(page)
+            default_visual_data.get("table_visuals", []),
+            dashboard["name"],
+        )
 
-            # ---------------------------------------------------------
-            # STEP 1: Process the default (unfiltered) page state
-            # ---------------------------------------------------------
-            logger.info(f"Processing default state for page: {page_name}")
-            default_screenshot = SCREENSHOT_DIR / f"{dashboard['name']}_{page_name}_default_{uuid.uuid4().hex[:8]}.png"
-            await page.screenshot(path=str(default_screenshot), full_page=True)
-            
-            # Extract visual data from DOM (if available)
-            default_visual_data = await extract_visual_data(page, attempt_export=False)
-            # default_ai_data = await asyncio.to_thread(extract_dashboard_json, default_screenshot)
-
-            # default_ai_data = await asyncio.to_thread(
-            #     extract_dashboard_json,
-            #     default_screenshot,
-            # )
-
-            # Export Table/Matrix visuals from the current dashboard state
-            default_tables = await export_table_visuals(
-                page,
-                default_visual_data.get("table_visuals", []),
-                dashboard["name"],
-            )
-            
-            # Structure as standard execution payload
-            executions.append({
+        # Structure as standard execution payload
+        executions.append({
             "dashboard": {
-                **dashboard, 
+                **dashboard,
                 "page_name": page_name,
                 "filter_applied": "Default View"
             },
             "page_name": page_name,
             "filter_applied": "Default View",
             "extraction": {
-                "status": "not_used", 
+                "status": "not_used",
                 "data": None,
-                  "error": None},
+                "error": None},
             "visual_data": default_visual_data,
-            # "metrics": metrics,  # <--- MAKE SURE THIS KEY IS INCLUDED
-            # "screenshot": str(default_screenshot),
+
             "tables": default_tables,
             "_page": page,
         })
 
-            # ---------------------------------------------------------
-            # STEP 2: Find filters and apply random options
-            # ---------------------------------------------------------
+        # ---------------------------------------------------------
+        # STEP 2: Apply filters — random for source, replayed for target
+        # ---------------------------------------------------------
+        if predetermined_filters:
+            filters_to_apply = list(predetermined_filters.items())
+            logger.info(
+                "Replaying source's filter selections on target | page=%s | filters=%s",
+                page_name,
+                filters_to_apply,
+            )
+        else:
             detected_filters = await engine.extract_filters_from_dom()
-            
             if detected_filters:
                 logger.info(f"Detected filters on page '{page_name}': {detected_filters}")
-                target_filters = detected_filters[:2]
-                
-                for f_name in target_filters:
-                    logger.info(f"Applying random option to filter: {f_name}")
-                    applied_option = await engine.apply_random_valid_option(f_name)
-                    
-                    if applied_option:
-                        filter_label = f"{f_name} = '{applied_option}'"
-                        logger.info(
-                            "Filter applied | filter=%s | value=%s",
-                            f_name,
-                            applied_option,
-                        )
-                        self.timer.start("filter_dashboard_render")
-                        logger.info("Waiting 4.5s for Power BI visuals to recalculate...")
-                        await wait_for_dashboard(page)
-                        self.timer.stop("filter_dashboard_render")
+            filters_to_apply = [(f_name, None) for f_name in detected_filters[:2]]
 
-                        filtered_screenshot = (
-                            SCREENSHOT_DIR
-                            / f"{dashboard['name']}_{page_name}_{f_name}_{uuid.uuid4().hex[:8]}.png"
-                        )
-                        await page.screenshot(path=str(filtered_screenshot), full_page=True)
-                        
-                        filtered_visual_data = await extract_visual_data(page, attempt_export=False)
-                        #as we decided not to go furthur with ai commenting the below line
-                        # filtered_ai_data = await asyncio.to_thread(extract_dashboard_json, filtered_screenshot)
-                        filtered_tables = await export_table_visuals(
-                            page,
-                            filtered_visual_data.get("table_visuals", []),
-                            dashboard["name"],
-                        )
-                        
-                        executions.append({
-                            "dashboard": {
-                                **dashboard, 
-                                "page_name": page_name,
-                                "filter_applied": filter_label
-                            },
+        for f_name, predetermined_value in filters_to_apply:
+            if predetermined_value is not None:
+                logger.info(f"Reproducing filter on target: {f_name} = '{predetermined_value}'")
+                success = await engine.apply_filter(f_name, predetermined_value)
+
+                if not success:
+                    logger.warning(
+                        "Target could not reproduce source filter | page=%s filter=%s value=%s",
+                        page_name,
+                        f_name,
+                        predetermined_value,
+                    )
+                    executions.append({
+                        "dashboard": {
+                            **dashboard,
                             "page_name": page_name,
-                            "filter_applied": filter_label,
-                            "extraction": {"status": "not_used", "data": None, "error": None},
-                            "visual_data": filtered_visual_data,
-                            "screenshot": str(filtered_screenshot),
-                            "tables": filtered_tables, 
-                            "_page": page,
-                        })
+                            "filter_applied": (
+                                f"{f_name} = '{predetermined_value}' "
+                                "(FAILED TO APPLY)"
+                            ),
+                        },
+                        "page_name": page_name,
+                        "filter_applied": f"{f_name} = '{predetermined_value}'",
+                        "extraction": {"status": "not_used", "data": None, "error": None},
+                        "visual_data": {
+                            "status": "failed",
+                            "kpi_cards": [],
+                            "visuals": [],
+                            "filters": [],
+                            "errors": [
+                                f"Could not reproduce source's filter selection "
+                                f"'{predetermined_value}' for '{f_name}' on target dashboard."
+                            ],
+                        },
+                        "_page": page,
+                    })
+                    continue
 
-            # Return the list of executions directly for run_dashboard to collect
-            return executions
+                applied_option = predetermined_value
+            else:
+                logger.info(f"Applying random option to filter: {f_name}")
+                applied_option = await engine.apply_random_valid_option(f_name)
+
+                if not applied_option:
+                    continue
+
+            applied_selection[f_name] = applied_option
+            filter_label = f"{f_name} = '{applied_option}'"
+            logger.info(
+                "Filter applied | filter=%s | value=%s",
+                f_name,
+                applied_option,
+            )
+            self.timer.start("filter_dashboard_render")
+            logger.info("Waiting for Power BI visuals to recalculate...")
+            await wait_for_dashboard(page)
+            self.timer.stop("filter_dashboard_render")
+
+            filtered_screenshot = (
+                SCREENSHOT_DIR
+                / f"{dashboard['name']}_{page_name}_{f_name}_{uuid.uuid4().hex[:8]}.png"
+            )
+            await page.screenshot(path=str(filtered_screenshot), full_page=True)
+
+            filtered_visual_data = await extract_visual_data(page, attempt_export=False)
+            # as we decided not to go furthur with ai commenting the below line
+            # filtered_ai_data = await asyncio.to_thread(extract_dashboard_json, filtered_screenshot)
+            filtered_tables = await export_table_visuals(
+                page,
+                filtered_visual_data.get("table_visuals", []),
+                dashboard["name"],
+            )
+
+            executions.append({
+                "dashboard": {
+                    **dashboard,
+                    "page_name": page_name,
+                    "filter_applied": filter_label
+                },
+                "page_name": page_name,
+                "filter_applied": filter_label,
+                "extraction": {"status": "not_used", "data": None, "error": None},
+                "visual_data": filtered_visual_data,
+                "screenshot": str(filtered_screenshot),
+                "tables": filtered_tables,
+                "_page": page,
+            })
+
+        # Return the list of executions plus what was actually applied, so
+        # run_dashboard can hand it off as the next dashboard's replay set.
+        return executions, applied_selection
+
     # ============================================================
     # Arun - Multi Page Dashboard Navigation
     # ============================================================
@@ -1252,9 +1387,9 @@ class DashboardValidator:
                 # comparison_filters = compare_filters(source_data, target_data)
                 from services.comparison_service import compare_filters
                 comparison_filters = compare_filters(
-                source_data.get("filters", []),
-                target_data.get("filters", []),
-            )
+                    source_data.get("filters", []),
+                    target_data.get("filters", []),
+                )
         return build_filters_api_payload(
             executions,
             run_id=None,
