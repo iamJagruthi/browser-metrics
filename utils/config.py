@@ -4,21 +4,25 @@ config.py
 Loads all project configuration from the .env file.
 """
 
+import logging
 import os
 from pathlib import Path
+
 from dotenv import load_dotenv
 
-# --------------------------------------------------
-# Load .env
-# --------------------------------------------------
 
-load_dotenv()
-
-# --------------------------------------------------
-# Project Paths
-# --------------------------------------------------
+logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# --------------------------------------------------
+# Load .env (project root only)
+# --------------------------------------------------
+
+try:
+    load_dotenv(PROJECT_ROOT / ".env")
+except Exception:
+    logger.exception("Failed to load .env from project root")
 
 OUTPUT_DIR = PROJECT_ROOT / os.getenv(
     "OUTPUT_DIR",
@@ -36,8 +40,15 @@ DASHBOARD_CONFIG = PROJECT_ROOT / os.getenv(
 )
 
 PAGE_TIMEOUT = int(os.getenv("PAGE_TIMEOUT", 120000))
-PAGE_TIMEOUT
-# -----------------------------------
+
+# --------------------------------------------------
+# Matrix / table scroll (Jagruthi: wider matrices need more horizontal steps)
+# --------------------------------------------------
+
+MATRIX_MAX_SCROLL_STEPS = int(os.getenv("MATRIX_MAX_SCROLL_STEPS", "60"))
+SCROLL_STEP_WAIT_MS = int(os.getenv("SCROLL_STEP_WAIT_MS", "350"))
+
+# --------------------------------------------------
 # Browser
 # --------------------------------------------------
 PROFILE_DIR = os.getenv("PROFILE_DIR") or "Profile 7"
@@ -71,44 +82,32 @@ RENDER_WAIT = int(
 )
 
 # --------------------------------------------------
-# Storage
+# Table comparison config (Jagruthi: pandas table diff key strategy)
 # --------------------------------------------------
 
-STORAGE_TYPE = os.getenv(
-    "STORAGE_TYPE",
-    "both"
-)
-
-CSV_FILE = OUTPUT_DIR / os.getenv(
-    "CSV_FILE",
-    "DashboardMetrics.csv"
-)
-
-EXCEL_FILE = OUTPUT_DIR / os.getenv(
-    "EXCEL_FILE",
-    "DashboardMetrics.xlsx"
-)
+TABLE_COMPARE_KEY_STRATEGY = os.getenv("TABLE_COMPARE_KEY_STRATEGY", "auto")
+TABLE_COMPARE_KEY_COLUMNS = [
+    column.strip()
+    for column in os.getenv("TABLE_COMPARE_KEY_COLUMNS", "").split(",")
+    if column.strip()
+]
 
 # --------------------------------------------------
 # Create Required Directories
 # --------------------------------------------------
 
-OUTPUT_DIR.mkdir(
-    parents=True,
-    exist_ok=True
-)
-
-SCREENSHOT_DIR.mkdir(
-    parents=True,
-    exist_ok=True
-)
+try:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    logger.exception("Failed to create output directories")
 
 REPORT_DIR = PROJECT_ROOT / os.getenv(
     "REPORT_DIR",
     "output/reports"
 )
 
-REPORT_DIR.mkdir(
-    parents=True,
-    exist_ok=True
-)
+try:
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    logger.exception("Failed to create report directory | path=%s", REPORT_DIR)

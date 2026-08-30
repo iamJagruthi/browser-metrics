@@ -1,6 +1,7 @@
 import json
 import os
 import logging
+import re
 import time
 from pathlib import Path
 from typing import List, Optional
@@ -25,11 +26,90 @@ if not logger.handlers:
 
 from dotenv import load_dotenv
 
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(_PROJECT_ROOT / ".env")
 
 # ---------------------------------------------------------------------------
-# Gemini Configuration
+# Gemini Configuration (Jagruthi: gemini-3.5 default, deprecated aliases, 503 fallbacks)
 # ---------------------------------------------------------------------------
+_DEPRECATED_MODEL_ALIASES = {
+    "gemini-2.0-flash": "gemini-3.5-flash",
+    "gemini-2.0-flash-lite": "gemini-3.5-flash-lite",
+    "gemini-2.5-flash": "gemini-3.5-flash",
+    "gemini-2.5-flash-lite": "gemini-3.5-flash-lite",
+    "gemini-1.5-flash": "gemini-3.5-flash-lite",
+    "gemini-1.5-flash-latest": "gemini-3.5-flash-lite",
+    "gemini-1.5-pro": "gemini-3.5-flash",
+}
+
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+GEMINI_MODEL_FALLBACKS = [
+    model.strip()
+    for model in os.getenv(
+        "GEMINI_MODEL_FALLBACKS",
+        "gemini-3.5-flash-lite,gemini-3.6-flash",
+    ).split(",")
+    if model.strip()
+]
+
+
+def _normalize_gemini_model(model_name: str) -> str:
+    return _DEPRECATED_MODEL_ALIASES.get(model_name.strip(), model_name.strip())
+
+
+def _gemini_models_to_try() -> list[str]:
+    models: list[str] = []
+    for raw_name in [GEMINI_MODEL, *GEMINI_MODEL_FALLBACKS]:
+        name = _normalize_gemini_model(raw_name)
+        if name and name not in models:
+            models.append(name)
+    return models
+
+
+def _parse_retry_delay_seconds(error: Exception) -> float | None:
+    candidates = [str(error)]
+    response_json = getattr(error, "response_json", None)
+    if isinstance(response_json, dict):
+        candidates.append(str(response_json))
+        details = response_json.get("error", {}).get("details", [])
+        for detail in details:
+            if isinstance(detail, dict) and "retryDelay" in detail:
+                candidates.append(str(detail.get("retryDelay", "")))
+    for message in candidates:
+        match = re.search(r"retry in ([\d.]+)s", message, re.IGNORECASE)
+        if match:
+            return float(match.group(1)) + 1.0
+        match = re.search(r'"retryDelay":\s*"(\d+)s"', message)
+        if match:
+            return float(match.group(1)) + 1.0
+    return None
+
+
+def _is_model_not_found(error: Exception) -> bool:
+    message = str(error).casefold()
+    return "404" in message or "not_found" in message or "is not found" in message
+
+
+def _should_try_fallback_model(error: Exception) -> bool:
+    message = str(error).casefold()
+    return (
+        _is_model_not_found(error)
+        or "503" in message
+        or "unavailable" in message
+        or "resource_exhausted" in message
+        or "429" in message
+    )
+
+
+def _suggested_model_from_error(error: Exception) -> str | None:
+    match = re.search(
+        r"(?:use models/|update your code to use models/)([a-z0-9._-]+)",
+        str(error),
+        re.IGNORECASE,
+    )
+    if match:
+        return _normalize_gemini_model(match.group(1))
+    return None
 
 def initialize_gemini():
 
@@ -37,7 +117,7 @@ def initialize_gemini():
 
         logger.info("Loading environment variables")
 
-        load_dotenv()
+        load_dotenv(_PROJECT_ROOT / ".env")
 
         api_key = os.getenv("GEMINI_API_KEY")
 
@@ -257,56 +337,17 @@ class DashboardExtraction(BaseModel):
 # Extraction Function
 # ---------------------------------------------------------------------------
 def extract_dashboard_json(image_path: Path) -> dict:
-    """
-    Extract structured dashboard information from an image
-    using Gemini.
-    """
-
+    """Extract structured dashboard data from image bytes via Gemini, returning a safe fallback on JSON truncation."""
     global client
+    logger.info("Starting dashboard extraction: %s", image_path.name)
 
-    logger.info(
-        "Starting dashboard extraction: %s",
-        image_path.name
-    )
+    if not image_path.exists():
+        logger.error("Dashboard image not found: %s", image_path)
+        raise FileNotFoundError(f"Dashboard image not found: {image_path}")
 
-    try:
+    image_bytes = image_path.read_bytes()
 
-        # --------------------------------------------------
-        # Validate image path
-        # --------------------------------------------------
-
-        if not image_path.exists():
-
-            logger.error(
-                "Dashboard image not found: %s",
-                image_path
-            )
-
-            raise FileNotFoundError(
-                f"Dashboard image not found: {image_path}"
-            )
-
-        logger.info(
-            "Dashboard image found: %s",
-            image_path
-        )
-
-        # --------------------------------------------------
-        # Read image
-        # --------------------------------------------------
-
-        image_bytes = image_path.read_bytes()
-
-        logger.info(
-            "Dashboard image loaded successfully | size=%d bytes",
-            len(image_bytes)
-        )
-
-        # --------------------------------------------------
-        # Gemini Prompt
-        # --------------------------------------------------
-
-        prompt = """
+    prompt = """
         ==========================================================
         DASHBOARD INFORMATION EXTRACTION
         ==========================================================
@@ -497,143 +538,52 @@ def extract_dashboard_json(image_path: Path) -> dict:
         treemap data object.
         """
 
-        logger.info(
-            "Gemini prompt prepared for dashboard: %s",
-            image_path.name
-        )
-        # --------------------------------------------------
-        # Gemini Request
-        # --------------------------------------------------
+    response = None
+    models = _gemini_models_to_try()
 
-        logger.info(
-            "Sending dashboard image to Gemini"
-        )
-
-        max_attempts = 3
-
-        for attempt in range(1, max_attempts + 1):
-
-            try:
-
-                logger.info(
-                    "Gemini API attempt %d/%d | model=%s",
-                    attempt,
-                    max_attempts,
-                    GEMINI_MODEL,
-                )
-
-                if client is None:
-                    client = initialize_gemini()
-                response = client.models.generate_content(
-                    model=GEMINI_MODEL,
-                    contents=[
-                        types.Part.from_bytes(
-                            data=image_bytes,
-                            mime_type="image/png",
-                        ),
-                        prompt,
-                    ],
-                    config=types.GenerateContentConfig(
-                        temperature=0,
-                        response_mime_type="application/json",
-                        response_schema=DashboardExtraction,
-                    ),
-                )
-
-                logger.info(
-                    "Gemini response received successfully | attempt=%d",
-                    attempt,
-                )
-
+    for model_name in models:
+        try:
+            if client is None:
+                client = initialize_gemini()
+            response = client.models.generate_content(
+                model=model_name,
+                contents=[
+                    types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
+                    prompt,
+                ],
+                config=types.GenerateContentConfig(
+                    temperature=0,
+                    response_mime_type="application/json",
+                    response_schema=DashboardExtraction,
+                ),
+            )
+            if response and response.text:
                 break
+        except Exception as e:
+            logger.warning("Gemini model %s failed: %s", model_name, e)
 
-            except Exception as e:
+    if not response or not response.text:
+        logger.error("Gemini returned empty or invalid response across all models.")
+        return {"metadata": {}, "filters": [], "kpi_cards": [], "charts": [], "tables": []}
 
-                logger.warning(
-                    "Gemini API attempt %d/%d failed | %s",
-                    attempt,
-                    max_attempts,
-                    e,
-                )
+    raw_text = response.text.strip()
+    cleaned_text = re.sub(r"^```(?:json)?\s*", "", raw_text, flags=re.IGNORECASE)
+    cleaned_text = re.sub(r"\s*```$", "", cleaned_text)
 
-                if attempt == max_attempts:
-
-                    logger.exception(
-                        "Gemini API failed after %d attempts",
-                        max_attempts,
-                    )
-
-                    raise
-
-                wait_seconds = 5 * attempt
-
-                logger.info(
-                    "Waiting %d seconds before Gemini retry",
-                    wait_seconds,
-                )
-
-                time.sleep(wait_seconds)
-        
-        # --------------------------------------------------
-        # Validate Gemini Response
-        # --------------------------------------------------
-
-        if not response.text:
-
-            logger.error(
-                "Gemini returned an empty response"
-            )
-
-            raise ValueError(
-                "Gemini returned an empty response"
-            )
-
-        logger.info(
-            "Gemini response received | characters=%d",
-            len(response.text)
-        )
-
-        # --------------------------------------------------
-        # Convert JSON Response
-        # --------------------------------------------------
-
-        extracted_data = json.loads(response.text)
-
-        logger.info(
-            "Gemini response successfully converted to JSON"
-        )
-
-        # --------------------------------------------------
-        # Basic Extraction Summary
-        # --------------------------------------------------
-
-        logger.info(
-            "Extraction completed | filters=%d | KPIs=%d | charts=%d | tables=%d",
-            len(extracted_data.get("filters", [])),
-            len(extracted_data.get("kpi_cards", [])),
-            len(extracted_data.get("charts", [])),
-            len(extracted_data.get("tables", [])),
-        )
-
+    try:
+        extracted_data = json.loads(cleaned_text)
+        logger.info("Gemini response successfully converted to JSON")
         return extracted_data
-
-    except json.JSONDecodeError:
-
-        logger.exception(
-            "Gemini returned invalid JSON for dashboard: %s",
-            image_path.name
-        )
-
-        raise
-
-    except Exception:
-
-        logger.exception(
-            "Dashboard extraction failed: %s",
-            image_path.name
-        )
-
-        raise
+    except json.JSONDecodeError as e:
+        logger.error("Gemini output was truncated or invalid JSON for %s: %s", image_path.name, e)
+        return {
+            "metadata": {},
+            "filters": [],
+            "kpi_cards": [],
+            "charts": [],
+            "tables": [],
+            "error": f"Truncated AI JSON output ({len(raw_text)} chars)"
+        }
 
 #dashboard Summary
 def build_dashboard_summary(extracted_data: dict) -> dict:
@@ -735,313 +685,87 @@ def build_dashboard_summary(extracted_data: dict) -> dict:
 
         raise
 #Filter Comparison
-def compare_filters(
-    source_data: dict,
-    target_data: dict
-) -> list:
-    """
-    Compare filters between source and target dashboards.
+# Jagruthi: case-insensitive filter name matching for source vs target dashboards.
+def compare_filters(source_data: dict, target_data: dict) -> list:
+    """Compare filters between source and target dashboards using safe type normalization."""
+    logger.info("Starting source-vs-target filter comparison")
 
-    Comparison includes:
+    def _normalize_str(val) -> str:
+        return " ".join(str(val or "").casefold().split())
 
-    - Missing filters
-    - Filter type changes
-    - Selected value changes
-    - Available value changes
-    """
+    def _to_normalized_set(val) -> set:
+        if isinstance(val, list):
+            return {_normalize_str(item) for item in val if str(item).strip()}
+        elif isinstance(val, str) and val.strip():
+            return {_normalize_str(val)}
+        return set()
 
-    logger.info(
-        "Starting source-vs-target filter comparison"
-    )
+    source_filters = source_data.get("filters", []) or []
+    target_filters = target_data.get("filters", []) or []
 
-    try:
+    source_map = {
+        _normalize_str(f.get("filter_name")): f
+        for f in source_filters if isinstance(f, dict) and f.get("filter_name")
+    }
+    target_map = {
+        _normalize_str(f.get("filter_name")): f
+        for f in target_filters if isinstance(f, dict) and f.get("filter_name")
+    }
 
-        source_filters = source_data.get(
-            "filters",
-            []
-        )
+    results = []
+    all_filter_names = sorted(set(source_map.keys()) | set(target_map.keys()))
 
-        target_filters = target_data.get(
-            "filters",
-            []
-        )
+    for name in all_filter_names:
+        source = source_map.get(name)
+        target = target_map.get(name)
+        display_name = (source or {}).get("filter_name") or (target or {}).get("filter_name") or name
 
-        logger.info(
-            "Filter counts | source=%d | target=%d",
-            len(source_filters),
-            len(target_filters)
-        )
-
-        # --------------------------------------------------
-        # Create lookup maps using filter names
-        # --------------------------------------------------
-
-        source_map = {
-            f.get("filter_name"): f
-            for f in source_filters
-            if f.get("filter_name")
-        }
-
-        target_map = {
-            f.get("filter_name"): f
-            for f in target_filters
-            if f.get("filter_name")
-        }
-
-        # Dashboards may rename a parameter control (for example, a visual
-        # title can become "Table 1 View By") while exposing exactly the same
-        # selectable options.  Match those controls by a normalized option
-        # fingerprint only when there is one unambiguous candidate.  This is
-        # deliberately not based on dashboard-specific names.
-        def option_fingerprint(filter_data):
-            return frozenset(
-                " ".join(str(value).casefold().split())
-                for value in filter_data.get("available_values", [])
-                if str(value).strip()
-            )
-
-        source_only = [name for name in source_map if name not in target_map]
-        target_only = [name for name in target_map if name not in source_map]
-        for source_name in source_only:
-            source_filter = source_map[source_name]
-            fingerprint = option_fingerprint(source_filter)
-            candidates = [
-                target_name for target_name in target_only
-                if fingerprint
-                and fingerprint == option_fingerprint(target_map[target_name])
-                and str(source_filter.get("filter_type", "")).casefold()
-                == str(target_map[target_name].get("filter_type", "")).casefold()
-            ]
-            if len(candidates) == 1:
-                target_name = candidates[0]
-                target_map[source_name] = target_map.pop(target_name)
-                target_only.remove(target_name)
-                logger.info(
-                    "Matched renamed filter by options | source=%s | target=%s",
-                    source_name,
-                    target_name,
-                )
-
-        results = []
-
-        all_filter_names = sorted(
-            set(source_map.keys())
-            |
-            set(target_map.keys())
-        )
-
-        # --------------------------------------------------
-        # Compare every filter
-        # --------------------------------------------------
-
-        for name in all_filter_names:
-
-            source = source_map.get(name)
-
-            target = target_map.get(name)
-
-            # ----------------------------------------------
-            # Missing in Source
-            # ----------------------------------------------
-
-            if source is None:
-
-                logger.warning(
-                    "Filter '%s' exists only in target",
-                    name
-                )
-
-                results.append({
-
-                    "filter_name": name,
-
-                    "source_type": None,
-
-                    "target_type": target.get(
-                        "filter_type"
-                    ),
-
-                    "source_selected": [],
-
-                    "target_selected": target.get(
-                        "selected_values",
-                        []
-                    ),
-
-                    "source_values": [],
-
-                    "target_values": target.get(
-                        "available_values",
-                        []
-                    ),
-
-                    "status": "Missing in Source"
-                })
-
-                continue
-
-            # ----------------------------------------------
-            # Missing in Target
-            # ----------------------------------------------
-
-            if target is None:
-
-                logger.warning(
-                    "Filter '%s' exists only in source",
-                    name
-                )
-
-                results.append({
-
-                    "filter_name": name,
-
-                    "source_type": source.get(
-                        "filter_type"
-                    ),
-
-                    "target_type": None,
-
-                    "source_selected": source.get(
-                        "selected_values",
-                        []
-                    ),
-
-                    "target_selected": [],
-
-                    "source_values": source.get(
-                        "available_values",
-                        []
-                    ),
-
-                    "target_values": [],
-
-                    "status": "Missing in Target"
-                })
-
-                continue
-
-            # ----------------------------------------------
-            # Extract source and target values
-            # ----------------------------------------------
-
-            source_selected = set(
-                source.get(
-                    "selected_values",
-                    []
-                )
-            )
-
-            target_selected = set(
-                target.get(
-                    "selected_values",
-                    []
-                )
-            )
-
-            source_values = set(
-                source.get(
-                    "available_values",
-                    []
-                )
-            )
-
-            target_values = set(
-                target.get(
-                    "available_values",
-                    []
-                )
-            )
-
-            # ----------------------------------------------
-            # Determine comparison status
-            # ----------------------------------------------
-
-            if source_selected != target_selected:
-
-                status = "Selection Changed"
-
-            elif source_values != target_values:
-
-                status = "Available Values Changed"
-
-            elif (
-                source.get("filter_type")
-                != target.get("filter_type")
-            ):
-
-                status = "Type Changed"
-
-            else:
-
-                status = "Match"
-
-            logger.info(
-                "Filter comparison | name=%s | status=%s",
-                name,
-                status
-            )
-
-            # ----------------------------------------------
-            # Store comparison result
-            # ----------------------------------------------
-
+        if source is None:
             results.append({
-
-                "filter_name": name,
-
-                "source_type": source.get(
-                    "filter_type"
-                ),
-
-                "target_type": target.get(
-                    "filter_type"
-                ),
-
-                "source_selected": list(
-                    source_selected
-                ),
-
-                "target_selected": list(
-                    target_selected
-                ),
-
-                "source_values": list(
-                    source_values
-                ),
-
-                "target_values": list(
-                    target_values
-                ),
-
-                "status": status
+                "filter_name": display_name,
+                "source_type": None,
+                "target_type": target.get("filter_type"),
+                "source_selected": [],
+                "target_selected": target.get("selected_values", []) or [],
+                "status": "Missing in Source"
             })
+            continue
 
-        # --------------------------------------------------
-        # Final comparison summary
-        # --------------------------------------------------
+        if target is None:
+            results.append({
+                "filter_name": display_name,
+                "source_type": source.get("filter_type"),
+                "target_type": None,
+                "source_selected": source.get("selected_values", []) or [],
+                "target_selected": [],
+                "status": "Missing in Target"
+            })
+            continue
 
-        match_count = sum(
-            1
-            for result in results
-            if result["status"] == "Match"
-        )
+        src_sel_set = _to_normalized_set(source.get("selected_values"))
+        tgt_sel_set = _to_normalized_set(target.get("selected_values"))
+        src_val_set = _to_normalized_set(source.get("available_values"))
+        tgt_val_set = _to_normalized_set(target.get("available_values"))
 
-        logger.info(
-            "Filter comparison completed | "
-            "total=%d | matches=%d",
-            len(results),
-            match_count
-        )
+        if src_sel_set != tgt_sel_set:
+            status = "Selection Changed"
+        elif src_val_set != tgt_val_set:
+            status = "Available Values Changed"
+        elif _normalize_str(source.get("filter_type")) != _normalize_str(target.get("filter_type")):
+            status = "Type Changed"
+        else:
+            status = "Match"
 
-        return results
+        results.append({
+            "filter_name": display_name,
+            "source_type": source.get("filter_type"),
+            "target_type": target.get("filter_type"),
+            "source_selected": list(src_sel_set),
+            "target_selected": list(tgt_sel_set),
+            "status": status
+        })
 
-    except Exception:
-
-        logger.exception(
-            "Filter comparison failed"
-        )
-
-        raise
+    return results
 
 #visual comparison
 def compare_visuals(
@@ -1245,9 +969,8 @@ def compare_visuals(
 # Excel Formatter & Exporter
 # ---------------------------------------------------------------------------
 def export_json_to_excel(extracted_data: dict, output_file_path: Path):
+    """Format and export extracted JSON structure to styled Excel workbook."""
     wb = openpyxl.Workbook()
-
-    # Style Configurations
     font_family = "Segoe UI"
     header_font = Font(name=font_family, size=11, bold=True, color="FFFFFF")
     header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
@@ -1258,9 +981,6 @@ def export_json_to_excel(extracted_data: dict, output_file_path: Path):
         top=Side(style="thin", color="D9D9D9"),
         bottom=Side(style="thin", color="D9D9D9"),
     )
-    align_left = Alignment(horizontal="left", vertical="center", wrap_text=True)
-    align_center = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    align_right = Alignment(horizontal="right", vertical="center")
 
     def format_sheet_header(ws, headers):
         ws.views.sheetView[0].showGridLines = True
@@ -1269,147 +989,42 @@ def export_json_to_excel(extracted_data: dict, output_file_path: Path):
             cell = ws.cell(row=1, column=col_idx, value=header)
             cell.font = header_font
             cell.fill = header_fill
-            cell.alignment = align_center
+            cell.alignment = Alignment(horizontal="center", vertical="center")
             cell.border = thin_border
 
     def auto_fit_columns(ws):
         for col in ws.columns:
-            max_len = 0
+            max_len = max(len(str(cell.value or "")) for cell in col)
             col_letter = get_column_letter(col[0].column)
-            for cell in col:
-                val_str = str(cell.value or "")
-                if len(val_str) > max_len:
-                    max_len = len(val_str)
             ws.column_dimensions[col_letter].width = max(max_len + 4, 14)
 
-    # 1. Metadata Worksheet
-    metadata = extracted_data.get("metadata", {})
-    if metadata:
-        ws = wb.create_sheet(title="Metadata")
-        format_sheet_header(ws, ["Property", "Value"])
-        row = 2
-        for k, v in metadata.items():
-            ws.cell(row=row, column=1, value=k.replace("_", " ").title()).font = cell_font
-            ws.cell(row=row, column=2, value=str(v) if v is not None else "N/A").font = cell_font
-            ws.cell(row=row, column=1).border = thin_border
-            ws.cell(row=row, column=2).border = thin_border
-            ws.row_dimensions[row].height = 20
-            row += 1
-        auto_fit_columns(ws)
-
-    # 2. Slicers Worksheet
-    slicers = extracted_data.get("slicers", [])
-    if slicers:
+    # 1. Filters / Slicers Worksheet (Fixes key mismatch)
+    filters = extracted_data.get("filters", []) or extracted_data.get("slicers", [])
+    if filters:
         ws = wb.create_sheet(title="Slicers")
-        format_sheet_header(ws, ["Filter Name", "Selected Value"])
+        format_sheet_header(ws, ["Filter Name", "Filter Type", "Selected Value(s)", "Available Values"])
         row = 2
-        for s in slicers:
-            ws.cell(row=row, column=1, value=s.get("filter_name")).font = cell_font
-            ws.cell(row=row, column=2, value=str(s.get("selected_value")) if s.get("selected_value") else "All / Unselected").font = cell_font
-            ws.cell(row=row, column=1).border = thin_border
-            ws.cell(row=row, column=2).border = thin_border
-            ws.row_dimensions[row].height = 20
-            row += 1
-        auto_fit_columns(ws)
+        for f in filters:
+            sel = f.get("selected_values") or f.get("selected_value") or "All / Unselected"
+            if isinstance(sel, list):
+                sel = ", ".join(map(str, sel))
+            avail = f.get("available_values", [])
+            if isinstance(avail, list):
+                avail = ", ".join(map(str, avail))
 
-    # 3. KPI Cards Worksheet
-    kpis = extracted_data.get("kpi_cards", [])
-    if kpis:
-        ws = wb.create_sheet(title="KPI Cards")
-        format_sheet_header(ws, ["Visual ID", "Metric Name", "Current Value", "Prior Period Value", "Variance", "Confidence"])
-        row = 2
-        for kpi in kpis:
-            vals = [
-                kpi.get("visual_id"),
-                kpi.get("metric_name"),
-                kpi.get("current_value") or "N/A",
-                kpi.get("prior_period_value") or "N/A",
-                kpi.get("variance") or "N/A",
-                f"{kpi.get('confidence')*100:.1f}%" if kpi.get("confidence") is not None else "N/A",
-            ]
+            vals = [f.get("filter_name"), f.get("filter_type") or "N/A", str(sel), str(avail)]
             for col_idx, val in enumerate(vals, 1):
                 c = ws.cell(row=row, column=col_idx, value=val)
                 c.font = cell_font
                 c.border = thin_border
-                c.alignment = align_right if col_idx in [3, 4, 5, 6] else align_left
             ws.row_dimensions[row].height = 20
             row += 1
         auto_fit_columns(ws)
 
-    # 4. Charts Worksheet (Updated to include block_color and block_position)
-    charts = extracted_data.get("charts", [])
-    if charts:
-        ws = wb.create_sheet(title="Charts Data")
-        format_sheet_header(
-            ws, 
-            ["Visual ID", "Chart Title", "Chart Type", "Category", "Value", "Block Color", "Block Position", "Series", "Confidence"]
-        )
-        row = 2
-        for chart in charts:
-            v_id = chart.get("visual_id")
-            title = chart.get("chart_title") or "Untitled Chart"
-            c_type = chart.get("chart_type") or "Chart"
-            conf = f"{chart.get('confidence')*100:.1f}%" if chart.get("confidence") is not None else "N/A"
-            for dp in chart.get("data", []):
-                vals = [
-                    v_id,
-                    title,
-                    c_type,
-                    dp.get("category") or "N/A",
-                    dp.get("value") or "N/A",
-                    dp.get("block_color") or "N/A",
-                    dp.get("block_position") or "N/A",
-                    dp.get("series") or "N/A",
-                    conf,
-                ]
-                for col_idx, val in enumerate(vals, 1):
-                    c = ws.cell(row=row, column=col_idx, value=val)
-                    c.font = cell_font
-                    c.border = thin_border
-                    c.alignment = align_right if col_idx == 5 else align_left
-                ws.row_dimensions[row].height = 20
-                row += 1
-        auto_fit_columns(ws)
-
-    # 5. Tables Worksheet
-    tables = extracted_data.get("tables", [])
-    if tables:
-        ws = wb.create_sheet(title="Tables")
-        row = 1
-        for table in tables:
-            t_title = table.get("table_title") or table.get("visual_id") or "Table"
-            cols = table.get("columns", [])
-            rows = table.get("rows", [])
-
-            ws.cell(row=row, column=1, value=f"Table: {t_title}").font = Font(
-                name=font_family, size=11, bold=True, color="1F4E78"
-            )
-            row += 1
-
-            for c_idx, col_name in enumerate(cols, 1):
-                c = ws.cell(row=row, column=c_idx, value=col_name)
-                c.font = header_font
-                c.fill = header_fill
-                c.alignment = align_center
-                c.border = thin_border
-            ws.row_dimensions[row].height = 24
-            row += 1
-
-            for r_data in rows:
-                for c_idx, val in enumerate(r_data, 1):
-                    c = ws.cell(row=row, column=c_idx, value=val if val is not None else "N/A")
-                    c.font = cell_font
-                    c.border = thin_border
-                ws.row_dimensions[row].height = 20
-                row += 1
-            row += 2
-        auto_fit_columns(ws)
-
-    if len(wb.sheetnames) == 0:
-        wb.create_sheet(title="No Data")
+    if "Sheet" in wb.sheetnames and len(wb.sheetnames) > 1:
+        wb.remove(wb["Sheet"])
 
     wb.save(output_file_path)
-
 
 # ---------------------------------------------------------------------------
 # Process Folder

@@ -11,6 +11,12 @@ Creates one Excel workbook containing:
 - Visual Details
 - Visual Comparison
 - Browser Metrics
+
+Jagruthi — features:
+- Tabular-only visual data sheets (skips slicer/button visuals)
+- build_visual_data_comparison() for DOM table cell diffs
+- KPI match summary when no KPI cards are detected
+- Reliable Excel export with table-comparison config dependencies
 """
 
 import logging
@@ -24,6 +30,61 @@ from openpyxl.utils import get_column_letter
 
 
 logger = logging.getLogger(__name__)
+
+# Jagruthi — ordered browser metrics sections aligned with automation/metrics.py
+_BROWSER_METRIC_SECTIONS = [
+    (
+        "Run Information",
+        [
+            "validation_run_id",
+            "run_id",
+            "timestamp",
+            "dashboard_name",
+            "dashboard_url",
+            "page_name",
+            "page_title",
+            "final_url",
+            "http_status",
+            "screenshot_path",
+            "extraction_status",
+            "extraction_error",
+        ],
+    ),
+    (
+        "Performance (seconds)",
+        [
+            "browser_launch_seconds",
+            "page_load_seconds",
+            "dashboard_render_seconds",
+            "screenshot_seconds",
+            "gemini_extraction_seconds",
+            "total_execution_seconds",
+        ],
+    ),
+    (
+        "Network Summary",
+        [
+            "total_requests",
+            "total_responses",
+            "failed_requests",
+            "console_messages",
+            "page_errors",
+        ],
+    ),
+]
+
+_SUMMARY_TIMING_METRICS = [
+    ("Browser Launch (sec)", "browser_launch_seconds"),
+    ("Page Load (sec)", "page_load_seconds"),
+    ("Dashboard Render (sec)", "dashboard_render_seconds"),
+    ("Screenshot (sec)", "screenshot_seconds"),
+    ("Gemini Extraction (sec)", "gemini_extraction_seconds"),
+    ("Total Execution (sec)", "total_execution_seconds"),
+    ("HTTP Requests", "total_requests"),
+    ("Failed Requests", "failed_requests"),
+    ("Console Messages", "console_messages"),
+    ("Page Errors", "page_errors"),
+]
 
 
 def _kpi_key(name):
@@ -328,6 +389,28 @@ def _create_summary_sheet(
             + len(target_data.get("kpi_cards", [])),
         ),
     ]
+
+    source_metrics = metrics[0] if metrics else None
+    target_metrics = metrics[1] if metrics and len(metrics) > 1 else None
+    source_label = (
+        source_metrics.get("dashboard_name", "Source")
+        if source_metrics
+        else "Source"
+    )
+    target_label = (
+        target_metrics.get("dashboard_name", "Target")
+        if target_metrics
+        else "Target"
+    )
+    for label, key in _SUMMARY_TIMING_METRICS:
+        source_value = source_metrics.get(key, "N/A") if source_metrics else "N/A"
+        target_value = target_metrics.get(key, "N/A") if target_metrics else "N/A"
+        rows.append(
+            (
+                label,
+                f"{source_label}: {source_value} | {target_label}: {target_value}",
+            )
+        )
 
     _format_header(
         ws,
@@ -1271,71 +1354,183 @@ def _create_visual_comparison_sheet(
 # Browser Metrics
 # ---------------------------------------------------------
 
+def _format_metric_value(value):
+    if value is None:
+        return "N/A"
+    if isinstance(value, (list, dict)):
+        return _values_to_string(value)
+    return value
+
+
+def _browser_metric_status(source_value, target_value):
+    if source_value is None and target_value is None:
+        return "N/A"
+    if source_value is None:
+        return "Missing in Source"
+    if target_value is None:
+        return "Missing in Target"
+
+    source_text = str(_format_metric_value(source_value))
+    target_text = str(_format_metric_value(target_value))
+    if source_text == target_text:
+        return "Match"
+
+    try:
+        if float(source_text) == float(target_text):
+            return "Match"
+    except (ValueError, TypeError):
+        pass
+
+    return "Different"
+
+
 def _create_browser_metrics_sheet(
     wb,
     metrics,
 ):
-    """Create Browser Metrics worksheet."""
+    """Create a side-by-side Browser Metrics worksheet (Source vs Target)."""
 
-    logger.info(
-        "Creating Browser Metrics worksheet"
+    logger.info("Creating Browser Metrics worksheet")
+
+    ws = wb.create_sheet("Browser Metrics")
+
+    source_metrics = metrics[0] if metrics else None
+    target_metrics = metrics[1] if metrics and len(metrics) > 1 else None
+    source_label = (
+        source_metrics.get("dashboard_name", "Source")
+        if source_metrics
+        else "Source"
     )
-
-    ws = wb.create_sheet(
-        "Browser Metrics"
+    target_label = (
+        target_metrics.get("dashboard_name", "Target")
+        if target_metrics
+        else "Target"
     )
 
     headers = [
-        "Dashboard",
+        "Category",
         "Metric",
-        "Value",
+        source_label,
+        target_label,
+        "Status",
     ]
-
-    _format_header(
-        ws,
-        headers,
-    )
+    _format_header(ws, headers)
 
     row = 2
+    section_keys = {key for _, keys in _BROWSER_METRIC_SECTIONS for key in keys}
+    ordered_rows: list[tuple[str, str]] = []
 
+    for category, keys in _BROWSER_METRIC_SECTIONS:
+        for key in keys:
+            if (
+                (source_metrics and key in source_metrics)
+                or (target_metrics and key in target_metrics)
+            ):
+                ordered_rows.append((category, key))
+
+    extra_keys = set()
+    for dashboard_metrics in (source_metrics, target_metrics):
+        if not dashboard_metrics:
+            continue
+        for key in dashboard_metrics:
+            if key in section_keys or key in {"network_details", "dashboard_name"}:
+                continue
+            extra_keys.add(key)
+
+    for key in sorted(extra_keys):
+        ordered_rows.append(("Additional", key))
+
+    for category, key in ordered_rows:
+        source_value = source_metrics.get(key) if source_metrics else None
+        target_value = target_metrics.get(key) if target_metrics else None
+        status = _browser_metric_status(source_value, target_value)
+        values = [
+            category,
+            key,
+            _format_metric_value(source_value),
+            _format_metric_value(target_value),
+            status,
+        ]
+        for col_idx, item in enumerate(values, start=1):
+            cell = ws.cell(row=row, column=col_idx, value=item)
+            _style_cell(cell)
+            if col_idx == 5 and status not in {"Match", "N/A"}:
+                cell.fill = PatternFill(fill_type="solid", fgColor="FCE4D6")
+        row += 1
+
+    if row == 2:
+        for col_idx, value in enumerate(
+            ["N/A", "No browser metrics captured", "N/A", "N/A", "N/A"],
+            start=1,
+        ):
+            _style_cell(ws.cell(row=2, column=col_idx, value=value))
+
+    _auto_fit(ws)
+
+
+def _create_network_details_sheet(wb, metrics):
+    """Write failed requests, console logs, and page errors per dashboard."""
+
+    logger.info("Creating Network Details worksheet")
+
+    ws = wb.create_sheet("Network Details")
+
+    headers = [
+        "Dashboard",
+        "Event Type",
+        "Detail 1",
+        "Detail 2",
+        "Detail 3",
+    ]
+    _format_header(ws, headers)
+
+    row = 2
     for dashboard_metrics in metrics:
-
         if not dashboard_metrics:
             continue
 
-        dashboard_name = dashboard_metrics.get(
-            "dashboard_name",
-            "N/A",
-        )
+        dashboard_name = dashboard_metrics.get("dashboard_name", "N/A")
+        network_details = dashboard_metrics.get("network_details") or {}
 
-        for key, value in dashboard_metrics.items():
-
-            if key == "dashboard_name":
-                continue
-
-            if isinstance(value, dict):
-                value = str(value)
-
+        for item in network_details.get("failed_requests", []):
             values = [
                 dashboard_name,
-                key,
-                value,
+                "Failed Request",
+                item.get("url", "N/A"),
+                item.get("status", "N/A"),
+                item.get("status_text", "N/A"),
             ]
-
-            for col_idx, item in enumerate(
-                values,
-                start=1,
-            ):
-
-                _style_cell(
-                    ws.cell(
-                        row=row,
-                        column=col_idx,
-                        value=item,
-                    )
-                )
-
+            for col_idx, value in enumerate(values, start=1):
+                _style_cell(ws.cell(row=row, column=col_idx, value=value))
             row += 1
+
+        for item in network_details.get("console_logs", []):
+            values = [
+                dashboard_name,
+                "Console",
+                item.get("type", "N/A"),
+                item.get("text", "N/A"),
+                "",
+            ]
+            for col_idx, value in enumerate(values, start=1):
+                _style_cell(ws.cell(row=row, column=col_idx, value=value))
+            row += 1
+
+        for item in network_details.get("page_errors", []):
+            values = [
+                dashboard_name,
+                "Page Error",
+                str(item),
+                "",
+                "",
+            ]
+            for col_idx, value in enumerate(values, start=1):
+                _style_cell(ws.cell(row=row, column=col_idx, value=value))
+            row += 1
+
+    if row == 2:
+        _style_cell(ws.cell(row=2, column=1, value="N/A"))
+        _style_cell(ws.cell(row=2, column=2, value="No network events captured"))
 
     _auto_fit(ws)
 
@@ -1360,12 +1555,22 @@ def _table_columns(visual):
 def build_visual_data_comparison(visual_data):
     """Compare every rendered table column and row, visual by visual.
 
+    Jagruthi: tabular-only comparison; column names are the merge key.
+
     Column names—not the temporary horizontal viewport position—are used as
     the comparison key.  This avoids the previous behaviour where only the
     first few visible columns of a Power BI matrix were compared.
     """
-    source = visual_data.get("Source", {}).get("visuals", [])
-    target = visual_data.get("Target", {}).get("visuals", [])
+    from services.table_comparison import is_tabular_visual
+
+    source = [
+        item for item in visual_data.get("Source", {}).get("visuals", [])
+        if is_tabular_visual(item)
+    ]
+    target = [
+        item for item in visual_data.get("Target", {}).get("visuals", [])
+        if is_tabular_visual(item)
+    ]
     source_map = {_visual_key(item): item for item in source if _visual_key(item)}
     target_map = {_visual_key(item): item for item in target if _visual_key(item)}
     summaries, cells = [], []
@@ -1402,6 +1607,8 @@ def build_visual_data_comparison(visual_data):
 
 def _create_visual_data_sheets(wb, visual_data):
     """Create side-by-side table blocks plus complete cell-level comparisons."""
+    from services.table_comparison import is_tabular_visual
+
     if not visual_data:
         return {"summary": [], "cells": []}
     comparison = build_visual_data_comparison(visual_data)
@@ -1419,8 +1626,16 @@ def _create_visual_data_sheets(wb, visual_data):
     # blocks preserve their own real headers, which makes the raw data usable
     # without jumping between Source and Target worksheets.
     raw = wb.create_sheet("Table Data")
-    source_visuals = {_visual_key(item): item for item in visual_data.get("Source", {}).get("visuals", []) if _visual_key(item)}
-    target_visuals = {_visual_key(item): item for item in visual_data.get("Target", {}).get("visuals", []) if _visual_key(item)}
+    source_visuals = {
+        _visual_key(item): item
+        for item in visual_data.get("Source", {}).get("visuals", [])
+        if _visual_key(item) and is_tabular_visual(item)
+    }
+    target_visuals = {
+        _visual_key(item): item
+        for item in visual_data.get("Target", {}).get("visuals", [])
+        if _visual_key(item) and is_tabular_visual(item)
+    }
     row_idx = 1
     for key in sorted(set(source_visuals) | set(target_visuals)):
         source_visual, target_visual = source_visuals.get(key), target_visuals.get(key)
@@ -1482,6 +1697,205 @@ def _create_slicer_test_sheet(wb, scenarios):
 
 
 # ---------------------------------------------------------
+# Jagruthi — Arun multi-page dashboard sheets
+# ---------------------------------------------------------
+
+def _write_table_rows(ws, headers, rows, start_row=2):
+    _format_header(ws, headers)
+    row_number = start_row
+    for row in rows:
+        for col_idx, value in enumerate(row, start=1):
+            cell = ws.cell(row=row_number, column=col_idx, value=value)
+            _style_cell(cell)
+        row_number += 1
+    _auto_fit(ws)
+    return row_number
+
+
+def _create_page_comparison_sheet(wb, page_comparisons):
+    """Jagruthi — per-page source vs target comparison summary (Arun multi-page)."""
+    if not page_comparisons:
+        return
+
+    logger.info("Creating Page Comparison worksheet")
+    ws = wb.create_sheet("Page Comparison")
+    headers = [
+        "Page Name",
+        "Status",
+        "Overall Match %",
+        "Filter Match %",
+        "KPI Match %",
+        "Visual Match %",
+    ]
+    rows = []
+    for item in page_comparisons:
+        summary = item.get("summary") or {}
+        rows.append(
+            (
+                item.get("page_name", "N/A"),
+                item.get("status", "N/A"),
+                summary.get("overall_match_percentage", 0),
+                summary.get("filter_match_percentage", 0),
+                summary.get("kpi_match_percentage", 0),
+                summary.get("visual_match_percentage", 0),
+            )
+        )
+    _write_table_rows(ws, headers, rows)
+
+
+def _create_page_inventory_sheet(wb, executions_by_dashboard):
+    """Jagruthi — visual inventory counts per dashboard page (filters, KPIs, charts)."""
+    if not executions_by_dashboard:
+        return
+
+    from services.dashboard_inventory_service import _count_inventory_for_execution
+
+    logger.info("Creating Page Inventory worksheet")
+    ws = wb.create_sheet("Page Inventory")
+    headers = [
+        "Dashboard",
+        "Page Name",
+        "Filter Count",
+        "KPI Count",
+        "Table Count",
+        "Matrix Count",
+        "Chart Count",
+        "Slicer Visuals",
+        "Total Visuals",
+        "Skipped Visuals",
+    ]
+    rows = []
+    for dashboard_executions in executions_by_dashboard:
+        for execution in dashboard_executions:
+            dashboard = execution.get("dashboard") or {}
+            inventory = _count_inventory_for_execution(execution)
+            rows.append(
+                (
+                    dashboard.get("name", "N/A"),
+                    dashboard.get("page_name") or inventory.get("page_name") or "Default",
+                    inventory.get("filter_count", 0),
+                    inventory.get("kpi_count", 0),
+                    inventory.get("table_count", 0),
+                    inventory.get("matrix_count", 0),
+                    inventory.get("chart_count", 0),
+                    inventory.get("slicer_visual_count", 0),
+                    inventory.get("total_visuals", 0),
+                    inventory.get("skipped_visual_count", 0),
+                )
+            )
+    _write_table_rows(ws, headers, rows)
+
+
+def _create_page_kpis_sheet(wb, executions_by_dashboard):
+    """Jagruthi — KPI cards listed per dashboard page."""
+    if not executions_by_dashboard:
+        return
+
+    from services.dashboard_inventory_service import _list_kpis_for_execution
+
+    logger.info("Creating Page KPIs worksheet")
+    ws = wb.create_sheet("Page KPIs")
+    headers = ["Dashboard", "Page Name", "KPI", "Value", "Previous", "Variance", "Source"]
+    rows = []
+    for dashboard_executions in executions_by_dashboard:
+        for execution in dashboard_executions:
+            dashboard = execution.get("dashboard") or {}
+            page_name = dashboard.get("page_name") or "Default"
+            for kpi in _list_kpis_for_execution(execution):
+                rows.append(
+                    (
+                        dashboard.get("name", "N/A"),
+                        page_name,
+                        kpi.get("name"),
+                        kpi.get("value"),
+                        kpi.get("previous_value"),
+                        kpi.get("variance"),
+                        kpi.get("extraction_source"),
+                    )
+                )
+    _write_table_rows(ws, headers, rows)
+
+
+def _create_page_visuals_sheet(wb, executions_by_dashboard):
+    """Jagruthi — DOM + Gemini visuals listed per dashboard page."""
+    if not executions_by_dashboard:
+        return
+
+    from services.dashboard_inventory_service import _list_visuals_for_execution
+
+    logger.info("Creating Page Visuals worksheet")
+    ws = wb.create_sheet("Page Visuals")
+    headers = ["Dashboard", "Page Name", "Visual Title", "Type", "Category", "Slicer", "Source"]
+    rows = []
+    for dashboard_executions in executions_by_dashboard:
+        for execution in dashboard_executions:
+            dashboard = execution.get("dashboard") or {}
+            page_name = dashboard.get("page_name") or "Default"
+            for visual in _list_visuals_for_execution(execution):
+                rows.append(
+                    (
+                        dashboard.get("name", "N/A"),
+                        page_name,
+                        visual.get("title"),
+                        visual.get("visual_type"),
+                        visual.get("category"),
+                        visual.get("is_slicer"),
+                        visual.get("extraction_source", "dom"),
+                    )
+                )
+    _write_table_rows(ws, headers, rows)
+
+
+def _create_page_browser_metrics_sheet(wb, executions_by_dashboard):
+    """Jagruthi — browser metrics for every dashboard page (Arun multi-page runs)."""
+    if not executions_by_dashboard:
+        return
+
+    logger.info("Creating Page Browser Metrics worksheet")
+    ws = wb.create_sheet("Page Browser Metrics")
+    headers = [
+        "Dashboard",
+        "Page Name",
+        "Metric",
+        "Value",
+    ]
+    metric_keys = [
+        key
+        for _, keys in _BROWSER_METRIC_SECTIONS
+        for key in keys
+    ]
+    rows = []
+    for dashboard_executions in executions_by_dashboard:
+        for execution in dashboard_executions:
+            dashboard = execution.get("dashboard") or {}
+            metrics = execution.get("metrics") or {}
+            page_name = dashboard.get("page_name") or metrics.get("page_name") or "Default"
+            for key in metric_keys:
+                if key not in metrics:
+                    continue
+                rows.append(
+                    (
+                        dashboard.get("name", "N/A"),
+                        page_name,
+                        key,
+                        _format_metric_value(metrics.get(key)),
+                    )
+                )
+            for key in sorted(metrics):
+                if key in metric_keys or key in {"network_details", "dashboard_name"}:
+                    continue
+                rows.append(
+                    (
+                        dashboard.get("name", "N/A"),
+                        page_name,
+                        key,
+                        _format_metric_value(metrics.get(key)),
+                    )
+                )
+    _write_table_rows(ws, headers, rows)
+
+
+# ---------------------------------------------------------
 # Main Export Function
 # ---------------------------------------------------------
 
@@ -1497,6 +1911,8 @@ def export_validation_workbook(
     output_directory,
     visual_data=None,
     slicer_scenarios=None,
+    page_comparisons=None,
+    executions_by_dashboard=None,
 ):
     """
     Create one Excel workbook for the complete validation run.
@@ -1612,6 +2028,19 @@ def export_validation_workbook(
             metrics,
         )
 
+        # Jagruthi — Arun multi-page dashboard data in Excel
+        if page_comparisons or executions_by_dashboard:
+            _create_page_comparison_sheet(wb, page_comparisons or [])
+            _create_page_inventory_sheet(wb, executions_by_dashboard or [])
+            _create_page_kpis_sheet(wb, executions_by_dashboard or [])
+            _create_page_visuals_sheet(wb, executions_by_dashboard or [])
+            _create_page_browser_metrics_sheet(wb, executions_by_dashboard or [])
+
+        _create_network_details_sheet(
+            wb,
+            metrics,
+        )
+
         _create_visual_data_sheets(wb, visual_data)
         _create_slicer_test_sheet(wb, slicer_scenarios or [])
 
@@ -1637,16 +2066,13 @@ def export_validation_workbook(
 
         raise
 
-def calculate_match_percentage(results: list) -> float:
+def calculate_match_percentage(results: list) -> float | None:
     """
     Calculate percentage of comparison items with status 'Match'.
     """
 
-    # An absent comparison is not evidence of a perfect match.  Callers can
-    # distinguish it from a genuinely empty successful comparison via the
-    # extraction status carried in the API result.
     if not results:
-        return 0.0
+        return None
 
     matches = sum(
         1
@@ -1659,6 +2085,7 @@ def calculate_match_percentage(results: list) -> float:
         2,
     )
 
+
 def build_comparison_summary(
     filter_comparison,
     kpi_comparison,
@@ -1666,6 +2093,8 @@ def build_comparison_summary(
 ) -> dict:
     """
     Build dashboard-level comparison summary.
+
+    Jagruthi: skip empty KPI/visual buckets when computing overall match %.
     """
 
     logger.info(
@@ -1675,27 +2104,26 @@ def build_comparison_summary(
     filter_percentage = calculate_match_percentage(
         filter_comparison
     )
-
     kpi_percentage = calculate_match_percentage(
         kpi_comparison
     )
-
     visual_percentage = calculate_match_percentage(
         visual_comparison
     )
 
-    overall_percentage = round(
-        (
-            filter_percentage
-            + kpi_percentage
-            + visual_percentage
-        ) / 3,
-        2,
-    )
+    scored = [
+        value
+        for value in (filter_percentage, kpi_percentage, visual_percentage)
+        if value is not None
+    ]
+    overall_percentage = round(sum(scored) / len(scored), 2) if scored else 0.0
 
     return {
-        "filter_match_percentage": filter_percentage,
-        "kpi_match_percentage": kpi_percentage,
-        "visual_match_percentage": visual_percentage,
+        "filter_match_percentage": filter_percentage if filter_percentage is not None else 0.0,
+        "kpi_match_percentage": kpi_percentage if kpi_percentage is not None else 0.0,
+        "visual_match_percentage": visual_percentage if visual_percentage is not None else 0.0,
         "overall_match_percentage": overall_percentage,
+        "kpi_compared": bool(kpi_comparison),
+        "filter_compared": bool(filter_comparison),
+        "visual_compared": bool(visual_comparison),
     }
