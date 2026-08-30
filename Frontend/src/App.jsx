@@ -21,6 +21,7 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [result, setResult] = useState(null);
+  console.log(result,"Result:");
 
   const [theme, toggleTheme] = useTheme();
   const apiStatus = useApiHealth();

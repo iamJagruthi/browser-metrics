@@ -124,7 +124,7 @@ class SlicerEngine:
 
          
     
-    async def apply_filter(self, filter_name: str, option_value: str):
+    async def apply_filter(self, filter_name: str, option_value: str) -> bool:
         logger.info(f"Applying filter: [{filter_name} = '{option_value}']")
         try:
             await self._close_any_open_popups()
@@ -139,7 +139,7 @@ class SlicerEngine:
 
             if await slicer_visual.count() == 0:
                 logger.warning(f"Slicer visual '{filter_name}' not found.")
-                return
+                return False
 
             dropdown_btn = slicer_visual.locator(
                 ".slicer-dropdown-menu, .slicer-rest-item, [role='combobox']"
@@ -155,9 +155,8 @@ class SlicerEngine:
                     container = popup
                 except Exception:
                     logger.warning(f"Popup failed to open for '{filter_name}'.")
-                    return
+                    return False
 
-            # Target the specific option whether it's a Checkbox, Radio, or List item
             target_el = container.locator(
                 f".slicerText:text-is('{option_value}'), "
                 f"[role='checkbox']:has-text('{option_value}'), "
@@ -166,25 +165,27 @@ class SlicerEngine:
             ).first
 
             if await target_el.count() == 0:
-                # Fallback for whitespace or partial string matching
                 target_el = container.locator(
                     f".slicerText:has-text('{option_value}')"
                 ).first
 
+            success = False
             if await target_el.count() > 0:
                 await target_el.scroll_into_view_if_needed()
                 await target_el.click(force=True)
                 logger.info(f"✅ Successfully clicked option '{option_value}' under '{filter_name}'.")
+                success = True
             else:
                 logger.warning(f"Option '{option_value}' not found in '{filter_name}'.")
 
             await self.page.keyboard.press("Escape")
             await self.page.wait_for_timeout(3000)
+            return success
 
         except Exception as e:
             logger.error(f"Error applying filter '{filter_name}' = '{option_value}': {e}")
             await self._close_any_open_popups()
-
+            return False
 
     async def extract_kpi_cards(self, max_retries: int = 2) -> dict:
         """Extracts KPI card values, retrying automatically if visuals return empty or N/A."""
