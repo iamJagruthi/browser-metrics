@@ -1,22 +1,18 @@
 """
 Excel exporter for Browser Metrics Validator.
 
-Creates one Excel workbook containing:
-- Summary
+Creates one Excel workbook containing conditional sheets:
+- Summary (Always created)
 - Metadata
-- Filters
-- Filter Comparison
-- KPI Details
-- KPI Comparison
-- Visual Details
-- Visual Comparison
-- Browser Metrics
+- Filters & Filter Comparison
+- KPI Details & KPI Comparison
+- Visual Details & Visual Comparison
+- Browser Metrics & Network Details
 
-Jagruthi — features:
-- Tabular-only visual data sheets (skips slicer/button visuals)
-- build_visual_data_comparison() for DOM table cell diffs
-- KPI match summary when no KPI cards are detected
-- Reliable Excel export with table-comparison config dependencies
+Features:
+- Dynamically creates sheets ONLY if data exists.
+- Supports both AI extraction and DOM-only extraction payloads.
+- Tabular-only visual data sheets (skips slicer/button visuals).
 """
 
 import logging
@@ -31,7 +27,7 @@ from openpyxl.utils import get_column_letter
 
 logger = logging.getLogger(__name__)
 
-# Jagruthi — ordered browser metrics sections aligned with automation/metrics.py
+# Ordered browser metrics sections aligned with automation/metrics.py
 _BROWSER_METRIC_SECTIONS = [
     (
         "Run Information",
@@ -56,6 +52,7 @@ _BROWSER_METRIC_SECTIONS = [
             "browser_launch_seconds",
             "page_load_seconds",
             "dashboard_render_seconds",
+            "filter_dashboard_render_seconds",
             "screenshot_seconds",
             "gemini_extraction_seconds",
             "total_execution_seconds",
@@ -77,6 +74,7 @@ _SUMMARY_TIMING_METRICS = [
     ("Browser Launch (sec)", "browser_launch_seconds"),
     ("Page Load (sec)", "page_load_seconds"),
     ("Dashboard Render (sec)", "dashboard_render_seconds"),
+    ("Filter Dashboard Render (sec)", "filter_dashboard_render_seconds"),
     ("Screenshot (sec)", "screenshot_seconds"),
     ("Gemini Extraction (sec)", "gemini_extraction_seconds"),
     ("Total Execution (sec)", "total_execution_seconds"),
@@ -97,13 +95,6 @@ def _normalise_comparison_value(value):
 
 
 def _match_abbreviated_kpis(source_map, target_map):
-    """Pair only unambiguous abbreviated KPI labels.
-
-    A shorter label is eligible only when its tokens are a strict subset of
-    the longer label's tokens, the values match, and it has one candidate.
-    Thus ``30 Days`` can pair with ``30 Days Retention``, but ``30 Days
-    Turnover`` can never be mistaken for it.
-    """
     matched = {}
     source_only = set(source_map) - set(target_map)
     target_only = set(target_map) - set(source_map)
@@ -129,30 +120,10 @@ def _match_abbreviated_kpis(source_map, target_map):
 
 FONT_FAMILY = "Segoe UI"
 
-HEADER_FONT = Font(
-    name=FONT_FAMILY,
-    size=11,
-    bold=True,
-    color="FFFFFF",
-)
-
-HEADER_FILL = PatternFill(
-    start_color="1F4E78",
-    end_color="1F4E78",
-    fill_type="solid",
-)
-
-SUBHEADER_FONT = Font(
-    name=FONT_FAMILY,
-    size=11,
-    bold=True,
-)
-
-CELL_FONT = Font(
-    name=FONT_FAMILY,
-    size=10,
-)
-
+HEADER_FONT = Font(name=FONT_FAMILY, size=11, bold=True, color="FFFFFF")
+HEADER_FILL = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
+SUBHEADER_FONT = Font(name=FONT_FAMILY, size=11, bold=True)
+CELL_FONT = Font(name=FONT_FAMILY, size=10)
 THIN_BORDER = Border(
     left=Side(style="thin", color="D9D9D9"),
     right=Side(style="thin", color="D9D9D9"),
@@ -160,22 +131,9 @@ THIN_BORDER = Border(
     bottom=Side(style="thin", color="D9D9D9"),
 )
 
-ALIGN_LEFT = Alignment(
-    horizontal="left",
-    vertical="center",
-    wrap_text=True,
-)
-
-ALIGN_CENTER = Alignment(
-    horizontal="center",
-    vertical="center",
-    wrap_text=True,
-)
-
-ALIGN_RIGHT = Alignment(
-    horizontal="right",
-    vertical="center",
-)
+ALIGN_LEFT = Alignment(horizontal="left", vertical="center", wrap_text=True)
+ALIGN_CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
+ALIGN_RIGHT = Alignment(horizontal="right", vertical="center")
 
 
 # ---------------------------------------------------------
@@ -183,19 +141,10 @@ ALIGN_RIGHT = Alignment(
 # ---------------------------------------------------------
 
 def _format_header(ws, headers):
-    """Format the first row of a worksheet."""
-
     ws.sheet_view.showGridLines = True
     ws.row_dimensions[1].height = 28
-
     for col_idx, header in enumerate(headers, start=1):
-
-        cell = ws.cell(
-            row=1,
-            column=col_idx,
-            value=header,
-        )
-
+        cell = ws.cell(row=1, column=col_idx, value=header)
         cell.font = HEADER_FONT
         cell.fill = HEADER_FILL
         cell.alignment = ALIGN_CENTER
@@ -203,73 +152,61 @@ def _format_header(ws, headers):
 
 
 def _style_cell(cell, alignment=ALIGN_LEFT):
-    """Apply standard cell formatting."""
-
     cell.font = CELL_FONT
     cell.border = THIN_BORDER
     cell.alignment = alignment
 
 
 def _auto_fit(ws):
-    """Automatically adjust worksheet column widths."""
-
     for column_cells in ws.columns:
-
         if not column_cells:
             continue
-
         max_length = 0
-
-        column_letter = get_column_letter(
-            column_cells[0].column
-        )
-
+        column_letter = get_column_letter(column_cells[0].column)
         for cell in column_cells:
-
-            value = cell.value
-
-            if value is None:
-                value = ""
-
-            max_length = max(
-                max_length,
-                len(str(value))
-            )
-
-        ws.column_dimensions[column_letter].width = min(
-            max(max_length + 4, 14),
-            60,
-        )
+            value = "" if cell.value is None else str(cell.value)
+            max_length = max(max_length, len(value))
+        ws.column_dimensions[column_letter].width = min(max(max_length + 4, 14), 60)
 
 
 def _safe_list(value):
-    """Convert None/non-list values into a list."""
-
     if value is None:
         return []
-
     if isinstance(value, list):
         return value
-
     return [value]
 
 
 def _values_to_string(value):
-    """Convert list values into readable Excel text."""
-
     if value is None:
         return "N/A"
-
+    
     if isinstance(value, list):
-
         if not value:
             return "N/A"
-
-        return ", ".join(
-            str(item)
-            for item in value
-        )
-
+            
+        # Clean up DOM dictionaries into readable text
+        cleaned_items = []
+        seen_texts = set()
+        
+        for item in value:
+            if isinstance(item, dict):
+                # Pull the most readable text available from the DOM dict
+                text = str(item.get('text') or item.get('title') or item.get('aria_label') or '').strip()
+                
+                # Skip pure noise and loading placeholders
+                if not text or "loading" in text.lower() or "visual container" in text.lower() or "drill" in text.lower():
+                    continue
+                
+                # Deduplicate so we don't repeat the same axis labels endlessly
+                if text not in seen_texts:
+                    seen_texts.add(text)
+                    cleaned_items.append(text)
+            else:
+                cleaned_items.append(str(item))
+                
+        return ", ".join(cleaned_items) if cleaned_items else "N/A"
+        
     return str(value)
 
 
@@ -277,171 +214,58 @@ def _values_to_string(value):
 # Summary
 # ---------------------------------------------------------
 
-def _create_summary_sheet(
-    wb,
-    run_id,
-    source_data,
-    target_data,
-    comparison_result,
-    metrics,
-):
-    """Create the Summary worksheet."""
-
+def _create_summary_sheet(wb, run_id, source_data, target_data, comparison_result, metrics):
     logger.info("Creating Summary worksheet")
-
     ws = wb.create_sheet("Summary")
 
-    summary = comparison_result.get(
-        "summary",
-        {}
-    )
-
-    source_metadata = source_data.get(
-        "metadata",
-        {}
-    )
-
-    target_metadata = target_data.get(
-        "metadata",
-        {}
-    )
+    summary = comparison_result.get("summary", {})
+    source_metadata = source_data.get("metadata", {})
+    target_metadata = target_data.get("metadata", {})
 
     rows = [
         ("Run ID", run_id),
-
-        (
-            "Source Dashboard",
-            source_metadata.get(
-                "dashboard_title"
-            ) or "N/A",
-        ),
-
-        (
-            "Target Dashboard",
-            target_metadata.get(
-                "dashboard_title"
-            ) or "N/A",
-        ),
-
-        (
-            "Overall Match %",
-            summary.get(
-                "overall_match_percentage",
-                0,
-            ),
-        ),
-
-        (
-            "Filter Match %",
-            summary.get(
-                "filter_match_percentage",
-                0,
-            ),
-        ),
-
-        (
-            "KPI Match %",
-            summary.get(
-                "kpi_match_percentage",
-                0,
-            ),
-        ),
-
-        (
-            "Visual Match %",
-            summary.get(
-                "visual_match_percentage",
-                0,
-            ),
-        ),
-
-        (
-            "Source Filter Count",
-            len(source_data.get("filters", [])),
-        ),
-
-        (
-            "Target Filter Count",
-            len(target_data.get("filters", [])),
-        ),
-
-        (
-            "Source KPI Count",
-            len(source_data.get("kpi_cards", [])),
-        ),
-
-        (
-            "Target KPI Count",
-            len(target_data.get("kpi_cards", [])),
-        ),
-
+        ("Source Dashboard", source_metadata.get("dashboard_title") or "N/A"),
+        ("Target Dashboard", target_metadata.get("dashboard_title") or "N/A"),
+        ("Overall Match %", summary.get("overall_match_percentage", 0)),
+        ("Filter Match %", summary.get("filter_match_percentage", 0)),
+        ("KPI Match %", summary.get("kpi_match_percentage", 0)),
+        ("Visual Match %", summary.get("visual_match_percentage", 0)),
+        ("Source Filter Count", len(source_data.get("filters", []))),
+        ("Target Filter Count", len(target_data.get("filters", []))),
+        ("Source KPI Count", len(source_data.get("kpi_cards", []))),
+        ("Target KPI Count", len(target_data.get("kpi_cards", []))),
         (
             "Source Visual Count",
-            len(source_data.get("charts", []))
-            + len(source_data.get("tables", []))
+            len(source_data.get("charts", []) or source_data.get("visuals", []))
+            + len(source_data.get("tables", []) or source_data.get("table_exports", []))
             + len(source_data.get("kpi_cards", [])),
         ),
-
         (
             "Target Visual Count",
-            len(target_data.get("charts", []))
-            + len(target_data.get("tables", []))
+            len(target_data.get("charts", []) or target_data.get("visuals", []))
+            + len(target_data.get("tables", []) or target_data.get("table_exports", []))
             + len(target_data.get("kpi_cards", [])),
         ),
     ]
 
     source_metrics = metrics[0] if metrics else None
     target_metrics = metrics[1] if metrics and len(metrics) > 1 else None
-    source_label = (
-        source_metrics.get("dashboard_name", "Source")
-        if source_metrics
-        else "Source"
-    )
-    target_label = (
-        target_metrics.get("dashboard_name", "Target")
-        if target_metrics
-        else "Target"
-    )
+    source_label = source_metrics.get("dashboard_name", "Source") if source_metrics else "Source"
+    target_label = target_metrics.get("dashboard_name", "Target") if target_metrics else "Target"
+
     for label, key in _SUMMARY_TIMING_METRICS:
         source_value = source_metrics.get(key, "N/A") if source_metrics else "N/A"
         target_value = target_metrics.get(key, "N/A") if target_metrics else "N/A"
-        rows.append(
-            (
-                label,
-                f"{source_label}: {source_value} | {target_label}: {target_value}",
-            )
-        )
+        rows.append((label, f"{source_label}: {source_value} | {target_label}: {target_value}"))
 
-    _format_header(
-        ws,
-        ["Property", "Value"],
-    )
+    _format_header(ws, ["Property", "Value"])
 
     row_number = 2
-
     for property_name, value in rows:
-
-        ws.cell(
-            row=row_number,
-            column=1,
-            value=property_name,
-        )
-
-        ws.cell(
-            row=row_number,
-            column=2,
-            value=value,
-        )
-
-        _style_cell(
-            ws.cell(row=row_number, column=1)
-        )
-
-        _style_cell(
-            ws.cell(row=row_number, column=2),
-            ALIGN_CENTER,
-        )
-
+        ws.cell(row=row_number, column=1, value=property_name)
+        ws.cell(row=row_number, column=2, value=value)
+        _style_cell(ws.cell(row=row_number, column=1))
+        _style_cell(ws.cell(row=row_number, column=2), ALIGN_CENTER)
         row_number += 1
 
     _auto_fit(ws)
@@ -451,71 +275,21 @@ def _create_summary_sheet(
 # Metadata
 # ---------------------------------------------------------
 
-def _create_metadata_sheet(
-    wb,
-    source_data,
-    target_data,
-):
-    """Create Metadata worksheet."""
-
+def _create_metadata_sheet(wb, source_data, target_data):
     logger.info("Creating Metadata worksheet")
-
     ws = wb.create_sheet("Metadata")
 
-    _format_header(
-        ws,
-        [
-            "Dashboard",
-            "Property",
-            "Value",
-        ],
-    )
+    _format_header(ws, ["Dashboard", "Property", "Value"])
 
     row = 2
-
-    for dashboard_name, data in [
-        ("Source", source_data),
-        ("Target", target_data),
-    ]:
-
-        metadata = data.get(
-            "metadata",
-            {}
-        )
-
+    for dashboard_name, data in [("Source", source_data), ("Target", target_data)]:
+        metadata = data.get("metadata", {})
         for key, value in metadata.items():
-
-            ws.cell(
-                row=row,
-                column=1,
-                value=dashboard_name,
-            )
-
-            ws.cell(
-                row=row,
-                column=2,
-                value=key.replace(
-                    "_",
-                    " "
-                ).title(),
-            )
-
-            ws.cell(
-                row=row,
-                column=3,
-                value=(
-                    str(value)
-                    if value is not None
-                    else "N/A"
-                ),
-            )
-
+            ws.cell(row=row, column=1, value=dashboard_name)
+            ws.cell(row=row, column=2, value=key.replace("_", " ").title())
+            ws.cell(row=row, column=3, value=(str(value) if value is not None else "N/A"))
             for col in range(1, 4):
-
-                _style_cell(
-                    ws.cell(row=row, column=col)
-                )
-
+                _style_cell(ws.cell(row=row, column=col))
             row += 1
 
     _auto_fit(ws)
@@ -525,81 +299,26 @@ def _create_metadata_sheet(
 # Filters
 # ---------------------------------------------------------
 
-def _create_filters_sheet(
-    wb,
-    source_data,
-    target_data,
-):
-    """Create Filters worksheet."""
-
+def _create_filters_sheet(wb, source_data, target_data):
     logger.info("Creating Filters worksheet")
-
     ws = wb.create_sheet("Filters")
 
-    headers = [
-        "Dashboard",
-        "Filter Name",
-        "Filter Type",
-        "Selected Values",
-        "Available Values",
-    ]
-
-    _format_header(
-        ws,
-        headers,
-    )
+    headers = ["Dashboard", "Filter Name", "Filter Type", "Selected Values", "Available Values"]
+    _format_header(ws, headers)
 
     row = 2
-
-    for dashboard_name, data in [
-        ("Source", source_data),
-        ("Target", target_data),
-    ]:
-
-        filters = data.get(
-            "filters",
-            []
-        )
-
+    for dashboard_name, data in [("Source", source_data), ("Target", target_data)]:
+        filters = data.get("filters", [])
         for filter_data in filters:
-
             values = [
                 dashboard_name,
-                filter_data.get(
-                    "filter_name",
-                    "N/A",
-                ),
-                filter_data.get(
-                    "filter_type",
-                    "N/A",
-                ),
-                _values_to_string(
-                    filter_data.get(
-                        "selected_values",
-                        [],
-                    )
-                ),
-                _values_to_string(
-                    filter_data.get(
-                        "available_values",
-                        [],
-                    )
-                ),
+                filter_data.get("filter_name", "N/A"),
+                filter_data.get("filter_type", "N/A"),
+                _values_to_string(filter_data.get("selected_values", [])),
+                _values_to_string(filter_data.get("available_values", [])),
             ]
-
-            for col_idx, value in enumerate(
-                values,
-                start=1,
-            ):
-
-                cell = ws.cell(
-                    row=row,
-                    column=col_idx,
-                    value=value,
-                )
-
-                _style_cell(cell)
-
+            for col_idx, value in enumerate(values, start=1):
+                _style_cell(ws.cell(row=row, column=col_idx, value=value))
             row += 1
 
     _auto_fit(ws)
@@ -609,96 +328,31 @@ def _create_filters_sheet(
 # Filter Comparison
 # ---------------------------------------------------------
 
-def _create_filter_comparison_sheet(
-    wb,
-    comparison,
-):
-    """Create Filter Comparison worksheet."""
-
-    logger.info(
-        "Creating Filter Comparison worksheet"
-    )
-
-    ws = wb.create_sheet(
-        "Filter Comparison"
-    )
+def _create_filter_comparison_sheet(wb, comparison):
+    logger.info("Creating Filter Comparison worksheet")
+    ws = wb.create_sheet("Filter Comparison")
 
     headers = [
-        "Filter Name",
-        "Source Type",
-        "Target Type",
-        "Source Selected",
-        "Target Selected",
-        "Source Values",
-        "Target Values",
-        "Status",
+        "Filter Name", "Source Type", "Target Type",
+        "Source Selected", "Target Selected",
+        "Source Values", "Target Values", "Status"
     ]
-
-    _format_header(
-        ws,
-        headers,
-    )
+    _format_header(ws, headers)
 
     row = 2
-
     for result in comparison:
-
         values = [
-            result.get(
-                "filter_name",
-                "N/A",
-            ),
-            result.get(
-                "source_type",
-                "N/A",
-            ),
-            result.get(
-                "target_type",
-                "N/A",
-            ),
-            _values_to_string(
-                result.get(
-                    "source_selected",
-                    [],
-                )
-            ),
-            _values_to_string(
-                result.get(
-                    "target_selected",
-                    [],
-                )
-            ),
-            _values_to_string(
-                result.get(
-                    "source_values",
-                    [],
-                )
-            ),
-            _values_to_string(
-                result.get(
-                    "target_values",
-                    [],
-                )
-            ),
-            result.get(
-                "status",
-                "Unknown",
-            ),
+            result.get("filter_name", "N/A"),
+            result.get("source_type", "N/A"),
+            result.get("target_type", "N/A"),
+            _values_to_string(result.get("source_selected", [])),
+            _values_to_string(result.get("target_selected", [])),
+            _values_to_string(result.get("source_values", [])),
+            _values_to_string(result.get("target_values", [])),
+            result.get("status", "Unknown"),
         ]
-
-        for col_idx, value in enumerate(
-            values,
-            start=1,
-        ):
-
-            _style_cell(
-                ws.cell(
-                    row=row,
-                    column=col_idx,
-                    value=value,
-                )
-            )
-
+        for col_idx, value in enumerate(values, start=1):
+            _style_cell(ws.cell(row=row, column=col_idx, value=value))
         row += 1
 
     _auto_fit(ws)
@@ -708,105 +362,35 @@ def _create_filter_comparison_sheet(
 # KPI Details
 # ---------------------------------------------------------
 
-def _create_kpi_details_sheet(
-    wb,
-    source_data,
-    target_data,
-):
-    """Create KPI Details worksheet."""
-
-    logger.info(
-        "Creating KPI Details worksheet"
-    )
-
-    ws = wb.create_sheet(
-        "KPI Details"
-    )
+def _create_kpi_details_sheet(wb, source_data, target_data):
+    logger.info("Creating KPI Details worksheet")
+    ws = wb.create_sheet("KPI Details")
 
     headers = [
-        "Dashboard",
-        "Visual ID",
-        "Metric Name",
-        "Current Value",
-        "Prior Period Value",
-        "Variance",
-        "Confidence",
+        "Dashboard", "Visual ID", "Metric Name",
+        "Current Value", "Prior Period Value",
+        "Variance", "Confidence"
     ]
-
-    _format_header(
-        ws,
-        headers,
-    )
+    _format_header(ws, headers)
 
     row = 2
-
-    for dashboard_name, data in [
-        ("Source", source_data),
-        ("Target", target_data),
-    ]:
-
-        for kpi in data.get(
-            "kpi_cards",
-            [],
-        ):
-
-            confidence = kpi.get(
-                "confidence"
-            )
-
-            if confidence is not None:
-                confidence = (
-                    f"{confidence * 100:.1f}%"
-                )
-
-            else:
-                confidence = "N/A"
+    for dashboard_name, data in [("Source", source_data), ("Target", target_data)]:
+        for kpi in data.get("kpi_cards", []):
+            confidence = kpi.get("confidence")
+            confidence_str = f"{confidence * 100:.1f}%" if confidence is not None else "N/A"
 
             values = [
                 dashboard_name,
-                kpi.get(
-                    "visual_id",
-                    "N/A",
-                ),
-                kpi.get(
-                    "name",
-                    "N/A",
-                ),
-                kpi.get(
-                    "value",
-                    "N/A",
-                ),
-                kpi.get(
-                    "previous_value",
-                    "N/A",
-                ),
-                kpi.get(
-                    "variance",
-                    "N/A",
-                ),
-                confidence,
+                kpi.get("visual_id", "N/A"),
+                kpi.get("name", "N/A"),
+                kpi.get("value", "N/A"),
+                kpi.get("previous_value", "N/A"),
+                kpi.get("variance", "N/A"),
+                confidence_str,
             ]
-
-            for col_idx, value in enumerate(
-                values,
-                start=1,
-            ):
-
-                alignment = (
-                    ALIGN_RIGHT
-                    if col_idx in [4, 5, 6, 7]
-                    else ALIGN_LEFT
-                )
-
-                _style_cell(
-                    ws.cell(
-                        row=row,
-                        column=col_idx,
-                        value=value,
-                    ),
-                    alignment,
-                )
-
+            for col_idx, value in enumerate(values, start=1):
+                alignment = ALIGN_RIGHT if col_idx in [4, 5, 6, 7] else ALIGN_LEFT
+                _style_cell(ws.cell(row=row, column=col_idx, value=value), alignment)
             row += 1
 
     _auto_fit(ws)
@@ -816,101 +400,33 @@ def _create_kpi_details_sheet(
 # KPI Comparison
 # ---------------------------------------------------------
 def compare_kpis(source_data: dict, target_data: dict) -> list:
-    """
-    Compare KPI cards between source and target dashboards.
-
-    Uses the current DashboardExtraction schema:
-        name
-        value
-        previous_value
-        variance
-    """
-
     logger.info("Starting KPI comparison")
-
     try:
+        source_kpis = source_data.get("kpi_cards", [])
+        target_kpis = target_data.get("kpi_cards", [])
 
-        source_kpis = source_data.get(
-            "kpi_cards",
-            []
-        )
+        source_map = {_kpi_key(kpi.get("name")): kpi for kpi in source_kpis if kpi.get("name")}
+        target_map = {_kpi_key(kpi.get("name")): kpi for kpi in target_kpis if kpi.get("name")}
 
-        target_kpis = target_data.get(
-            "kpi_cards",
-            []
-        )
-
-        logger.info(
-            "KPI counts | source=%d | target=%d",
-            len(source_kpis),
-            len(target_kpis)
-        )
-
-        # --------------------------------------------------
-        # Create lookup maps using KPI name
-        # --------------------------------------------------
-
-        source_map = {
-            _kpi_key(kpi.get("name")): kpi
-            for kpi in source_kpis
-            if kpi.get("name")
-        }
-
-        target_map = {
-            _kpi_key(kpi.get("name")): kpi
-            for kpi in target_kpis
-            if kpi.get("name")
-        }
-
-        # Preserve every business word for exact matching first.  Only then
-        # resolve a unique, value-backed abbreviated label such as a dashboard
-        # that omits the final word from an otherwise identical KPI caption.
         for source_key, target_kpi in _match_abbreviated_kpis(source_map, target_map).items():
             for target_key, candidate in list(target_map.items()):
                 if candidate is target_kpi:
                     del target_map[target_key]
                     break
             target_map[source_key] = target_kpi
-            logger.info("Matched abbreviated KPI label | source=%s | target=%s", source_key, target_kpi.get("name"))
 
         results = []
-
-        all_names = sorted(
-            set(source_map.keys()) |
-            set(target_map.keys())
-        )
-
-        # --------------------------------------------------
-        # Compare KPIs
-        # --------------------------------------------------
+        all_names = sorted(set(source_map.keys()) | set(target_map.keys()))
 
         for name in all_names:
-
             source = source_map.get(name)
             target = target_map.get(name)
 
-            # ----------------------------------------------
-            # Missing in Source
-            # ----------------------------------------------
-
             if source is None:
-
                 status = "Missing in Source"
-
-            # ----------------------------------------------
-            # Missing in Target
-            # ----------------------------------------------
-
             elif target is None:
-
                 status = "Missing in Target"
-
-            # ----------------------------------------------
-            # Compare Source and Target
-            # ----------------------------------------------
-
             else:
-
                 source_value = _normalise_comparison_value(source.get("value"))
                 target_value = _normalise_comparison_value(target.get("value"))
                 source_previous = _normalise_comparison_value(source.get("previous_value"))
@@ -918,203 +434,61 @@ def compare_kpis(source_data: dict, target_data: dict) -> list:
                 source_variance = _normalise_comparison_value(source.get("variance"))
                 target_variance = _normalise_comparison_value(target.get("variance"))
 
-                # ------------------------------------------
-                # KPI Match
-                # ------------------------------------------
-
-                if (
-                    source_value == target_value
-                    and
-                    source_previous == target_previous
-                    and
-                    source_variance == target_variance
-                ):
-
+                if (source_value == target_value and source_previous == target_previous and source_variance == target_variance):
                     status = "Match"
-
-                # ------------------------------------------
-                # KPI Value Changed
-                # ------------------------------------------
-
                 elif source_value != target_value:
-
                     status = "Value Changed"
-
-                # ------------------------------------------
-                # Previous Value Changed
-                # ------------------------------------------
-
                 elif source_previous != target_previous:
-
                     status = "Previous Value Changed"
-
-                # ------------------------------------------
-                # Variance Changed
-                # ------------------------------------------
-
                 elif source_variance != target_variance:
-
                     status = "Variance Changed"
-
                 else:
-
                     status = "Mismatch"
 
-            # --------------------------------------------------
-            # Result
-            # --------------------------------------------------
-
-            result = {
+            results.append({
                 "kpi": source.get("name") if source else target.get("name"),
                 "source_kpi_name": source.get("name") if source else None,
                 "target_kpi_name": target.get("name") if target else None,
-
-                # IMPORTANT:
-                # These names match excel_exporter.py
-
-                "source": (
-                    source.get("value")
-                    if source
-                    else None
-                ),
-
-                "target": (
-                    target.get("value")
-                    if target
-                    else None
-                ),
-
-                "source_prior": (
-                    source.get("previous_value")
-                    if source
-                    else None
-                ),
-
-                "target_prior": (
-                    target.get("previous_value")
-                    if target
-                    else None
-                ),
-
-                "source_variance": (
-                    source.get("variance")
-                    if source
-                    else None
-                ),
-
-                "target_variance": (
-                    target.get("variance")
-                    if target
-                    else None
-                ),
-
+                "source": source.get("value") if source else None,
+                "target": target.get("value") if target else None,
+                "source_prior": source.get("previous_value") if source else None,
+                "target_prior": target.get("previous_value") if target else None,
+                "source_variance": source.get("variance") if source else None,
+                "target_variance": target.get("variance") if target else None,
                 "status": status,
-            }
-
-            results.append(result)
-
-            logger.info(
-                "KPI comparison | name=%s | status=%s",
-                name,
-                status
-            )
-
-        match_count = sum(
-            1
-            for result in results
-            if result.get("status") == "Match"
-        )
-
-        logger.info(
-            "KPI comparison completed | total=%d | matches=%d",
-            len(results),
-            match_count
-        )
+            })
 
         return results
-
     except Exception:
-
-        logger.exception(
-            "Error during KPI comparison"
-        )
-
+        logger.exception("Error during KPI comparison")
         raise
 
 
-def _create_kpi_comparison_sheet(
-    wb,
-    comparison,
-):
-    """Create KPI Comparison worksheet."""
-
-    logger.info(
-        "Creating KPI Comparison worksheet"
-    )
-
-    ws = wb.create_sheet(
-        "KPI Comparison"
-    )
+def _create_kpi_comparison_sheet(wb, comparison):
+    logger.info("Creating KPI Comparison worksheet")
+    ws = wb.create_sheet("KPI Comparison")
 
     headers = [
-        "KPI",
-        "Source Value",
-        "Target Value",
-        "Source Prior Value",
-        "Target Prior Value",
-        "Source Variance",
-        "Target Variance",
-        "Status",
+        "KPI", "Source Value", "Target Value",
+        "Source Prior Value", "Target Prior Value",
+        "Source Variance", "Target Variance", "Status"
     ]
-
-    _format_header(
-        ws,
-        headers,
-    )
+    _format_header(ws, headers)
 
     row = 2
-
     for result in comparison:
-
         values = [
             result.get("kpi", "N/A"),
             result.get("source", "N/A"),
             result.get("target", "N/A"),
-            result.get(
-                "source_prior",
-                "N/A",
-            ),
-            result.get(
-                "target_prior",
-                "N/A",
-            ),
-            result.get(
-                "source_variance",
-                "N/A",
-            ),
-            result.get(
-                "target_variance",
-                "N/A",
-            ),
-            result.get(
-                "status",
-                "Unknown",
-            ),
+            result.get("source_prior", "N/A"),
+            result.get("target_prior", "N/A"),
+            result.get("source_variance", "N/A"),
+            result.get("target_variance", "N/A"),
+            result.get("status", "Unknown"),
         ]
-
-        for col_idx, value in enumerate(
-            values,
-            start=1,
-        ):
-
-            _style_cell(
-                ws.cell(
-                    row=row,
-                    column=col_idx,
-                    value=value,
-                )
-            )
-
+        for col_idx, value in enumerate(values, start=1):
+            _style_cell(ws.cell(row=row, column=col_idx, value=value))
         row += 1
 
     _auto_fit(ws)
@@ -1124,149 +498,53 @@ def _create_kpi_comparison_sheet(
 # Visual Details
 # ---------------------------------------------------------
 
-def _create_visual_details_sheet(
-    wb,
-    source_data,
-    target_data,
-    visual_comparison=None,
-    table_comparison=None,
-):
-    """Create Visual Details worksheet."""
+def _create_visual_details_sheet(wb, source_data, target_data, visual_comparison=None, table_comparison=None):
+    logger.info("Creating Visual Details worksheet")
+    ws = wb.create_sheet("Visual Details")
 
-    logger.info(
-        "Creating Visual Details worksheet"
-    )
+    headers = ["Dashboard", "Visual ID", "Visual Type", "Title", "Data", "Confidence", "Comparison Status"]
+    _format_header(ws, headers)
 
-    ws = wb.create_sheet(
-        "Visual Details"
-    )
-
-    headers = [
-        "Dashboard",
-        "Visual ID",
-        "Visual Type",
-        "Title",
-        "Data",
-        "Confidence",
-        "Comparison Status",
-    ]
-
-    _format_header(
-        ws,
-        headers,
-    )
-
-    status_by_visual = {
-        str(item.get("visual_id")): item.get("status", "Not Compared")
-        for item in (visual_comparison or [])
-        if item.get("visual_id")
-    }
-    table_status_by_title = {
-        " ".join(str(item.get("visual", "")).casefold().split()): item.get("status", "Not Compared")
-        for item in (table_comparison or {}).get("summary", [])
-    }
+    status_by_visual = {str(item.get("visual_id")): item.get("status", "Not Compared") for item in (visual_comparison or []) if item.get("visual_id")}
+    table_status_by_title = {" ".join(str(item.get("visual", "")).casefold().split()): item.get("status", "Not Compared") for item in (table_comparison or {}).get("summary", [])}
+    
     row = 2
+    for dashboard_name, data in [("Source", source_data), ("Target", target_data)]:
 
-    for dashboard_name, data in [
-        ("Source", source_data),
-        ("Target", target_data),
-    ]:
-
-        for chart in data.get(
-            "charts",
-            [],
-        ):
-
-            confidence = chart.get(
-                "confidence"
-            )
-
-            if confidence is not None:
-                confidence = (
-                    f"{confidence * 100:.1f}%"
-                )
-            else:
-                confidence = "N/A"
+        # Fallback to DOM visuals if AI charts are empty
+        charts = data.get("charts", []) or data.get("visuals", [])
+        for chart in charts:
+            confidence = chart.get("confidence")
+            confidence_str = f"{confidence * 100:.1f}%" if confidence is not None else "N/A"
 
             values = [
                 dashboard_name,
-                chart.get(
-                    "visual_id",
-                    "N/A",
-                ),
-                chart.get(
-                    "chart_type",
-                    "Chart",
-                ),
-                chart.get(
-                    "chart_title",
-                    "Untitled",
-                ),
-                _values_to_string(
-                    chart.get(
-                        "data",
-                        [],
-                    )
-                ),
-                confidence,
+                chart.get("visual_id", "N/A"),
+                chart.get("chart_type") or chart.get("visual_type", "Chart"),
+                chart.get("chart_title") or chart.get("title", "Untitled"),
+                _values_to_string(chart.get("data") or chart.get("dom_content", [])),
+                confidence_str,
                 status_by_visual.get(str(chart.get("visual_id")), "Not Compared"),
             ]
-
-            for col_idx, value in enumerate(
-                values,
-                start=1,
-            ):
-
-                _style_cell(
-                    ws.cell(
-                        row=row,
-                        column=col_idx,
-                        value=value,
-                    )
-                )
-
+            for col_idx, value in enumerate(values, start=1):
+                _style_cell(ws.cell(row=row, column=col_idx, value=value))
             row += 1
 
-        for table in data.get(
-            "tables",
-            [],
-        ):
-
+        # Fallback to DOM table_exports if AI tables are empty
+        tables = data.get("tables", []) or data.get("table_exports", [])
+        for table in tables:
+            title = table.get("table_title") or table.get("title", "Table")
             values = [
                 dashboard_name,
-                table.get(
-                    "visual_id",
-                    "N/A",
-                ),
+                table.get("visual_id", "N/A"),
                 "Table",
-                table.get(
-                    "table_title",
-                    "Table",
-                ),
-                (
-                    f"{len(table.get('rows', []))} rows × "
-                    f"{len(table.get('columns', []))} columns; see Table Data"
-                ),
+                title,
+                f"{len(table.get('rows', []))} rows × {len(table.get('columns', []))} columns; see Table Data",
                 "N/A",
-                table_status_by_title.get(
-                    " ".join(str(table.get("table_title", "")).casefold().split()),
-                    "Not Compared",
-                ),
+                table_status_by_title.get(" ".join(str(title).casefold().split()), "Not Compared"),
             ]
-
-            for col_idx, value in enumerate(
-                values,
-                start=1,
-            ):
-
-                _style_cell(
-                    ws.cell(
-                        row=row,
-                        column=col_idx,
-                        value=value,
-                    )
-                )
-
+            for col_idx, value in enumerate(values, start=1):
+                _style_cell(ws.cell(row=row, column=col_idx, value=value))
             row += 1
 
     _auto_fit(ws)
@@ -1276,75 +554,23 @@ def _create_visual_details_sheet(
 # Visual Comparison
 # ---------------------------------------------------------
 
-def _create_visual_comparison_sheet(
-    wb,
-    comparison,
-):
-    """Create Visual Comparison worksheet."""
+def _create_visual_comparison_sheet(wb, comparison):
+    logger.info("Creating Visual Comparison worksheet")
+    ws = wb.create_sheet("Visual Comparison")
 
-    logger.info(
-        "Creating Visual Comparison worksheet"
-    )
-
-    ws = wb.create_sheet(
-        "Visual Comparison"
-    )
-
-    headers = [
-        "Visual",
-        "Source",
-        "Target",
-        "Status",
-    ]
-
-    _format_header(
-        ws,
-        headers,
-    )
+    headers = ["Visual", "Source", "Target", "Status"]
+    _format_header(ws, headers)
 
     row = 2
-
     for result in comparison:
-
         values = [
-            result.get(
-                "visual",
-                result.get(
-                    "visual_id",
-                    "N/A",
-                ),
-            ),
-            _values_to_string(
-                result.get(
-                    "source",
-                    "N/A",
-                )
-            ),
-            _values_to_string(
-                result.get(
-                    "target",
-                    "N/A",
-                )
-            ),
-            result.get(
-                "status",
-                "Unknown",
-            ),
+            result.get("visual", result.get("visual_id", "N/A")),
+            _values_to_string(result.get("source", "N/A")),
+            _values_to_string(result.get("target", "N/A")),
+            result.get("status", "Unknown"),
         ]
-
-        for col_idx, value in enumerate(
-            values,
-            start=1,
-        ):
-
-            _style_cell(
-                ws.cell(
-                    row=row,
-                    column=col_idx,
-                    value=value,
-                )
-            )
-
+        for col_idx, value in enumerate(values, start=1):
+            _style_cell(ws.cell(row=row, column=col_idx, value=value))
         row += 1
 
     _auto_fit(ws)
@@ -1384,48 +610,25 @@ def _browser_metric_status(source_value, target_value):
     return "Different"
 
 
-def _create_browser_metrics_sheet(
-    wb,
-    metrics,
-):
-    """Create a side-by-side Browser Metrics worksheet (Source vs Target)."""
-
+def _create_browser_metrics_sheet(wb, metrics):
     logger.info("Creating Browser Metrics worksheet")
-
     ws = wb.create_sheet("Browser Metrics")
 
     source_metrics = metrics[0] if metrics else None
     target_metrics = metrics[1] if metrics and len(metrics) > 1 else None
-    source_label = (
-        source_metrics.get("dashboard_name", "Source")
-        if source_metrics
-        else "Source"
-    )
-    target_label = (
-        target_metrics.get("dashboard_name", "Target")
-        if target_metrics
-        else "Target"
-    )
+    source_label = source_metrics.get("dashboard_name", "Source") if source_metrics else "Source"
+    target_label = target_metrics.get("dashboard_name", "Target") if target_metrics else "Target"
 
-    headers = [
-        "Category",
-        "Metric",
-        source_label,
-        target_label,
-        "Status",
-    ]
+    headers = ["Category", "Metric", source_label, target_label]
     _format_header(ws, headers)
 
     row = 2
     section_keys = {key for _, keys in _BROWSER_METRIC_SECTIONS for key in keys}
-    ordered_rows: list[tuple[str, str]] = []
+    ordered_rows = []
 
     for category, keys in _BROWSER_METRIC_SECTIONS:
         for key in keys:
-            if (
-                (source_metrics and key in source_metrics)
-                or (target_metrics and key in target_metrics)
-            ):
+            if (source_metrics and key in source_metrics) or (target_metrics and key in target_metrics):
                 ordered_rows.append((category, key))
 
     extra_keys = set()
@@ -1443,45 +646,28 @@ def _create_browser_metrics_sheet(
     for category, key in ordered_rows:
         source_value = source_metrics.get(key) if source_metrics else None
         target_value = target_metrics.get(key) if target_metrics else None
-        status = _browser_metric_status(source_value, target_value)
         values = [
-            category,
-            key,
+            category, key,
             _format_metric_value(source_value),
-            _format_metric_value(target_value),
-            status,
+            _format_metric_value(target_value)
         ]
         for col_idx, item in enumerate(values, start=1):
             cell = ws.cell(row=row, column=col_idx, value=item)
             _style_cell(cell)
-            if col_idx == 5 and status not in {"Match", "N/A"}:
-                cell.fill = PatternFill(fill_type="solid", fgColor="FCE4D6")
         row += 1
 
     if row == 2:
-        for col_idx, value in enumerate(
-            ["N/A", "No browser metrics captured", "N/A", "N/A", "N/A"],
-            start=1,
-        ):
+        for col_idx, value in enumerate(["N/A", "No browser metrics captured", "N/A", "N/A"], start=1):
             _style_cell(ws.cell(row=2, column=col_idx, value=value))
 
     _auto_fit(ws)
 
 
 def _create_network_details_sheet(wb, metrics):
-    """Write failed requests, console logs, and page errors per dashboard."""
-
     logger.info("Creating Network Details worksheet")
-
     ws = wb.create_sheet("Network Details")
 
-    headers = [
-        "Dashboard",
-        "Event Type",
-        "Detail 1",
-        "Detail 2",
-        "Detail 3",
-    ]
+    headers = ["Dashboard", "Event Type", "Detail 1", "Detail 2", "Detail 3"]
     _format_header(ws, headers)
 
     row = 2
@@ -1494,11 +680,8 @@ def _create_network_details_sheet(wb, metrics):
 
         for item in network_details.get("failed_requests", []):
             values = [
-                dashboard_name,
-                "Failed Request",
-                item.get("url", "N/A"),
-                item.get("status", "N/A"),
-                item.get("status_text", "N/A"),
+                dashboard_name, "Failed Request",
+                item.get("url", "N/A"), item.get("status", "N/A"), item.get("status_text", "N/A"),
             ]
             for col_idx, value in enumerate(values, start=1):
                 _style_cell(ws.cell(row=row, column=col_idx, value=value))
@@ -1506,11 +689,8 @@ def _create_network_details_sheet(wb, metrics):
 
         for item in network_details.get("console_logs", []):
             values = [
-                dashboard_name,
-                "Console",
-                item.get("type", "N/A"),
-                item.get("text", "N/A"),
-                "",
+                dashboard_name, "Console",
+                item.get("type", "N/A"), item.get("text", "N/A"), "",
             ]
             for col_idx, value in enumerate(values, start=1):
                 _style_cell(ws.cell(row=row, column=col_idx, value=value))
@@ -1518,11 +698,7 @@ def _create_network_details_sheet(wb, metrics):
 
         for item in network_details.get("page_errors", []):
             values = [
-                dashboard_name,
-                "Page Error",
-                str(item),
-                "",
-                "",
+                dashboard_name, "Page Error", str(item), "", "",
             ]
             for col_idx, value in enumerate(values, start=1):
                 _style_cell(ws.cell(row=row, column=col_idx, value=value))
@@ -1544,7 +720,6 @@ def _column_key(value):
 
 
 def _table_columns(visual):
-    """Return an ordered, non-empty column list for a rendered visual."""
     columns = visual.get("data", {}).get("columns", [])
     if columns:
         return [str(column) for column in columns]
@@ -1553,40 +728,32 @@ def _table_columns(visual):
 
 
 def build_visual_data_comparison(visual_data):
-    """Compare every rendered table column and row, visual by visual.
-
-    Jagruthi: tabular-only comparison; column names are the merge key.
-
-    Column names—not the temporary horizontal viewport position—are used as
-    the comparison key.  This avoids the previous behaviour where only the
-    first few visible columns of a Power BI matrix were compared.
-    """
     from services.table_comparison import is_tabular_visual
 
-    source = [
-        item for item in visual_data.get("Source", {}).get("visuals", [])
-        if is_tabular_visual(item)
-    ]
-    target = [
-        item for item in visual_data.get("Target", {}).get("visuals", [])
-        if is_tabular_visual(item)
-    ]
+    source = [item for item in visual_data.get("Source", {}).get("visuals", []) if is_tabular_visual(item)]
+    target = [item for item in visual_data.get("Target", {}).get("visuals", []) if is_tabular_visual(item)]
+    
     source_map = {_visual_key(item): item for item in source if _visual_key(item)}
     target_map = {_visual_key(item): item for item in target if _visual_key(item)}
+    
     summaries, cells = [], []
     for key in sorted(set(source_map) | set(target_map)):
         left, right = source_map.get(key), target_map.get(key)
         if not left or not right:
             summaries.append({"visual": (left or right).get("title"), "status": "Missing in Target" if left else "Missing in Source", "source_rows": len((left or {}).get("data", {}).get("rows", [])), "target_rows": len((right or {}).get("data", {}).get("rows", [])), "matched_cells": 0, "mismatched_cells": 0})
             continue
+            
         left_rows, right_rows = left.get("data", {}).get("rows", []), right.get("data", {}).get("rows", [])
         left_columns, right_columns = _table_columns(left), _table_columns(right)
+        
         if not left_rows and not right_rows and not left_columns and not right_columns:
             summaries.append({"visual": left.get("title"), "status": "No table data captured", "source_rows": 0, "target_rows": 0, "matched_cells": 0, "mismatched_cells": 0})
             continue
+            
         left_column_map = {_column_key(name): index for index, name in enumerate(left_columns)}
         right_column_map = {_column_key(name): index for index, name in enumerate(right_columns)}
         column_keys = list(dict.fromkeys([_column_key(name) for name in left_columns + right_columns]))
+        
         matched = mismatched = 0
         for row_number in range(max(len(left_rows), len(right_rows))):
             left_row = left_rows[row_number] if row_number < len(left_rows) else []
@@ -1601,17 +768,24 @@ def build_visual_data_comparison(visual_data):
                 mismatched += status != "Match"
                 display_column = left_columns[source_column] if source_column is not None else right_columns[target_column]
                 cells.append({"visual": left.get("title"), "row_number": row_number + 1, "column": display_column, "source_value": source_value, "target_value": target_value, "status": status})
+                
         summaries.append({"visual": left.get("title"), "status": "Match" if not mismatched else "Mismatch", "source_rows": len(left_rows), "target_rows": len(right_rows), "matched_cells": matched, "mismatched_cells": mismatched})
+        
     return {"summary": summaries, "cells": cells}
 
 
 def _create_visual_data_sheets(wb, visual_data):
-    """Create side-by-side table blocks plus complete cell-level comparisons."""
-    from services.table_comparison import is_tabular_visual
-
     if not visual_data:
         return {"summary": [], "cells": []}
+        
     comparison = build_visual_data_comparison(visual_data)
+    
+    # Conditional generation: only create sheets if there is actual table comparison data
+    if not comparison.get("summary"):
+        return comparison
+
+    from services.table_comparison import is_tabular_visual
+
     summary = wb.create_sheet("Visual Data Summary")
     _format_header(summary, ["Visual", "Status", "Source Rows", "Target Rows", "Matched Cells", "Mismatched Cells"])
     for row_idx, item in enumerate(comparison["summary"], start=2):
@@ -1622,20 +796,10 @@ def _create_visual_data_sheets(wb, visual_data):
                 summary.cell(row=row_idx, column=col_idx).fill = PatternFill(fill_type="solid", fgColor="FCE4D6")
     _auto_fit(summary)
 
-    # One sheet holds each matched pair beside each other.  Individual visual
-    # blocks preserve their own real headers, which makes the raw data usable
-    # without jumping between Source and Target worksheets.
     raw = wb.create_sheet("Table Data")
-    source_visuals = {
-        _visual_key(item): item
-        for item in visual_data.get("Source", {}).get("visuals", [])
-        if _visual_key(item) and is_tabular_visual(item)
-    }
-    target_visuals = {
-        _visual_key(item): item
-        for item in visual_data.get("Target", {}).get("visuals", [])
-        if _visual_key(item) and is_tabular_visual(item)
-    }
+    source_visuals = {_visual_key(item): item for item in visual_data.get("Source", {}).get("visuals", []) if _visual_key(item) and is_tabular_visual(item)}
+    target_visuals = {_visual_key(item): item for item in visual_data.get("Target", {}).get("visuals", []) if _visual_key(item) and is_tabular_visual(item)}
+    
     row_idx = 1
     for key in sorted(set(source_visuals) | set(target_visuals)):
         source_visual, target_visual = source_visuals.get(key), target_visuals.get(key)
@@ -1643,11 +807,13 @@ def _create_visual_data_sheets(wb, visual_data):
         target_columns = _table_columns(target_visual) if target_visual else []
         source_width = max(1, len(source_columns))
         target_start = source_width + 3
+        
         raw.cell(row=row_idx, column=1, value=f"Source: {(source_visual or target_visual).get('title')}")
         raw.cell(row=row_idx, column=target_start, value=f"Target: {(target_visual or source_visual).get('title')}")
         for cell in (raw.cell(row=row_idx, column=1), raw.cell(row=row_idx, column=target_start)):
             cell.font = SUBHEADER_FONT
         row_idx += 1
+        
         for index, column in enumerate(source_columns, start=1):
             _style_cell(raw.cell(row=row_idx, column=index, value=column), ALIGN_CENTER)
             raw.cell(row=row_idx, column=index).font = HEADER_FONT
@@ -1657,6 +823,7 @@ def _create_visual_data_sheets(wb, visual_data):
             raw.cell(row=row_idx, column=index).font = HEADER_FONT
             raw.cell(row=row_idx, column=index).fill = HEADER_FILL
         row_idx += 1
+        
         height = max(len((source_visual or {}).get("data", {}).get("rows", [])), len((target_visual or {}).get("data", {}).get("rows", [])))
         for data_row in range(height):
             for index, value in enumerate(((source_visual or {}).get("data", {}).get("rows", []) or [[]])[data_row] if data_row < len((source_visual or {}).get("data", {}).get("rows", [])) else [], start=1):
@@ -1676,11 +843,11 @@ def _create_visual_data_sheets(wb, visual_data):
             for col_idx in range(1, 7):
                 cells.cell(row=row_idx, column=col_idx).fill = PatternFill(fill_type="solid", fgColor="FCE4D6")
     _auto_fit(cells)
+    
     return comparison
 
 
 def _create_slicer_test_sheet(wb, scenarios):
-    """Record the matched-slicer run and its visual comparison result."""
     if not scenarios:
         return
     ws = wb.create_sheet("Slicer Test")
@@ -1713,84 +880,38 @@ def _write_table_rows(ws, headers, rows, start_row=2):
 
 
 def _create_page_comparison_sheet(wb, page_comparisons):
-    """Jagruthi — per-page source vs target comparison summary (Arun multi-page)."""
     if not page_comparisons:
         return
-
     logger.info("Creating Page Comparison worksheet")
     ws = wb.create_sheet("Page Comparison")
-    headers = [
-        "Page Name",
-        "Status",
-        "Overall Match %",
-        "Filter Match %",
-        "KPI Match %",
-        "Visual Match %",
-    ]
+    headers = ["Page Name", "Status", "Overall Match %", "Filter Match %", "KPI Match %", "Visual Match %"]
     rows = []
     for item in page_comparisons:
         summary = item.get("summary") or {}
-        rows.append(
-            (
-                item.get("page_name", "N/A"),
-                item.get("status", "N/A"),
-                summary.get("overall_match_percentage", 0),
-                summary.get("filter_match_percentage", 0),
-                summary.get("kpi_match_percentage", 0),
-                summary.get("visual_match_percentage", 0),
-            )
-        )
+        rows.append((item.get("page_name", "N/A"), item.get("status", "N/A"), summary.get("overall_match_percentage", 0), summary.get("filter_match_percentage", 0), summary.get("kpi_match_percentage", 0), summary.get("visual_match_percentage", 0)))
     _write_table_rows(ws, headers, rows)
 
 
 def _create_page_inventory_sheet(wb, executions_by_dashboard):
-    """Jagruthi — visual inventory counts per dashboard page (filters, KPIs, charts)."""
     if not executions_by_dashboard:
         return
-
     from services.dashboard_inventory_service import _count_inventory_for_execution
 
     logger.info("Creating Page Inventory worksheet")
     ws = wb.create_sheet("Page Inventory")
-    headers = [
-        "Dashboard",
-        "Page Name",
-        "Filter Count",
-        "KPI Count",
-        "Table Count",
-        "Matrix Count",
-        "Chart Count",
-        "Slicer Visuals",
-        "Total Visuals",
-        "Skipped Visuals",
-    ]
+    headers = ["Dashboard", "Page Name", "Filter Count", "KPI Count", "Table Count", "Matrix Count", "Chart Count", "Slicer Visuals", "Total Visuals", "Skipped Visuals"]
     rows = []
     for dashboard_executions in executions_by_dashboard:
         for execution in dashboard_executions:
             dashboard = execution.get("dashboard") or {}
             inventory = _count_inventory_for_execution(execution)
-            rows.append(
-                (
-                    dashboard.get("name", "N/A"),
-                    dashboard.get("page_name") or inventory.get("page_name") or "Default",
-                    inventory.get("filter_count", 0),
-                    inventory.get("kpi_count", 0),
-                    inventory.get("table_count", 0),
-                    inventory.get("matrix_count", 0),
-                    inventory.get("chart_count", 0),
-                    inventory.get("slicer_visual_count", 0),
-                    inventory.get("total_visuals", 0),
-                    inventory.get("skipped_visual_count", 0),
-                )
-            )
+            rows.append((dashboard.get("name", "N/A"), dashboard.get("page_name") or inventory.get("page_name") or "Default", inventory.get("filter_count", 0), inventory.get("kpi_count", 0), inventory.get("table_count", 0), inventory.get("matrix_count", 0), inventory.get("chart_count", 0), inventory.get("slicer_visual_count", 0), inventory.get("total_visuals", 0), inventory.get("skipped_visual_count", 0)))
     _write_table_rows(ws, headers, rows)
 
 
 def _create_page_kpis_sheet(wb, executions_by_dashboard):
-    """Jagruthi — KPI cards listed per dashboard page."""
     if not executions_by_dashboard:
         return
-
     from services.dashboard_inventory_service import _list_kpis_for_execution
 
     logger.info("Creating Page KPIs worksheet")
@@ -1802,25 +923,13 @@ def _create_page_kpis_sheet(wb, executions_by_dashboard):
             dashboard = execution.get("dashboard") or {}
             page_name = dashboard.get("page_name") or "Default"
             for kpi in _list_kpis_for_execution(execution):
-                rows.append(
-                    (
-                        dashboard.get("name", "N/A"),
-                        page_name,
-                        kpi.get("name"),
-                        kpi.get("value"),
-                        kpi.get("previous_value"),
-                        kpi.get("variance"),
-                        kpi.get("extraction_source"),
-                    )
-                )
+                rows.append((dashboard.get("name", "N/A"), page_name, kpi.get("name"), kpi.get("value"), kpi.get("previous_value"), kpi.get("variance"), kpi.get("extraction_source")))
     _write_table_rows(ws, headers, rows)
 
 
 def _create_page_visuals_sheet(wb, executions_by_dashboard):
-    """Jagruthi — DOM + Gemini visuals listed per dashboard page."""
     if not executions_by_dashboard:
         return
-
     from services.dashboard_inventory_service import _list_visuals_for_execution
 
     logger.info("Creating Page Visuals worksheet")
@@ -1832,39 +941,20 @@ def _create_page_visuals_sheet(wb, executions_by_dashboard):
             dashboard = execution.get("dashboard") or {}
             page_name = dashboard.get("page_name") or "Default"
             for visual in _list_visuals_for_execution(execution):
-                rows.append(
-                    (
-                        dashboard.get("name", "N/A"),
-                        page_name,
-                        visual.get("title"),
-                        visual.get("visual_type"),
-                        visual.get("category"),
-                        visual.get("is_slicer"),
-                        visual.get("extraction_source", "dom"),
-                    )
-                )
+                rows.append((dashboard.get("name", "N/A"), page_name, visual.get("title"), visual.get("visual_type"), visual.get("category"), visual.get("is_slicer"), visual.get("extraction_source", "dom")))
     _write_table_rows(ws, headers, rows)
 
 
 def _create_page_browser_metrics_sheet(wb, executions_by_dashboard):
-    """Jagruthi — browser metrics for every dashboard page (Arun multi-page runs)."""
     if not executions_by_dashboard:
         return
 
     logger.info("Creating Page Browser Metrics worksheet")
     ws = wb.create_sheet("Page Browser Metrics")
-    headers = [
-        "Dashboard",
-        "Page Name",
-        "Metric",
-        "Value",
-    ]
-    metric_keys = [
-        key
-        for _, keys in _BROWSER_METRIC_SECTIONS
-        for key in keys
-    ]
+    headers = ["Dashboard", "Page Name", "Metric", "Value"]
+    metric_keys = [key for _, keys in _BROWSER_METRIC_SECTIONS for key in keys]
     rows = []
+    
     for dashboard_executions in executions_by_dashboard:
         for execution in dashboard_executions:
             dashboard = execution.get("dashboard") or {}
@@ -1873,25 +963,11 @@ def _create_page_browser_metrics_sheet(wb, executions_by_dashboard):
             for key in metric_keys:
                 if key not in metrics:
                     continue
-                rows.append(
-                    (
-                        dashboard.get("name", "N/A"),
-                        page_name,
-                        key,
-                        _format_metric_value(metrics.get(key)),
-                    )
-                )
+                rows.append((dashboard.get("name", "N/A"), page_name, key, _format_metric_value(metrics.get(key))))
             for key in sorted(metrics):
                 if key in metric_keys or key in {"network_details", "dashboard_name"}:
                     continue
-                rows.append(
-                    (
-                        dashboard.get("name", "N/A"),
-                        page_name,
-                        key,
-                        _format_metric_value(metrics.get(key)),
-                    )
-                )
+                rows.append((dashboard.get("name", "N/A"), page_name, key, _format_metric_value(metrics.get(key))))
     _write_table_rows(ws, headers, rows)
 
 
@@ -1914,121 +990,68 @@ def export_validation_workbook(
     page_comparisons=None,
     executions_by_dashboard=None,
 ):
-    """
-    Create one Excel workbook for the complete validation run.
-
-    Returns
-    -------
-    Path
-        Path to generated Excel workbook.
-    """
-
-    logger.info(
-        "Starting Excel workbook generation | run_id=%s",
-        run_id,
-    )
+    logger.info("Starting Excel workbook generation | run_id=%s", run_id)
 
     try:
+        output_directory = Path(output_directory)
+        output_directory.mkdir(parents=True, exist_ok=True)
+        output_file = output_directory / f"{run_id}_dashboard_validation.xlsx"
 
-        output_directory = Path(
-            output_directory
-        )
-
-        output_directory.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-        output_file = (
-            output_directory
-            / f"{run_id}_dashboard_validation.xlsx"
-        )
-
-        logger.info(
-            "Excel output path: %s",
-            output_file,
-        )
+        logger.info("Excel output path: %s", output_file)
 
         wb = Workbook()
-
-        # Remove default sheet.
         default_sheet = wb.active
 
-        wb.remove(default_sheet)
-
         # -------------------------------------------------
-        # Create all worksheets
+        # Create all worksheets conditionally
         # -------------------------------------------------
 
-        _create_summary_sheet(
-            wb,
-            run_id,
-            source_data,
-            target_data,
-            {
-                "summary": comparison_summary
-            },
-            metrics,
-        )
+        # 1. Summary & Metadata always exist
+        _create_summary_sheet(wb, run_id, source_data, target_data, {"summary": comparison_summary}, metrics)
+        _create_metadata_sheet(wb, source_data, target_data)
 
-        _create_metadata_sheet(
-            wb,
-            source_data,
-            target_data,
-        )
+        # 2. Filters
+        if source_data.get("filters") or target_data.get("filters"):
+            _create_filters_sheet(wb, source_data, target_data)
+        if filter_comparison:
+            _create_filter_comparison_sheet(wb, filter_comparison)
 
-        _create_filters_sheet(
-            wb,
-            source_data,
-            target_data,
-        )
+        # 3. KPIs
+        if source_data.get("kpi_cards") or target_data.get("kpi_cards"):
+            _create_kpi_details_sheet(wb, source_data, target_data)
+        if kpi_comparison:
+            _create_kpi_comparison_sheet(wb, kpi_comparison)
 
-        _create_filter_comparison_sheet(
-            wb,
-            filter_comparison,
-        )
+        # 4. Visuals (Fallback logic applied here)
+        charts_source = source_data.get("charts", []) or source_data.get("visuals", [])
+        tables_source = source_data.get("tables", []) or source_data.get("table_exports", [])
+        charts_target = target_data.get("charts", []) or target_data.get("visuals", [])
+        tables_target = target_data.get("tables", []) or target_data.get("table_exports", [])
 
-        _create_kpi_details_sheet(
-            wb,
-            source_data,
-            target_data,
-        )
+        if charts_source or tables_source or charts_target or tables_target:
+            table_comparison = build_visual_data_comparison(visual_data or {})
+            combined_visual_comparison = list(visual_comparison or []) + [
+                {
+                    "visual": item.get("visual"),
+                    "source": f"{item.get('source_rows', 0)} rows / {item.get('matched_cells', 0)} matching cells",
+                    "target": f"{item.get('target_rows', 0)} rows / {item.get('mismatched_cells', 0)} differing cells",
+                    "status": item.get("status", "Not Compared"),
+                }
+                for item in table_comparison.get("summary", [])
+            ]
 
-        _create_kpi_comparison_sheet(
-            wb,
-            kpi_comparison,
-        )
+            _create_visual_details_sheet(wb, source_data, target_data, visual_comparison, table_comparison)
+            
+            if combined_visual_comparison:
+                _create_visual_comparison_sheet(wb, combined_visual_comparison)
 
-        table_comparison = build_visual_data_comparison(visual_data or {})
-        combined_visual_comparison = list(visual_comparison or []) + [
-            {
-                "visual": item.get("visual"),
-                "source": f"{item.get('source_rows', 0)} rows / {item.get('matched_cells', 0)} matching cells",
-                "target": f"{item.get('target_rows', 0)} rows / {item.get('mismatched_cells', 0)} differing cells",
-                "status": item.get("status", "Not Compared"),
-            }
-            for item in table_comparison.get("summary", [])
-        ]
+        # 5. Metrics
+        if metrics and any(metrics):
+            _create_browser_metrics_sheet(wb, metrics)
+            if any(m.get("network_details") for m in metrics if m):
+                _create_network_details_sheet(wb, metrics)
 
-        _create_visual_details_sheet(
-            wb,
-            source_data,
-            target_data,
-            visual_comparison,
-            table_comparison,
-        )
-
-        _create_visual_comparison_sheet(
-            wb,
-            combined_visual_comparison,
-        )
-
-        _create_browser_metrics_sheet(
-            wb,
-            metrics,
-        )
-
-        # Jagruthi — Arun multi-page dashboard data in Excel
+        # 6. Arun multi-page dashboard data
         if page_comparisons or executions_by_dashboard:
             _create_page_comparison_sheet(wb, page_comparisons or [])
             _create_page_inventory_sheet(wb, executions_by_dashboard or [])
@@ -2036,86 +1059,39 @@ def export_validation_workbook(
             _create_page_visuals_sheet(wb, executions_by_dashboard or [])
             _create_page_browser_metrics_sheet(wb, executions_by_dashboard or [])
 
-        _create_network_details_sheet(
-            wb,
-            metrics,
-        )
-
+        # 7. Deep Tabular Data (Self-checks if data exists before creating sheets)
         _create_visual_data_sheets(wb, visual_data)
-        _create_slicer_test_sheet(wb, slicer_scenarios or [])
+        
+        # 8. Slicer Tests
+        if slicer_scenarios:
+            _create_slicer_test_sheet(wb, slicer_scenarios)
 
-        # -------------------------------------------------
-        # Save workbook
-        # -------------------------------------------------
-
+        wb.remove(default_sheet)
         wb.save(output_file)
 
-        logger.info(
-            "Excel workbook generated successfully | %s",
-            output_file,
-        )
-
+        logger.info("Excel workbook generated successfully | %s", output_file)
         return output_file
 
     except Exception:
-
-        logger.exception(
-            "Failed to generate Excel workbook | run_id=%s",
-            run_id,
-        )
-
+        logger.exception("Failed to generate Excel workbook | run_id=%s", run_id)
         raise
 
-def calculate_match_percentage(results: list) -> float | None:
-    """
-    Calculate percentage of comparison items with status 'Match'.
-    """
 
+def calculate_match_percentage(results: list) -> float | None:
     if not results:
         return None
-
-    matches = sum(
-        1
-        for result in results
-        if result.get("status") == "Match"
-    )
-
-    return round(
-        (matches / len(results)) * 100,
-        2,
-    )
+    matches = sum(1 for result in results if result.get("status") == "Match")
+    return round((matches / len(results)) * 100, 2)
 
 
-def build_comparison_summary(
-    filter_comparison,
-    kpi_comparison,
-    visual_comparison,
-) -> dict:
-    """
-    Build dashboard-level comparison summary.
+def build_comparison_summary(filter_comparison, kpi_comparison, visual_comparison) -> dict:
+    logger.info("Building dashboard comparison summary")
+    
+    filter_percentage = calculate_match_percentage(filter_comparison)
+    kpi_percentage = calculate_match_percentage(kpi_comparison)
+    visual_percentage = calculate_match_percentage(visual_comparison)
 
-    Jagruthi: skip empty KPI/visual buckets when computing overall match %.
-    """
-
-    logger.info(
-        "Building dashboard comparison summary"
-    )
-
-    filter_percentage = calculate_match_percentage(
-        filter_comparison
-    )
-    kpi_percentage = calculate_match_percentage(
-        kpi_comparison
-    )
-    visual_percentage = calculate_match_percentage(
-        visual_comparison
-    )
-
-    scored = [
-        value
-        for value in (filter_percentage, kpi_percentage, visual_percentage)
-        if value is not None
-    ]
+    scored = [value for value in (filter_percentage, kpi_percentage, visual_percentage) if value is not None]
     overall_percentage = round(sum(scored) / len(scored), 2) if scored else 0.0
 
     return {

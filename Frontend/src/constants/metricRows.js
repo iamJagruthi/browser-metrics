@@ -9,6 +9,7 @@ import {
   Monitor,
   Search,
   AlertCircle,
+  Filter,
 } from 'lucide-react';
 
 export const METRIC_ROWS = [
@@ -16,6 +17,7 @@ export const METRIC_ROWS = [
   { key: 'browser_launch_seconds', label: 'Browser Launch', icon: Globe, unit: 's' },
   { key: 'page_load_seconds', label: 'Page Load', icon: Clock3, unit: 's' },
   { key: 'dashboard_render_seconds', label: 'Dashboard Render', icon: Monitor, unit: 's' },
+  { key: 'filter_dashboard_render_seconds', label: 'Filter Dashboard Render', icon: Filter, unit: 's' },
   { key: 'screenshot_seconds', label: 'Screenshot Time', icon: Camera, unit: 's' },
   { key: 'total_execution_seconds', label: 'Total Execution', icon: Activity, unit: 's' },
   { key: 'total_requests', label: 'Total Requests', icon: BarChart3 },

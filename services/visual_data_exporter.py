@@ -13,6 +13,7 @@ Responsibilities:
 
 from __future__ import annotations
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -64,6 +65,36 @@ class VisualDataExporter:
                     const noise =
                         /^(more options|focus mode|drill down|drill up|expand|see more)$/i;
 
+                    // Split "50 Last Year: 45(+11%)" into current value, last period, and %.
+                    const parseKpiParts = (title, rawValue) => {
+                        const text = clean(rawValue);
+                        let value = text;
+                        let previous_value = null;
+                        let variance = null;
+
+                        const lastYear = text.match(/last\\s*year\\s*:?\\s*([^\\n]+)/i);
+                        if (lastYear) {
+                            previous_value = clean(lastYear[1].replace(/\\([^)]*\\)/g, ''));
+                            value = clean(text.slice(0, lastYear.index));
+                        }
+                        const varMatch = text.match(/\\(([+-]?\\d+(?:\\.\\d+)?%?)\\)/);
+                        if (varMatch) variance = varMatch[1];
+                        if (title && value) {
+                            value = clean(value.replace(title, ''));
+                        }
+                        return { value, previous_value, variance };
+                    };
+
+                    // Higher score = we found a real title and a real callout number.
+                    const kpiConfidence = ({ title, value, previous_value, usedCallout }) => {
+                        let score = 0.45;
+                        if (title && !/^KPI Card /i.test(title)) score += 0.2;
+                        if (usedCallout) score += 0.25;
+                        else if (/[$€£¥%]|\\d/.test(value || '')) score += 0.1;
+                        if (previous_value) score += 0.1;
+                        return Math.min(0.99, Math.round(score * 100) / 100);
+                    };
+
                     const visuals = [
                         ...document.querySelectorAll(
                             '.visualContainer, [data-visual-container]'
@@ -84,18 +115,31 @@ class VisualDataExporter:
                             .join(' ')
                             .toLowerCase();
 
-                        if (
-                            /slicer|dropdown|button|table|matrix|legend|axis|tooltip/i
-                                .test(typeSource)
-                        ) {
+                        // Skip filters, tables, charts — those are not KPI cards.
+                        // Note: We don't skip "button" here because some KPIs may have button-like elements.
+                        if (/slicer|dropdown|table|matrix|columnchart|barchart|linechart|pie|donut|scatter/i.test(typeSource)) {
                             continue;
                         }
 
-                        const explicitCard =
-                            /card|kpi|callout|multirowcard/i.test(typeSource);
+                        // Skip button slicers — those are not KPI cards.
+                        const buttonNodes = [...visual.querySelectorAll(
+                            '[role="button"], button, .buttonSlicerVisual, [class*="buttonSlicer" i]'
+                        )].filter(el => {
+                            const label = clean(el.innerText || el.getAttribute('aria-label'));
+                            return label && !chrome.test(label);
+                        });
 
+                        const isButtonSlicer =
+                            /buttonslicer|chicletslicer/i.test(typeSource)
+                            || (buttonNodes.length >= 2 && /slicer|button/i.test(typeSource));
+
+                        if (isButtonSlicer) {
+                            continue;
+                        }
+
+                        // TITLE EXTRACTION
                         const titleNode = visual.querySelector(
-                            '.visualTitle, [class*="visualTitle" i], [data-visual-title]'
+                            '.visualTitle, [class*="visualTitle" i], [data-visual-title], [class*="title" i]'
                         );
 
                         let title =
@@ -106,61 +150,103 @@ class VisualDataExporter:
                             title = clean(visual.getAttribute('aria-label'));
                         }
 
-                        if (!title || noise.test(title)) {
+                        if (title && noise.test(title)) {
                             continue;
                         }
 
+                        // EXPANDED SELECTORS FOR POWER BI CARD / KPI VALUES
                         const valueSelectors = [
                             '[class*="calloutValue" i]',
                             '[class*="callout-value" i]',
+                            '[class*="callout" i]',
                             '[class*="value-label" i]',
                             '[class*="dataLabel" i]',
                             '[class*="cardValue" i]',
-                            '[class*="kpiValue" i]'
+                            '[class*="kpiValue" i]',
+                            '[class*="value" i]',
+                            'text.value',
+                            'div.value'
                         ];
 
                         let valueNode = null;
 
                         for (const selector of valueSelectors) {
-                            const candidate =
-                                visual.querySelector(selector);
-
+                            const candidate = visual.querySelector(selector);
                             if (candidate && getText(candidate)) {
                                 valueNode = candidate;
                                 break;
                             }
                         }
 
-                        if (!valueNode && explicitCard) {
-                            const candidates = [
-                                ...visual.querySelectorAll(
-                                    '[class*="value" i], [class*="metric" i]'
-                                )
-                            ].filter(element => {
-                                const text = getText(element);
+                        let value = getText(valueNode);
 
-                                return (
-                                    text &&
-                                    text !== title &&
-                                    text.length <= 150
-                                );
-                            });
+                        // GENERAL FALLBACK: EXTRACT NUMERIC / CURRENCY TEXT FROM VISUAL
+                        if (!value) {
+                            // Find elements containing digits, percentages, or currency symbols
+                            const allNodes = [...visual.querySelectorAll('span, div, text, p')];
+                            const numericRegex = /[$€£¥%\\d]/;
 
-                            valueNode = candidates[0] || null;
+                            for (const node of allNodes) {
+                                const nodeText = getText(node);
+                                if (
+                                    nodeText &&
+                                    numericRegex.test(nodeText) &&
+                                    nodeText !== title &&
+                                    !noise.test(nodeText) &&
+                                    nodeText.length < 50
+                                ) {
+                                    value = nodeText;
+                                    break;
+                                }
+                            }
                         }
 
-                        const value = getText(valueNode);
+                        // LAST RESORT FALLBACK: RAW TEXT DIFFERENCE
+                        if (!value) {
+                            let allText = clean(visual.innerText || visual.textContent || "");
+                            if (title) {
+                                allText = allText.replace(title, "").trim();
+                            }
+
+                            if (!allText) {
+                                const svgTexts = [...visual.querySelectorAll('svg text, [role="graphics-symbol"]')];
+                                for (const t of svgTexts) {
+                                    const tVal = clean(t.textContent || t.getAttribute('aria-label'));
+                                    if (tVal && tVal !== title && !noise.test(tVal)) {
+                                        allText = tVal;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            value = allText;
+                        }
 
                         if (!value) {
                             continue;
                         }
 
+                        if (value.length > 100) {
+                            value = value.substring(0, 100).trim() + "...";
+                        }
+
+                        const finalTitle = title || `KPI Card ${cards.length + 1}`;
+                        const parts = parseKpiParts(title, value);
+                        const usedCallout = Boolean(valueNode);
+
+                        // Keep name, value, previous, variance, and a 0-1 confidence score.
+                        // Do not store extraction_source — everything here is DOM.
                         cards.push({
-                            name: title,
-                            value,
-                            previous_value: null,
-                            variance: null,
-                            extraction_source: 'dom'
+                            name: finalTitle,
+                            value: parts.value,
+                            previous_value: parts.previous_value,
+                            variance: parts.variance,
+                            confidence: kpiConfidence({
+                                title: finalTitle,
+                                value: parts.value,
+                                previous_value: parts.previous_value,
+                                usedCallout,
+                            }),
                         });
                     }
 
@@ -207,6 +293,98 @@ class VisualDataExporter:
 
         except Exception:
             logger.exception("Unable to extract DOM KPI cards")
+            return []
+
+    async def _extract_button_groups(self) -> list[dict[str, Any]]:
+        """Read button slicers (Overall, names, chips) and which option is selected."""
+        try:
+            groups = await self.page.evaluate(
+                r"""() => {
+                    const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
+                    // Hide Power BI chrome so scroll arrows are not treated as filters.
+                    const chrome = /^(more options|focus mode|scroll up|scroll down|scroll left|scroll right|search)$/i;
+
+                    const isSelected = el => {
+                        const pressed = (el.getAttribute('aria-pressed') || '').toLowerCase();
+                        const checked = (el.getAttribute('aria-checked') || '').toLowerCase();
+                        const selected = (el.getAttribute('aria-selected') || '').toLowerCase();
+                        const cls = String(el.className || '');
+                        return pressed === 'true' || checked === 'true' || selected === 'true'
+                            || /\b(selected|isSelected|slicer-selected|checked)\b/i.test(cls);
+                    };
+
+                    const visuals = [...document.querySelectorAll('.visualContainer, [data-visual-container]')];
+                    const results = [];
+
+                    for (const visual of visuals) {
+                        const typeSource = [
+                            visual.getAttribute('data-visual-type'),
+                            visual.getAttribute('aria-roledescription'),
+                            visual.className,
+                        ].filter(Boolean).join(' ').toLowerCase();
+
+                        const buttonNodes = [...visual.querySelectorAll(
+                            '[role="button"], button, .buttonSlicerVisual, [class*="buttonSlicer" i]'
+                        )].filter(el => {
+                            const label = clean(el.innerText || el.getAttribute('aria-label'));
+                            return label && !chrome.test(label);
+                        });
+
+                        const looksLikeButtonSlicer =
+                            /buttonslicer|chicletslicer|slicer/i.test(typeSource)
+                            || buttonNodes.length >= 2;
+
+                        // Skip bookmark / nav action buttons. Keep real button slicers.
+                        if (!looksLikeButtonSlicer || /actionbutton|shape/i.test(typeSource)) {
+                            continue;
+                        }
+
+                        const titleNode = visual.querySelector(
+                            '.visualTitle, [class*="visualTitle" i], [data-visual-title]'
+                        );
+                        let name = clean(titleNode && (titleNode.innerText || titleNode.getAttribute('aria-label')));
+                        if (!name) name = clean(visual.getAttribute('aria-label')) || 'Button group';
+
+                        const seen = new Set();
+                        const options = [];
+                        for (const el of buttonNodes) {
+                            const label = clean(el.innerText || el.getAttribute('aria-label'));
+                            const key = label.toLowerCase();
+                            if (!label || seen.has(key)) continue;
+                            seen.add(key);
+                            options.push({
+                                label,
+                                selected: isSelected(el),
+                                control_type: 'button',
+                            });
+                        }
+                        if (!options.length) continue;
+
+                        const selected_values = options.filter(o => o.selected).map(o => o.label);
+                        const available_values = options.map(o => o.label);
+                        // More options + a selected chip = more confident reading.
+                        let confidence = 0.55;
+                        if (options.length >= 2) confidence += 0.2;
+                        if (selected_values.length) confidence += 0.2;
+                        if (selected_values.length > 0 && selected_values.length < options.length) confidence += 0.05;
+
+                        results.push({
+                            name,
+                            filter_type: 'Buttons',
+                            selected_values,
+                            available_values,
+                            options,
+                            buttons: options.map(o => ({ label: o.label, selected: o.selected })),
+                            confidence: Math.min(0.99, Math.round(confidence * 100) / 100),
+                        });
+                    }
+                    return results;
+                }"""
+            )
+            logger.info("Button group extraction completed | groups=%d", len(groups or []))
+            return groups or []
+        except Exception:
+            logger.exception("Unable to extract button groups")
             return []
 
     async def _inspect_visual(
@@ -259,10 +437,30 @@ class VisualDataExporter:
 
                     const typeSource = typeAttributes.join(' ');
 
-                    // VISUAL TYPE DETECTION
-                    const isButton =
-                        /button|bookmark|navigation/i.test(typeSource) ||
-                        node.matches('button, [role="button"], [class*="button" i], [data-visual-type*="actionButton" i]');
+                    const chromeButton = /^(more options|focus mode|scroll up|scroll down|scroll left|scroll right|search)$/i;
+
+                    const isSelected = el => {
+                        const pressed = (el.getAttribute('aria-pressed') || '').toLowerCase();
+                        const checked = (el.getAttribute('aria-checked') || '').toLowerCase();
+                        const selected = (el.getAttribute('aria-selected') || '').toLowerCase();
+                        return pressed === 'true' || checked === 'true' || selected === 'true'
+                            || /\b(selected|isSelected|slicer-selected|checked)\b/i.test(String(el.className || ''));
+                    };
+
+                    const buttonNodes = [...node.querySelectorAll(
+                        '[role="button"], button, .buttonSlicerVisual, [class*="buttonSlicer" i]'
+                    )].filter(el => {
+                        const label = clean(el.innerText || el.getAttribute('aria-label'));
+                        return label && !chromeButton.test(label);
+                    });
+
+                    // Bookmark/nav = action button. Name chips like Overall = button slicer.
+                    const isActionButton = /actionbutton|bookmark|navigation/i.test(typeSource);
+                    const isButtonSlicer =
+                        /buttonslicer|chicletslicer/i.test(typeSource)
+                        || Boolean(node.querySelector('.buttonSlicerVisual, [class*="buttonSlicer" i]'))
+                        || (buttonNodes.length >= 2 && /slicer|button/i.test(typeSource));
+                    const isButton = isButtonSlicer && !isActionButton;
 
                     const isDropdown =
                         /dropdown/i.test(typeSource) ||
@@ -474,6 +672,22 @@ class VisualDataExporter:
                         /\bvisuals?\s+are\s+loading\b/i.test(loadingText) ||
                         /^loading(\.{3}|…)?$/i.test(loadingText);
 
+                    const buttonLabels = buttonNodes.map(el => clean(el.innerText || el.getAttribute('aria-label'))).filter(Boolean);
+                    const selectedValues = buttonNodes
+                        .filter(isSelected)
+                        .map(el => clean(el.innerText || el.getAttribute('aria-label')))
+                        .filter(Boolean);
+
+                    // Score how sure we are this visual was read correctly from the page.
+                    let confidence = 0.4;
+                    if (title && !/^Visual \d+$/i.test(title)) confidence += 0.2;
+                    const knownType = clean(node.getAttribute('data-visual-type') || node.getAttribute('aria-roledescription'));
+                    if (knownType && knownType !== 'unknown') confidence += 0.15;
+                    if (domContent.length >= 2) confidence += 0.15;
+                    if ((accessibleText || '').length > 20) confidence += 0.1;
+                    if (isButton && selectedValues.length) confidence = Math.max(confidence, 0.75);
+                    confidence = Math.min(0.99, Math.round(confidence * 100) / 100);
+
                     return {
                         id: node.getAttribute('data-visual-id') || node.id || `visual-${index + 1}`,
                         index: index,
@@ -502,7 +716,19 @@ class VisualDataExporter:
                         is_matrix: Boolean(isMatrix),
                         scrollable: Boolean(scrollable),
                         horizontally_scrollable: Boolean(horizontallyScrollable),
-                        is_loading_placeholder: Boolean(isLoadingPlaceholder)
+                        is_loading_placeholder: Boolean(isLoadingPlaceholder),
+                        selected_values: selectedValues,
+                        available_values: buttonLabels,
+                        options: buttonLabels.map(label => ({
+                            label,
+                            selected: selectedValues.includes(label),
+                            control_type: 'button',
+                        })),
+                        buttons: buttonLabels.map(label => ({
+                            label,
+                            selected: selectedValues.includes(label),
+                        })),
+                        confidence,
                     };
                 }""",
                 index,
@@ -527,6 +753,9 @@ class VisualDataExporter:
                 "scrollable": False,
                 "horizontally_scrollable": False,
                 "is_loading_placeholder": False,
+                "confidence": 0.3,
+                "selected_values": [],
+                "available_values": [],
                 "inspection_error": str(exc),
             }
 
@@ -536,6 +765,7 @@ class VisualDataExporter:
             "status": "success",
             "extracted_at": datetime.now(timezone.utc).isoformat(),
             "kpi_cards": [],
+            "button_groups": [],
             "visuals": [],
             "table_visuals": [],
             "table_exports": [],
@@ -544,16 +774,25 @@ class VisualDataExporter:
         }
 
         logger.info("Starting dashboard DOM extraction")
+        VISUAL_SELECTOR = ".visualContainer, [data-visual-container]"
 
         # KPI EXTRACTION
         try:
-            VISUAL_SELECTOR = ".visualContainer, [data-visual-container]"
             result["kpi_cards"] = await self._extract_kpi_cards()
             logger.info("KPI extraction completed | kpis=%d", len(result["kpi_cards"]))
         except Exception as exc:
             logger.exception("KPI extraction failed")
             result["status"] = "partial"
             result["errors"].append(f"KPI extraction failed: {exc}")
+
+        # BUTTON SLICERS (selected chips like Overall / names)
+        try:
+            result["button_groups"] = await self._extract_button_groups()
+            logger.info("Button extraction completed | groups=%d", len(result["button_groups"]))
+        except Exception as exc:
+            logger.exception("Button extraction failed")
+            result["status"] = "partial"
+            result["errors"].append(f"Button extraction failed: {exc}")
 
         # LOCATE VISUALS
         try:
@@ -589,16 +828,110 @@ class VisualDataExporter:
                     result["skipped_visuals"].append({"index": index + 1, "reason": "loading_placeholder", "title": visual.get("title")})
                     continue
 
-                # KPI / CARD
+                # KPI / CARD — already stored in kpi_cards; do not treat as a chart.
                 if visual.get("is_kpi_or_card"):
-                    logger.info("Skipping KPI/card visual from visual extraction | index=%d | title=%s", index + 1, visual.get("title"))
+                    # Check if this KPI was already captured by _extract_kpi_cards
+                    visual_title = str(visual.get("title") or "").casefold()
+                    kpi_already_captured = any(
+                        str(kpi.get("name") or "").casefold() == visual_title
+                        for kpi in result["kpi_cards"]
+                    )
+                    
+                    if not kpi_already_captured:
+                        # Gap detected: KPI visual not captured by _extract_kpi_cards
+                        # Extract KPI data from the visual inspection result
+                        logger.info(
+                            "KPI gap detected | index=%d | title=%s | extracting from visual inspection",
+                            index + 1,
+                            visual.get("title"),
+                        )
+                        
+                        # Try to extract the KPI value from dom_content or accessible_text
+                        kpi_value = None
+                        dom_content = visual.get("dom_content", [])
+                        
+                        # Look for numeric values in dom_content
+                        numeric_pattern = re.compile(r'[$€£¥%\d]')
+                        for item in dom_content:
+                            text = str(item.get("text", "") or "")
+                            if text and numeric_pattern.search(text) and len(text) < 50:
+                                kpi_value = text
+                                break
+                        
+                        # If no value found in dom_content, try accessible_text
+                        if not kpi_value:
+                            accessible_text = str(visual.get("accessible_text", "") or "")
+                            # Extract the first non-empty line
+                            for line in accessible_text.split("\n"):
+                                line = line.strip()
+                                if line:
+                                    kpi_value = line[:100]
+                                    break
+                        
+                        # Add the KPI to kpi_cards if we found a value
+                        if kpi_value:
+                            result["kpi_cards"].append({
+                                "name": visual.get("title"),
+                                "value": kpi_value,
+                                "previous_value": None,
+                                "variance": None,
+                                "confidence": visual.get("confidence", 0.5),
+                            })
+                            logger.info(
+                                "KPI gap filled | index=%d | title=%s | value=%s",
+                                index + 1,
+                                visual.get("title"),
+                                kpi_value,
+                            )
+                        else:
+                            logger.warning(
+                                "KPI gap could not be filled | index=%d | title=%s | no value found",
+                                index + 1,
+                                visual.get("title"),
+                            )
+                    
                     result["skipped_visuals"].append({"index": index + 1, "reason": "kpi_or_card", "title": visual.get("title")})
                     continue
 
-                # BUTTON
+                # BUTTON SLICER — keep selected options; do not treat as a chart.
                 if visual.get("is_button"):
-                    logger.info("Skipping button from visual extraction | index=%d | title=%s", index + 1, visual.get("title"))
-                    result["skipped_visuals"].append({"index": index + 1, "reason": "button", "title": visual.get("title")})
+                    visual_title = str(visual.get("title") or "").casefold()
+                    visual_available = set(visual.get("available_values") or [])
+                    
+                    # Check if this button group was already captured
+                    # Match by name OR by available values (to handle name variations)
+                    already = any(
+                        str(item.get("name") or "").casefold() == visual_title
+                        or (
+                            visual_available
+                            and set(item.get("available_values") or []) == visual_available
+                        )
+                        for item in result["button_groups"]
+                    )
+                    
+                    if not already:
+                        # Gap detected: button visual not captured by _extract_button_groups
+                        logger.info(
+                            "Button gap detected | index=%d | title=%s | adding from visual inspection",
+                            index + 1,
+                            visual.get("title"),
+                        )
+                        result["button_groups"].append({
+                            "name": visual.get("title"),
+                            "filter_type": "Buttons",
+                            "selected_values": visual.get("selected_values") or [],
+                            "available_values": visual.get("available_values") or [],
+                            "options": visual.get("options") or [],
+                            "buttons": visual.get("buttons") or [],
+                            "confidence": visual.get("confidence"),
+                        })
+                    logger.info(
+                        "Captured button visual | index=%d | title=%s | selected=%s | confidence=%s",
+                        index + 1,
+                        visual.get("title"),
+                        visual.get("selected_values"),
+                        visual.get("confidence"),
+                    )
                     continue
 
                 # SLICER / DROPDOWN
@@ -641,8 +974,9 @@ class VisualDataExporter:
             logger.info("No table or matrix visuals detected | dashboard=%s", self.dashboard_name)
 
         logger.info(
-            "Dashboard DOM extraction completed | kpis=%d | visuals=%d | table_visuals=%d | table_exports=%d | skipped=%d | errors=%d",
+            "Dashboard DOM extraction completed | kpis=%d | buttons=%d | visuals=%d | table_visuals=%d | table_exports=%d | skipped=%d | errors=%d",
             len(result["kpi_cards"]),
+            len(result["button_groups"]),
             len(result["visuals"]),
             len(result["table_visuals"]),
             len(result["table_exports"]),

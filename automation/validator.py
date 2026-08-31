@@ -3,9 +3,10 @@
 import asyncio
 import json
 import logging
+import time
 import uuid
 
-from .browser import launch_browser, wait_for_dashboard
+from .browser import capture_dashboard_snapshot, launch_browser, wait_for_dashboard
 from .network import clear, details, register, summary
 from .performance import PerformanceTimer
 from .metrics import build_metrics
@@ -46,6 +47,7 @@ class DashboardValidator:
         context=None,
         page=None,
         filter_selections=None,
+        browser_launch_elapsed=0.0,
     ):
         """Run one dashboard in a supplied authenticated Edge tab when available.
 
@@ -67,10 +69,15 @@ class DashboardValidator:
             self.timer.reset()
             self.timer.start("total_execution")
 
+            # Compare runs launch Edge in run_links, then pass in `page`.
+            # Time that launch there and inject it here, otherwise this
+            # timer never starts and browser_launch_seconds stays 0.
             if page is None:
                 self.timer.start("browser_launch")
                 playwright, context, page = await launch_browser()
                 self.timer.stop("browser_launch")
+            elif browser_launch_elapsed:
+                self.timer.set_elapsed("browser_launch", browser_launch_elapsed)
 
             await register(page)
             page.set_default_timeout(PAGE_TIMEOUT)
@@ -183,18 +190,12 @@ class DashboardValidator:
 
             self.timer.stop("total_execution")
 
-            metrics = build_metrics(
-                dashboard_name=dashboard["name"],
-                dashboard_url=dashboard["url"],
-                timers=self.timer.summary(),
-                network_summary=summary(),
-                network_details=details(),
-                page_title=await page.title(),
-                final_url=page.url,
-                http_status=response.status if response else None,
+            metrics = await self._capture_metrics(
+                dashboard,
+                page,
+                response,
+                screenshot_path=screenshot_path,
             )
-
-            metrics["screenshot_path"] = str(screenshot_path)
             metrics["extraction_status"] = extraction["status"]
             if extraction.get("error"):
                 metrics["extraction_error"] = extraction["error"]
@@ -231,7 +232,35 @@ class DashboardValidator:
             "filters": visual_data.get("filters", []),
             "kpi_cards": visual_data.get("kpi_cards", []),
             "visuals": visual_data.get("visuals", []),
+            "button_groups": visual_data.get("button_groups", []),
+            "table_exports": visual_data.get("table_exports", []),
         }
+
+    async def _capture_metrics(
+        self,
+        dashboard,
+        page,
+        response,
+        *,
+        page_name=None,
+        screenshot_path=None,
+    ) -> dict:
+        """Build the metrics dict that the API returns to the frontend."""
+        metrics = build_metrics(
+            dashboard_name=dashboard["name"],
+            dashboard_url=dashboard["url"],
+            timers=self.timer.summary(),
+            network_summary=summary(),
+            network_details=details(),
+            page_title=await page.title(),
+            final_url=page.url,
+            http_status=response.status if response else None,
+        )
+        if page_name:
+            metrics["page_name"] = page_name
+        if screenshot_path:
+            metrics["screenshot_path"] = str(screenshot_path)
+        return metrics
 
     async def run_links(self, links):
         """Validate source/target URLs and return data suitable for the API/frontend."""
@@ -268,7 +297,13 @@ class DashboardValidator:
         try:
             # A persistent Edge profile can only be launched once at a time.
             # Reuse one authenticated context and open the dashboards in tabs.
+            launch_started = time.perf_counter()
             playwright, context, first_page = await launch_browser()
+            browser_launch_elapsed = time.perf_counter() - launch_started
+            logger.info(
+                "Browser launch completed | elapsed=%.3f seconds",
+                browser_launch_elapsed,
+            )
             resources.append((playwright, context))
 
             for index, dashboard in enumerate(links):
@@ -285,6 +320,7 @@ class DashboardValidator:
                         context=context,
                         page=page,
                         filter_selections=source_filter_selections,
+                        browser_launch_elapsed=browser_launch_elapsed,
                     )
 
                     if index == 0:
@@ -980,23 +1016,22 @@ class DashboardValidator:
         # STEP 1: Process the default (unfiltered) page state
         # ---------------------------------------------------------
 
-        # Extract visual data from DOM (if available)
+        logger.info("Waiting for visual containers to stay stable before extraction")
+        await wait_for_dashboard(page)
+
         default_visual_data = await extract_visual_data(page, attempt_export=False)
-        # default_ai_data = await asyncio.to_thread(extract_dashboard_json, default_screenshot)
-
-        # default_ai_data = await asyncio.to_thread(
-        #     extract_dashboard_json,
-        #     default_screenshot,
-        # )
-
-        # Export Table/Matrix visuals from the current dashboard state
         default_tables = await export_table_visuals(
             page,
             default_visual_data.get("table_visuals", []),
             dashboard["name"],
         )
+        default_metrics = await self._capture_metrics(
+            dashboard,
+            page,
+            response,
+            page_name=page_name,
+        )
 
-        # Structure as standard execution payload
         executions.append({
             "dashboard": {
                 **dashboard,
@@ -1010,7 +1045,7 @@ class DashboardValidator:
                 "data": None,
                 "error": None},
             "visual_data": default_visual_data,
-
+            "metrics": default_metrics,
             "tables": default_tables,
             "_page": page,
         })
@@ -1032,6 +1067,8 @@ class DashboardValidator:
             filters_to_apply = [(f_name, None) for f_name in detected_filters[:2]]
 
         for f_name, predetermined_value in filters_to_apply:
+            previous_snapshot = await capture_dashboard_snapshot(page)
+
             if predetermined_value is not None:
                 logger.info(f"Reproducing filter on target: {f_name} = '{predetermined_value}'")
                 success = await engine.apply_filter(f_name, predetermined_value)
@@ -1086,7 +1123,7 @@ class DashboardValidator:
             )
             self.timer.start("filter_dashboard_render")
             logger.info("Waiting for Power BI visuals to recalculate...")
-            await wait_for_dashboard(page)
+            await wait_for_dashboard(page, previous_snapshot=previous_snapshot)
             self.timer.stop("filter_dashboard_render")
 
             filtered_screenshot = (
@@ -1116,6 +1153,13 @@ class DashboardValidator:
                 "visual_data": filtered_visual_data,
                 "screenshot": str(filtered_screenshot),
                 "tables": filtered_tables,
+                "metrics": await self._capture_metrics(
+                    dashboard,
+                    page,
+                    response,
+                    page_name=page_name,
+                    screenshot_path=filtered_screenshot,
+                ),
                 "_page": page,
             })
 

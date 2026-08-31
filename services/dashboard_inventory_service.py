@@ -1,7 +1,7 @@
 """Dashboard inventory for API consumers — filters (with selection) and visual counts.
 
-Jagruthi — frontend-ready payload for filter state and visuals inventory
-(tables, matrices, KPIs, chart types) per dashboard.
+Pure DOM Extraction Mode — No Gemini/AI dependencies.
+Provides frontend, Excel exporter, and Word reporter payloads.
 """
 
 from __future__ import annotations
@@ -28,8 +28,8 @@ _CHART_TYPE_ALIASES = {
     "table": ("table", "grid"),
     "matrix": ("matrix", "pivot"),
     "treemap": ("treemap", "tree map"),
-    "funnel": ("funnel"),
-    "waterfall": ("waterfall"),
+    "funnel": ("funnel",),
+    "waterfall": ("waterfall",),
 }
 
 
@@ -55,8 +55,10 @@ def _classify_dom_visual(visual: dict[str, Any]) -> str:
     if visual.get("is_slicer"):
         return "slicer"
     type_source = str(visual.get("visual_type", "")).casefold()
-    if "matrix" in type_source or "pivot" in type_source:
+    if visual.get("is_matrix") or "matrix" in type_source or "pivot" in type_source:
         return "matrix"
+    if visual.get("is_table") or "table" in type_source:
+        return "table"
     data = visual.get("data") or {}
     if data.get("rows") or data.get("columns"):
         return "table"
@@ -65,7 +67,6 @@ def _classify_dom_visual(visual: dict[str, Any]) -> str:
 
 def _count_inventory_for_execution(execution: dict[str, Any]) -> dict[str, Any]:
     visual_data = execution.get("visual_data") or {}
-    extraction_data = (execution.get("extraction") or {}).get("data") or {}
 
     chart_types = _empty_chart_types()
     tables = 0
@@ -75,6 +76,7 @@ def _count_inventory_for_execution(execution: dict[str, Any]) -> dict[str, Any]:
     other = 0
     skipped = 0
 
+    # 1. Standard DOM Visuals
     for visual in visual_data.get("visuals", []):
         if visual.get("is_loading_placeholder"):
             skipped += 1
@@ -98,24 +100,21 @@ def _count_inventory_for_execution(execution: dict[str, Any]) -> dict[str, Any]:
             chart_types[bucket] += 1
             dom_charts += 1
 
+    # 2. DOM Table/Matrix Visuals
+    table_visuals = visual_data.get("table_visuals", []) or visual_data.get("table_exports", [])
+    for table_vis in table_visuals:
+        if table_vis.get("is_matrix"):
+            matrices += 1
+        else:
+            tables += 1
+
     skipped += len(visual_data.get("skipped_visuals", []))
 
-    gemini_charts = 0
-    for chart in extraction_data.get("charts", []):
-        bucket = _normalize_chart_bucket(chart.get("chart_type"))
-        chart_types[bucket] += 1
-        gemini_charts += 1
-
-    gemini_tables = len(extraction_data.get("tables", []))
-    dom_tabular = tables + matrices
-    if gemini_tables > dom_tabular:
-        tables += gemini_tables - dom_tabular
-
+    # 3. DOM KPIs
     dom_kpis = visual_data.get("kpi_cards", []) or []
-    gemini_kpis = extraction_data.get("kpi_cards", []) or []
     kpi_names = {
         _kpi_key(item.get("name"))
-        for item in dom_kpis + gemini_kpis
+        for item in dom_kpis
         if item.get("name")
     }
     kpi_count = len(kpi_names)
@@ -124,8 +123,8 @@ def _count_inventory_for_execution(execution: dict[str, Any]) -> dict[str, Any]:
     filter_count = len(visual_data.get("filters", []))
     total_visuals = kpi_count + tables + matrices + chart_count + other
 
-    metadata = extraction_data.get("metadata") or {}
     dashboard = execution.get("dashboard") or {}
+    metadata = visual_data.get("metadata") or {}
 
     return {
         "filter_count": filter_count,
@@ -138,25 +137,21 @@ def _count_inventory_for_execution(execution: dict[str, Any]) -> dict[str, Any]:
         "other_visual_count": other,
         "total_visuals": total_visuals,
         "dom_visual_count": len(visual_data.get("visuals", [])),
-        "gemini_chart_count": gemini_charts,
-        "gemini_table_count": gemini_tables,
         "skipped_visual_count": skipped,
         "page_name": dashboard.get("page_name") or metadata.get("page_name"),
         "page_number": metadata.get("page_number"),
         "refresh_date": metadata.get("data_refresh_date"),
-        "dashboard_title": metadata.get("dashboard_title"),
+        "dashboard_title": dashboard.get("name") or metadata.get("dashboard_title"),
     }
 
 
 def _list_kpis_for_execution(execution: dict[str, Any]) -> list[dict[str, Any]]:
-    """Jagruthi — merged DOM + Gemini KPI cards for page showcase and reports."""
+    """DOM KPI cards for page showcase, Excel, and Word reports."""
     visual_data = execution.get("visual_data") or {}
-    extraction_data = (execution.get("extraction") or {}).get("data") or {}
     seen: set[str] = set()
     kpis: list[dict[str, Any]] = []
 
     dom_kpis = visual_data.get("kpi_cards", []) or []
-    gemini_kpis = extraction_data.get("kpi_cards", []) or []
 
     for item in dom_kpis:
         name = item.get("name")
@@ -173,62 +168,46 @@ def _list_kpis_for_execution(execution: dict[str, Any]) -> list[dict[str, Any]]:
                 "extraction_source": "dom",
             }
         )
-
-    for item in gemini_kpis:
-        name = item.get("name")
-        key = _kpi_key(name)
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        kpis.append(
-            {
-                "name": name,
-                "value": item.get("value"),
-                "previous_value": item.get("previous_value"),
-                "variance": item.get("variance"),
-                "extraction_source": "gemini",
-            }
-        )
     return kpis
 
 
 def _list_visuals_for_execution(execution: dict[str, Any]) -> list[dict[str, Any]]:
-    """Jagruthi — DOM visual inventory list (title, type, slicer flag)."""
+    """DOM visual inventory list (title, type, category, slicer flag)."""
     visual_data = execution.get("visual_data") or {}
-    extraction_data = (execution.get("extraction") or {}).get("data") or {}
     visuals: list[dict[str, Any]] = []
+    seen_titles: set[str] = set()
 
     for visual in visual_data.get("visuals", []):
         if visual.get("is_loading_placeholder"):
             continue
+        title = visual.get("title") or visual.get("name")
+        title_key = " ".join(str(title or "").casefold().split())
+        if title_key:
+            seen_titles.add(title_key)
         visuals.append(
             {
-                "title": visual.get("title") or visual.get("name"),
+                "title": title,
                 "visual_type": visual.get("visual_type"),
                 "category": _classify_dom_visual(visual),
                 "is_slicer": bool(visual.get("is_slicer")),
+                "extraction_source": "dom",
             }
         )
 
-    for chart in extraction_data.get("charts", []):
+    table_visuals = visual_data.get("table_visuals", []) or visual_data.get("table_exports", [])
+    for table in table_visuals:
+        title = table.get("title") or table.get("name") or "Table"
+        title_key = " ".join(str(title).casefold().split())
+        if title_key in seen_titles:
+            continue
+        seen_titles.add(title_key)
         visuals.append(
             {
-                "title": chart.get("title") or chart.get("name"),
-                "visual_type": chart.get("chart_type"),
-                "category": _normalize_chart_bucket(chart.get("chart_type")),
+                "title": title,
+                "visual_type": table.get("visual_type") or "table",
+                "category": "matrix" if table.get("is_matrix") else "table",
                 "is_slicer": False,
-                "extraction_source": "gemini",
-            }
-        )
-
-    for table in extraction_data.get("tables", []):
-        visuals.append(
-            {
-                "title": table.get("title") or table.get("name"),
-                "visual_type": "table",
-                "category": "table",
-                "is_slicer": False,
-                "extraction_source": "gemini",
+                "extraction_source": "dom",
             }
         )
 
@@ -236,7 +215,7 @@ def _list_visuals_for_execution(execution: dict[str, Any]) -> list[dict[str, Any
 
 
 def build_page_showcase_entry(execution: dict[str, Any]) -> dict[str, Any]:
-    """Jagruthi — one report page: filters, KPIs, visuals, and inventory counts."""
+    """One report page: filters, KPIs, visuals, and inventory counts."""
     dashboard = execution.get("dashboard") or {}
     filters_section = build_dashboard_filters_payload(execution)
     inventory = _count_inventory_for_execution(execution)
@@ -259,7 +238,7 @@ def build_pages_showcase_payload(
     executions_by_dashboard: list[list[dict[str, Any]]] | None = None,
     run_id: str | None = None,
 ) -> dict[str, Any]:
-    """Jagruthi — multi-page showcase: page names, KPIs, visuals, and visual inventory."""
+    """Multi-page showcase: page names, KPIs, visuals, and visual inventory."""
     try:
         grouped = executions_by_dashboard or []
         if not grouped and executions:

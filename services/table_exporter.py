@@ -1516,25 +1516,29 @@ async def _export_visual(
             return result
 
         except Exception as exc:
-
             last_error = str(exc)
 
             logger.warning(
-                "Export attempt %s failed | "
-                "dashboard=%s | visual=%s | error=%s",
+                "Export attempt %s failed | dashboard=%s | visual=%s | error=%s",
                 attempt,
                 dashboard_name,
                 visual["title"],
                 exc,
             )
 
-            await _close_open_overlays(
-                page
-            )
+            # If the browser is completely dead, stop trying to export.
+            if "TargetClosedError" in str(exc) or "browser has been closed" in str(exc):
+                logger.error("Browser closed unexpectedly. Aborting export for this visual.")
+                break
 
-            await page.wait_for_timeout(
-                750
-            )
+            # Attempt graceful cleanup only if the browser is still alive
+            try:
+                await _close_open_overlays(page)
+                await page.wait_for_timeout(750)
+            except Exception as cleanup_exc:
+                logger.debug("Cleanup failed: %s", cleanup_exc)
+                if "TargetClosedError" in str(cleanup_exc) or "browser has been closed" in str(cleanup_exc):
+                    break
 
     result["error"] = (
         last_error
