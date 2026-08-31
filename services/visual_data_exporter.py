@@ -13,7 +13,6 @@ Responsibilities:
 
 from __future__ import annotations
 import logging
-import inspect
 from datetime import datetime, timezone
 from typing import Any
 
@@ -22,26 +21,19 @@ from services.table_exporter import export_table_visuals
 
 logger = logging.getLogger(__name__)
 
-VISUAL_SELECTOR = ".visualContainer, [data-visual-container]"
-
 
 class VisualDataExporter:
     """Extract KPI and visual information directly from the Power BI DOM."""
 
-    def __init__(self, page, dashboard_name: str = "Dashboard",):
+    def __init__(self, page, dashboard_name: str = "Dashboard"):
         self.page = page
         self.dashboard_name = dashboard_name
 
     async def _extract_kpi_cards(self) -> list[dict[str, Any]]:
-        """
-        Extract KPI/card values directly from the DOM.
-
-        This stays separate from graph/visual extraction.
-        """
+        """Extract KPI/card values directly from the DOM."""
         try:
             logger.info("Starting DOM KPI extraction")
 
-            # Useful diagnostic: how many Power BI visual containers exist?
             visual_count = await self.page.locator(
                 ".visualContainer, [data-visual-container]"
             ).count()
@@ -92,7 +84,6 @@ class VisualDataExporter:
                             .join(' ')
                             .toLowerCase();
 
-                        // Skip visuals that should not be treated as KPIs.
                         if (
                             /slicer|dropdown|button|table|matrix|legend|axis|tooltip/i
                                 .test(typeSource)
@@ -107,9 +98,13 @@ class VisualDataExporter:
                             '.visualTitle, [class*="visualTitle" i], [data-visual-title]'
                         );
 
-                        const title =
+                        let title =
                             getText(titleNode) ||
                             getText(visual.querySelector('[title]'));
+
+                        if (!title) {
+                            title = clean(visual.getAttribute('aria-label'));
+                        }
 
                         if (!title || noise.test(title)) {
                             continue;
@@ -126,8 +121,6 @@ class VisualDataExporter:
 
                         let valueNode = null;
 
-                        // First priority:
-                        // Look for known KPI/card value elements.
                         for (const selector of valueSelectors) {
                             const candidate =
                                 visual.querySelector(selector);
@@ -138,8 +131,6 @@ class VisualDataExporter:
                             }
                         }
 
-                        // Fallback only when this visual looks explicitly
-                        // like a KPI/card visual.
                         if (!valueNode && explicitCard) {
                             const candidates = [
                                 ...visual.querySelectorAll(
@@ -173,7 +164,6 @@ class VisualDataExporter:
                         });
                     }
 
-                    // Remove duplicate name/value pairs.
                     const unique = new Map();
 
                     for (const card of cards) {
@@ -203,20 +193,6 @@ class VisualDataExporter:
                 len(unique_cards),
             )
 
-            if raw_count > len(unique_cards):
-                logger.debug(
-                    "DOM KPI extraction | removed duplicate KPI entries=%d",
-                    raw_count - len(unique_cards),
-                )
-
-            # Debug only: avoids filling normal logs with every KPI.
-            for card in unique_cards:
-                logger.debug(
-                    "DOM KPI detected | name=%r | value=%r",
-                    card.get("name"),
-                    card.get("value"),
-                )
-
             if not unique_cards:
                 logger.warning(
                     "DOM KPI extraction completed but no KPI cards were detected"
@@ -238,21 +214,7 @@ class VisualDataExporter:
         locator,
         index: int,
     ) -> dict[str, Any]:
-        """
-        Inspect one Power BI visual and extract DOM-based metadata/content.
-
-        Responsibilities:
-        - Identify visual type and title.
-        - Detect KPI/card visuals.
-        - Detect slicers.
-        - Detect table/matrix/tabular visuals.
-        - Preserve scrollability metadata.
-        - Extract DOM-visible graph content.
-        - Do NOT compare source and target.
-        - Do NOT export table data here.
-        - Do NOT call AI/LLM.
-        """
-
+        """Inspect one Power BI visual and extract DOM-based metadata/content."""
         try:
             logger.debug(
                 "Inspecting visual | dashboard=%s | index=%d",
@@ -268,9 +230,7 @@ class VisualDataExporter:
                             .replace(/\s+/g, ' ')
                             .trim();
 
-
                     const getText = element => {
-
                         if (!element) return '';
 
                         return clean(
@@ -281,14 +241,12 @@ class VisualDataExporter:
                         );
                     };
 
-
                     const unique = values =>
                         [...new Set(
                             values
                                 .map(value => clean(value))
                                 .filter(Boolean)
                         )];
-
 
                     const typeAttributes = [
                         node.getAttribute('data-visual-type'),
@@ -299,42 +257,29 @@ class VisualDataExporter:
                             : ''
                     ].filter(Boolean);
 
-
                     const typeSource = typeAttributes.join(' ');
 
-
-                    // ------------------------------------------
                     // VISUAL TYPE DETECTION
-                    // ------------------------------------------
+                    const isButton =
+                        /button|bookmark|navigation/i.test(typeSource) ||
+                        node.matches('button, [role="button"], [class*="button" i], [data-visual-type*="actionButton" i]');
 
-                    const isKpiOrCard =
-                        /card|kpi|callout|multirowcard/i
-                            .test(typeSource);
-
+                    const isDropdown =
+                        /dropdown/i.test(typeSource) ||
+                        Boolean(node.querySelector('.dropdown, [class*="dropdown" i]'));
 
                     const isSlicer =
-                        /slicer/i.test(typeSource) ||
+                        (
+                            /slicer/i.test(typeSource) ||
+                            node.matches('.slicerContainer, [class*="slicer" i], [aria-label*="Slicer" i], [data-visual-type*="slicer" i]') ||
+                            Boolean(node.querySelector('.slicerContainer, [class*="slicer" i], [aria-label*="Slicer" i]')) ||
+                            isDropdown
+                        ) && !isButton;
 
-                        node.matches(
-                            '.slicerContainer, ' +
-                            '[class*="slicer" i], ' +
-                            '[aria-label*="Slicer" i], ' +
-                            '[data-visual-type*="slicer" i]'
-                        ) ||
+                    const isKpiOrCard =
+                        /card|kpi|callout|multirowcard/i.test(typeSource) && !isButton && !isSlicer;
 
-                        Boolean(
-                            node.querySelector(
-                                '.slicerContainer, ' +
-                                '[class*="slicer" i], ' +
-                                '[aria-label*="Slicer" i]'
-                            )
-                        );
-
-
-                    // ------------------------------------------
                     // TABLE / MATRIX DETECTION
-                    // ------------------------------------------
-
                     const visualType = clean(
                         node.getAttribute('data-visual-type')
                     ).toLowerCase();
@@ -356,11 +301,6 @@ class VisualDataExporter:
                                     : ''
                             )
                     ].join(' ');
-
-
-                    // ------------------------------------------
-                    // POWER BI TABULAR DOM SIGNALS
-                    // ------------------------------------------
 
                     const hasTableElement =
                         Boolean(
@@ -399,11 +339,6 @@ class VisualDataExporter:
                             )
                         );
 
-
-                    // ------------------------------------------
-                    // EXPLICIT TYPE DETECTION
-                    // ------------------------------------------
-
                     const isTable =
                         visualType === 'table' ||
                         ariaRoleDescription === 'table' ||
@@ -415,11 +350,6 @@ class VisualDataExporter:
                         ariaRoleDescription === 'matrix' ||
                         /\bmatrix\b/i.test(typeSource) ||
                         /\bmatrix\b/i.test(classSource);
-
-
-                    // ------------------------------------------
-                    // FINAL TABULAR DECISION
-                    // ------------------------------------------
 
                     const isTabular =
                         Boolean(
@@ -433,13 +363,13 @@ class VisualDataExporter:
                                     hasPowerBITabularClass
                                 ) &&
                                 !isSlicer &&
-                                !isKpiOrCard
+                                !isKpiOrCard &&
+                                !isButton &&
+                                !isDropdown
                             )
                         );
-                    // ------------------------------------------
-                    // TITLE EXTRACTION
-                    // ------------------------------------------
 
+                    // TITLE EXTRACTION
                     const titleSelectors = [
                         '.visualTitle',
                         '[class*="visualTitle" i]',
@@ -447,149 +377,53 @@ class VisualDataExporter:
                         '[class*="title" i]'
                     ];
 
-
                     let title = '';
 
                     for (const selector of titleSelectors) {
-
-                        const titleNode =
-                            node.querySelector(selector);
-
-                        const candidate =
-                            getText(titleNode);
-
+                        const titleNode = node.querySelector(selector);
+                        const candidate = getText(titleNode);
                         if (candidate) {
                             title = candidate;
                             break;
                         }
                     }
 
-
                     if (!title) {
-
-                        const labelled =
-                            clean(
-                                node.getAttribute(
-                                    'aria-label'
-                                )
-                            );
-
-                        if (labelled) {
-                            title = labelled;
-                        }
+                        const labelled = clean(node.getAttribute('aria-label'));
+                        if (labelled) title = labelled;
                     }
 
-
                     if (!title) {
-
-                        const titled =
-                            clean(
-                                node.getAttribute(
-                                    'title'
-                                )
-                            );
-
-                        if (titled) {
-                            title = titled;
-                        }
+                        const titled = clean(node.getAttribute('title'));
+                        if (titled) title = titled;
                     }
 
-
-                    // ------------------------------------------
                     // SCROLL DETECTION
-                    // ------------------------------------------
-
                     const canScrollY = element =>
-                        element.scrollHeight >
-                        element.clientHeight + 2;
-
+                        element.scrollHeight > element.clientHeight + 2;
 
                     const canScrollX = element =>
-                        element.scrollWidth >
-                        element.clientWidth + 2;
-
+                        element.scrollWidth > element.clientWidth + 2;
 
                     const grid = node.querySelector(
-                        '[role="grid"], ' +
-                        '[role="table"], ' +
-                        '.mid-viewport, ' +
-                        '[class*="scrollRegion" i]'
+                        '[role="grid"], [role="table"], .mid-viewport, [class*="scrollRegion" i]'
                     );
 
-
                     const scrollable =
-                        Boolean(
-                            grid &&
-                            canScrollY(grid)
-                        ) ||
-
-                        [...node.querySelectorAll('*')]
-                            .some(element => {
-
-                                const style =
-                                    getComputedStyle(element);
-
-                                return (
-                                    canScrollY(element) &&
-                                    /(auto|scroll|hidden)/i
-                                        .test(
-                                            style.overflowY
-                                        )
-                                );
-                            });
-
+                        Boolean(grid && canScrollY(grid)) ||
+                        [...node.querySelectorAll('*')].some(element => {
+                            const style = getComputedStyle(element);
+                            return canScrollY(element) && /(auto|scroll|hidden)/i.test(style.overflowY);
+                        });
 
                     const horizontallyScrollable =
-                        Boolean(
-                            grid &&
-                            canScrollX(grid)
-                        ) ||
+                        Boolean(grid && canScrollX(grid)) ||
+                        [...node.querySelectorAll('*')].some(element => {
+                            const style = getComputedStyle(element);
+                            return canScrollX(element) && /(auto|scroll|hidden)/i.test(style.overflowX);
+                        });
 
-                        [...node.querySelectorAll('*')]
-                            .some(element => {
-
-                                const style =
-                                    getComputedStyle(element);
-
-                                return (
-                                    canScrollX(element) &&
-                                    /(auto|scroll|hidden)/i
-                                        .test(
-                                            style.overflowX
-                                        )
-                                );
-                            });
-
-
-                    // ------------------------------------------
                     // GRAPH / VISUAL CONTENT EXTRACTION
-                    // ------------------------------------------
-                    //
-                    // Works generically for visuals where Power BI
-                    // exposes labels/data through:
-                    //
-                    // - SVG text
-                    // - aria-label
-                    // - title
-                    // - graphics symbols
-                    // - canvas accessibility layers
-                    //
-                    // This does NOT assume a specific chart type.
-                    //
-                    // Therefore it can preserve information from:
-                    //
-                    // - bar charts
-                    // - column charts
-                    // - line charts
-                    // - area charts
-                    // - pie/donut charts
-                    // - scatter plots
-                    // - heatmaps
-                    // - histograms
-                    // - box plots
-                    // - combo charts
-                    // ------------------------------------------
-
                     const contentSelectors = [
                         'svg text',
                         '[aria-label]',
@@ -600,366 +434,91 @@ class VisualDataExporter:
                         '[role="listitem"]'
                     ];
 
-
-                    const elements = [
-                        ...node.querySelectorAll(
-                            contentSelectors.join(',')
-                        )
-                    ];
-
-
+                    const elements = [...node.querySelectorAll(contentSelectors.join(','))];
                     const domContent = [];
-
                     const seenContent = new Set();
 
-
                     for (const element of elements) {
-
-                        if (!element || !element.isConnected) {
-                            continue;
-                        }
-
+                        if (!element || !element.isConnected) continue;
 
                         const text =
                             getText(element) ||
+                            clean(element.getAttribute('aria-label')) ||
+                            clean(element.getAttribute('title'));
 
-                            clean(
-                                element.getAttribute(
-                                    'aria-label'
-                                )
-                            ) ||
-
-                            clean(
-                                element.getAttribute(
-                                    'title'
-                                )
-                            );
-
-
-                        if (!text) {
-                            continue;
-                        }
-
+                        if (!text) continue;
 
                         const item = {
-                            tag:
-                                clean(
-                                    element.tagName
-                                ).toLowerCase(),
-
-                            role:
-                                clean(
-                                    element.getAttribute(
-                                        'role'
-                                    )
-                                ),
-
-                            aria_label:
-                                clean(
-                                    element.getAttribute(
-                                        'aria-label'
-                                    )
-                                ),
-
-                            title:
-                                clean(
-                                    element.getAttribute(
-                                        'title'
-                                    )
-                                ),
-
+                            tag: clean(element.tagName).toLowerCase(),
+                            role: clean(element.getAttribute('role')),
+                            aria_label: clean(element.getAttribute('aria-label')),
+                            title: clean(element.getAttribute('title')),
                             text
                         };
 
-
-                        const key = [
-                            item.tag,
-                            item.role,
-                            item.aria_label,
-                            item.title,
-                            item.text
-                        ].join('|');
-
-
-                        if (seenContent.has(key)) {
-                            continue;
-                        }
-
+                        const key = [item.tag, item.role, item.aria_label, item.title, item.text].join('|');
+                        if (seenContent.has(key)) continue;
 
                         seenContent.add(key);
-
                         domContent.push(item);
                     }
 
-
-                    // ------------------------------------------
-                    // SVG TEXT
-                    // ------------------------------------------
-
-                    const svgText = unique(
-                        [
-                            ...node.querySelectorAll(
-                                'svg text'
-                            )
-                        ].map(
-                            element =>
-                                clean(
-                                    element.textContent
-                                )
-                        )
-                    );
-
-
-                    // ------------------------------------------
-                    // ARIA LABELS
-                    // ------------------------------------------
-
-                    const ariaLabels = unique(
-                        [
-                            ...node.querySelectorAll(
-                                '[aria-label]'
-                            )
-                        ].map(
-                            element =>
-                                clean(
-                                    element.getAttribute(
-                                        'aria-label'
-                                    )
-                                )
-                        )
-                    );
-
-
-                    // ------------------------------------------
-                    // TITLE ATTRIBUTES
-                    // ------------------------------------------
-
-                    const titles = unique(
-                        [
-                            ...node.querySelectorAll(
-                                '[title]'
-                            )
-                        ].map(
-                            element =>
-                                clean(
-                                    element.getAttribute(
-                                        'title'
-                                    )
-                                )
-                        )
-                    );
-
-
-                    // ------------------------------------------
-                    // ACCESSIBLE / VISIBLE TEXT
-                    // ------------------------------------------
-
-                    const accessibleText =
-                        clean(node.innerText);
-
-
-                    // ------------------------------------------
-                    // POSITION
-                    // ------------------------------------------
-
-                    const rect =
-                        node.getBoundingClientRect();
-
-
-                    // ------------------------------------------
-                    // LOADING DETECTION
-                    // ------------------------------------------
-
-                    const loadingText =
-                        clean(node.innerText);
-
+                    const svgText = unique([...node.querySelectorAll('svg text')].map(e => clean(e.textContent)));
+                    const ariaLabels = unique([...node.querySelectorAll('[aria-label]')].map(e => clean(e.getAttribute('aria-label'))));
+                    const titles = unique([...node.querySelectorAll('[title]')].map(e => clean(e.getAttribute('title'))));
+                    const accessibleText = clean(node.innerText);
+                    const rect = node.getBoundingClientRect();
+                    const loadingText = clean(node.innerText);
 
                     const isLoadingPlaceholder =
-                        /\bvisuals?\s+are\s+loading\b/i
-                            .test(loadingText) ||
-
-                        /^loading(\.{3}|…)?$/i
-                            .test(loadingText);
-
-
-                    // ------------------------------------------
-                    // FINAL METADATA
-                    // ------------------------------------------
+                        /\bvisuals?\s+are\s+loading\b/i.test(loadingText) ||
+                        /^loading(\.{3}|…)?$/i.test(loadingText);
 
                     return {
-
-                        id:
-                            node.getAttribute(
-                                'data-visual-id'
-                            ) ||
-
-                            node.id ||
-
-                            `visual-${index + 1}`,
-
-
+                        id: node.getAttribute('data-visual-id') || node.id || `visual-${index + 1}`,
                         index: index,
-
-
-                        title:
-                            title ||
-                            `Visual ${index + 1}`,
-
-
-                        visual_type:
-                            clean(
-                                node.getAttribute(
-                                    'data-visual-type'
-                                )
-                            ) ||
-
-                            clean(
-                                node.getAttribute(
-                                    'aria-roledescription'
-                                )
-                            ) ||
-
-                            'unknown',
-
-
-                        aria_role:
-                            clean(
-                                node.getAttribute(
-                                    'aria-roledescription'
-                                )
-                            ),
-
-
-                        type_source:
-                            clean(typeSource),
-
-
-                        accessible_text:
-                            accessibleText,
-                        "accessible_text_length": 
-                            accessibleText.length,
-                            
-
-                        // DOM graph/visual data
-                        dom_content:
-                            domContent,
-
-
-                        svg_text:
-                            svgText,
-
-
-                        aria_labels:
-                            ariaLabels,
-
-
-                        titles,
-
-
-                        // Position metadata
+                        title: title || `Visual ${index + 1}`,
+                        visual_type: clean(node.getAttribute('data-visual-type')) || clean(node.getAttribute('aria-roledescription')) || 'unknown',
+                        aria_role: clean(node.getAttribute('aria-roledescription')),
+                        type_source: clean(typeSource),
+                        accessible_text: accessibleText,
+                        accessible_text_length: accessibleText.length,
+                        dom_content: domContent,
+                        svg_text: svgText,
+                        aria_labels: ariaLabels,
+                        titles: titles,
                         position: {
-                            x:
-                                Math.round(rect.x),
-
-                            y:
-                                Math.round(rect.y),
-
-                            width:
-                                Math.round(rect.width),
-
-                            height:
-                                Math.round(rect.height)
+                            x: Math.round(rect.x),
+                            y: Math.round(rect.y),
+                            width: Math.round(rect.width),
+                            height: Math.round(rect.height)
                         },
-
-
-                        // Visual classification
-                        is_kpi_or_card:
-                            Boolean(isKpiOrCard),
-
-
-                        is_slicer:
-                            Boolean(isSlicer),
-
-
-                        is_tabular:
-                            Boolean(isTabular),
-
-
-                        is_table:
-                            Boolean(isTable),
-
-
-                        is_matrix:
-                            Boolean(isMatrix),
-
-
-                        // Preserve scroll metadata
-                        scrollable:
-                            Boolean(scrollable),
-
-
-                        horizontally_scrollable:
-                            Boolean(
-                                horizontallyScrollable
-                            ),
-
-
-                        is_loading_placeholder:
-                            Boolean(
-                                isLoadingPlaceholder
-                            )
+                        is_button: Boolean(isButton),
+                        is_dropdown: Boolean(isDropdown),
+                        is_kpi_or_card: Boolean(isKpiOrCard),
+                        is_slicer: Boolean(isSlicer),
+                        is_tabular: Boolean(isTabular),
+                        is_table: Boolean(isTable),
+                        is_matrix: Boolean(isMatrix),
+                        scrollable: Boolean(scrollable),
+                        horizontally_scrollable: Boolean(horizontallyScrollable),
+                        is_loading_placeholder: Boolean(isLoadingPlaceholder)
                     };
-
                 }""",
                 index,
-            )
-
-            logger.debug(
-                "Visual inspection completed | "
-                "dashboard=%s | index=%d | "
-                "title=%s | type=%s | "
-                "kpi=%s | slicer=%s | "
-                "tabular=%s | dom_items=%d",
-                self.dashboard_name,
-                index + 1,
-                metadata.get("title"),
-                metadata.get("visual_type"),
-                metadata.get("is_kpi_or_card"),
-                metadata.get("is_slicer"),
-                metadata.get("is_tabular"),
-                len(metadata.get("dom_content", [])),
             )
 
             return metadata
 
         except Exception as exc:
-
-            logger.exception(
-                "Visual inspection failed | "
-                "dashboard=%s | index=%d | error=%s",
-                self.dashboard_name,
-                index + 1,
-                exc,
-            )
-
+            logger.exception("Visual inspection failed | dashboard=%s | index=%d", self.dashboard_name, index + 1)
             return {
                 "id": f"visual-{index + 1}",
                 "index": index,
                 "title": f"Visual {index + 1}",
                 "visual_type": "unknown",
-                "aria_role": "",
-                "type_source": "",
-                "accessible_text": "",
-                "dom_content": [],
-                "svg_text": [],
-                "aria_labels": [],
-                "titles": [],
-                "position": {
-                    "x": 0,
-                    "y": 0,
-                    "width": 0,
-                    "height": 0,
-                },
+                "is_button": False,
+                "is_dropdown": False,
                 "is_kpi_or_card": False,
                 "is_slicer": False,
                 "is_tabular": False,
@@ -970,141 +529,9 @@ class VisualDataExporter:
                 "is_loading_placeholder": False,
                 "inspection_error": str(exc),
             }
-        
-    async def _extract_table_data(
-        self,
-        visual: dict[str, Any],
-        index: int,
-    ) -> dict[str, Any]:
-        """
-        Delegate a single identified table/matrix visual to table_exporter.
-
-        VisualDataExporter:
-        - identifies the table/matrix
-
-        table_exporter:
-        - exports the actual data
-
-        No AI/LLM is used here.
-        """
-
-        table_result: dict[str, Any] = {
-            "visual_id": visual.get("id"),
-            "index": index,
-            "title": visual.get("title"),
-            "visual_type": visual.get("visual_type"),
-            "is_table": visual.get("is_table", False),
-            "is_matrix": visual.get("is_matrix", False),
-            "is_tabular": visual.get("is_tabular", False),
-            "scrollable": visual.get("scrollable", False),
-            "horizontally_scrollable": visual.get(
-                "horizontally_scrollable",
-                False,
-            ),
-            "status": "not_attempted",
-            "data": None,
-            "error": None,
-        }
-
-        try:
-            logger.info(
-                "Delegating table visual to table_exporter | "
-                "dashboard=%s | index=%d | title=%s",
-                self.dashboard_name,
-                index + 1,
-                visual.get("title"),
-            )
-
-            exported_tables = await export_table_visuals(
-                page=self.page,
-                table_visuals=[visual],
-                dashboard_name=self.dashboard_name,
-            )
-
-            if not exported_tables:
-                logger.warning(
-                    "Table exporter returned no results | "
-                    "dashboard=%s | title=%s",
-                    self.dashboard_name,
-                    visual.get("title"),
-                )
-
-                table_result["status"] = "no_data"
-
-                return table_result
-
-            exported = exported_tables[0]
-
-            table_result["status"] = exported.get(
-                "status",
-                "unknown",
-            )
-
-            table_result["data"] = exported.get(
-                "data"
-            )
-
-            table_result["error"] = exported.get(
-                "error"
-            )
-
-            table_result["file_path"] = exported.get(
-                "file_path"
-            )
-
-            table_result["validation_data_type"] = (
-                exported.get("validation_data_type")
-            )
-
-            table_result["validation_option"] = (
-                exported.get("validation_option")
-            )
-
-            table_result["validation_note"] = (
-                exported.get("validation_note")
-            )
-
-            logger.info(
-                "Table export completed | "
-                "dashboard=%s | title=%s | status=%s",
-                self.dashboard_name,
-                visual.get("title"),
-                table_result["status"],
-            )
-
-            return table_result
-
-        except Exception as exc:
-
-            logger.exception(
-                "Table exporter failed | "
-                "dashboard=%s | index=%d | title=%s",
-                self.dashboard_name,
-                index + 1,
-                visual.get("title"),
-            )
-
-            table_result["status"] = "failed"
-            table_result["error"] = str(exc)
-
-            return table_result
 
     async def extract_dashboard_data(self) -> dict[str, Any]:
-        """
-        Extract dashboard data using DOM inspection.
-
-        Responsibilities:
-        - Extract KPI/card values from the DOM.
-        - Extract graph/visual information from the DOM.
-        - Detect tables and matrices.
-        - Delegate table/matrix extraction to table_exporter.
-
-        This function does NOT:
-        - Compare source and target dashboards.
-        - Call Gemini or any LLM.
-        - Scroll tables manually.
-        """
-
+        """Extract dashboard data using DOM inspection."""
         result: dict[str, Any] = {
             "status": "success",
             "extracted_at": datetime.now(timezone.utc).isoformat(),
@@ -1116,307 +543,105 @@ class VisualDataExporter:
             "errors": [],
         }
 
-        logger.info(
-            "Starting dashboard DOM extraction"
-        )
+        logger.info("Starting dashboard DOM extraction")
 
-        # --------------------------------------------------
         # KPI EXTRACTION
-        # --------------------------------------------------
         try:
-            logger.info(
-                "Starting KPI extraction"
-            )
-
-            result["kpi_cards"] = (
-                await self._extract_kpi_cards()
-            )
-
-            logger.info(
-                "KPI extraction completed | kpis=%d",
-                len(result["kpi_cards"]),
-            )
-
+            VISUAL_SELECTOR = ".visualContainer, [data-visual-container]"
+            result["kpi_cards"] = await self._extract_kpi_cards()
+            logger.info("KPI extraction completed | kpis=%d", len(result["kpi_cards"]))
         except Exception as exc:
-            logger.exception(
-                "KPI extraction failed"
-            )
-
+            logger.exception("KPI extraction failed")
             result["status"] = "partial"
+            result["errors"].append(f"KPI extraction failed: {exc}")
 
-            result["errors"].append(
-                f"KPI extraction failed: {exc}"
-            )
-
-        # --------------------------------------------------
         # LOCATE VISUALS
-        # --------------------------------------------------
         try:
-            visual_count = (
-                await self.page.locator(
-                    VISUAL_SELECTOR
-                ).count()
-            )
-
-            logger.info(
-                "Power BI visual containers found | count=%d",
-                visual_count,
-            )
-
+            visual_count = await self.page.locator(VISUAL_SELECTOR).count()
+            logger.info("Visual containers found using selector '%s' :%d", VISUAL_SELECTOR, visual_count)
         except Exception as exc:
-            logger.exception(
-                "Unable to locate Power BI visuals"
-            )
-
+            logger.exception("Unable to locate Power BI visuals")
             result["status"] = "failed"
-
-            result["errors"].append(
-                f"Unable to locate Power BI visuals: {exc}"
-            )
-
+            result["errors"].append(f"Unable to locate Power BI visuals: {exc}")
             return result
 
-        # --------------------------------------------------
-        # NO VISUALS
-        # --------------------------------------------------
         if visual_count == 0:
-
-            logger.warning(
-                "No Power BI visual containers found"
-            )
-
+            logger.warning("No Power BI visual containers found")
             result["status"] = "partial"
-
-            result["errors"].append(
-                "No Power BI visual containers were found."
-            )
-
+            result["errors"].append("No Power BI visual containers were found.")
             return result
 
-        # --------------------------------------------------
         # PROCESS VISUALS
-        # --------------------------------------------------
         for index in range(visual_count):
-
-            locator = (
-                self.page
-                .locator(VISUAL_SELECTOR)
-                .nth(index)
-            )
+            locator = self.page.locator(VISUAL_SELECTOR).nth(index)
 
             try:
-
-                # ------------------------------------------
-                # VISIBILITY CHECK
-                # ------------------------------------------
                 if not await locator.is_visible():
-
-                    logger.debug(
-                        "Skipping hidden visual | index=%d",
-                        index + 1,
-                    )
-
-                    result["skipped_visuals"].append(
-                        {
-                            "index": index + 1,
-                            "reason": "hidden",
-                        }
-                    )
-
+                    logger.info("Skipping hidden visual | index=%d", index + 1)
+                    result["skipped_visuals"].append({"index": index + 1, "reason": "hidden"})
                     continue
 
-                # ------------------------------------------
-                # DOM INSPECTION
-                # ------------------------------------------
-                logger.debug(
-                    "Inspecting visual | index=%d",
-                    index + 1,
-                )
+                visual = await self._inspect_visual(locator, index)
 
-                visual = await self._inspect_visual(
-                    locator,
-                    index,
-                )
-
-                logger.debug(
-                    "Visual inspected | "
-                    "index=%d | title=%s | type=%s",
-                    index + 1,
-                    visual.get("title"),
-                    visual.get("visual_type"),
-                )
-
-                # ------------------------------------------
                 # LOADING PLACEHOLDER
-                # ------------------------------------------
-                if visual.get(
-                    "is_loading_placeholder"
-                ):
-
-                    logger.info(
-                        "Skipping loading visual | "
-                        "index=%d | title=%s",
-                        index + 1,
-                        visual.get("title"),
-                    )
-
-                    result["skipped_visuals"].append(
-                        {
-                            "index": index + 1,
-                            "reason": "loading_placeholder",
-                            "title": visual.get("title"),
-                        }
-                    )
-
+                if visual.get("is_loading_placeholder"):
+                    logger.info("Skipping loading visual | index=%d | title=%s", index + 1, visual.get("title"))
+                    result["skipped_visuals"].append({"index": index + 1, "reason": "loading_placeholder", "title": visual.get("title")})
                     continue
 
-                # ------------------------------------------
                 # KPI / CARD
-                # ------------------------------------------
-                #
-                # KPI extraction is already handled by
-                # _extract_kpi_cards().
-                #
-                # Do not add KPI visuals to graph visuals.
-                #
-                # ------------------------------------------
-
                 if visual.get("is_kpi_or_card"):
-
-                    logger.debug(
-                        "Skipping KPI/card visual from "
-                        "visual extraction | index=%d | title=%s",
-                        index + 1,
-                        visual.get("title"),
-                    )
-
-                    result["skipped_visuals"].append(
-                        {
-                            "index": index + 1,
-                            "reason": "kpi_or_card",
-                            "title": visual.get("title"),
-                        }
-                    )
-
+                    logger.info("Skipping KPI/card visual from visual extraction | index=%d | title=%s", index + 1, visual.get("title"))
+                    result["skipped_visuals"].append({"index": index + 1, "reason": "kpi_or_card", "title": visual.get("title")})
                     continue
 
-                # ------------------------------------------
-                # SLICER
-                # ------------------------------------------
-
-                if visual.get("is_slicer"):
-
-                    logger.debug(
-                        "Skipping slicer from visual extraction | "
-                        "index=%d | title=%s",
-                        index + 1,
-                        visual.get("title"),
-                    )
-
-                    result["skipped_visuals"].append(
-                        {
-                            "index": index + 1,
-                            "reason": "slicer",
-                            "title": visual.get("title"),
-                        }
-                    )
-
+                # BUTTON
+                if visual.get("is_button"):
+                    logger.info("Skipping button from visual extraction | index=%d | title=%s", index + 1, visual.get("title"))
+                    result["skipped_visuals"].append({"index": index + 1, "reason": "button", "title": visual.get("title")})
                     continue
 
-                # ---------------------------------------------------------
-                # TABLE / MATRIX EXPORT
-                # ---------------------------------------------------------
+                # SLICER / DROPDOWN
+                if visual.get("is_slicer") or visual.get("is_dropdown"):
+                    logger.info("Skipping slicer/dropdown from visual extraction | index=%d | title=%s", index + 1, visual.get("title"))
+                    result["skipped_visuals"].append({"index": index + 1, "reason": "slicer_or_dropdown", "title": visual.get("title")})
+                    continue
 
-                if result["table_visuals"]:
+                # TABULAR VISUALS
+                if visual.get("is_table") or visual.get("is_matrix"):
+                    logger.info("Adding tabular visual for export | index=%d", index + 1)
+                    result["table_visuals"].append(visual)
+                    continue
 
-                    try:
-
-                        logger.info(
-                            "Starting delegated table export | "
-                            "dashboard=%s | tables=%d",
-                            self.dashboard_name,
-                            len(result["table_visuals"]),
-                        )
-
-                        result["table_exports"] = (
-                            await export_table_visuals(
-                                page=self.page,
-                                table_visuals=result["table_visuals"],
-                                dashboard_name=self.dashboard_name,
-                            )
-                        )
-
-                        successful_exports = sum(
-                            1
-                            for item in result["table_exports"]
-                            if item.get("status") == "downloaded"
-                        )
-
-                        logger.info(
-                            "Delegated table export completed | "
-                            "dashboard=%s | successful=%d | total=%d",
-                            self.dashboard_name,
-                            successful_exports,
-                            len(result["table_exports"]),
-                        )
-
-                    except Exception as exc:
-
-                        logger.exception(
-                            "Delegated table export failed | dashboard=%s",
-                            self.dashboard_name,
-                        )
-
-                        result["status"] = "partial"
-
-                        result["errors"].append(
-                            f"Table export failed: {exc}"
-                        )
-
-                else:
-
-                    logger.info(
-                        "No table or matrix visuals detected | dashboard=%s",
-                        self.dashboard_name,
-                    )
-
-                # ------------------------------------------
                 # NORMAL GRAPH / VISUAL
-                # ------------------------------------------
-
-                logger.debug(
-                    "Adding DOM visual | "
-                    "index=%d | title=%s | type=%s",
-                    index + 1,
-                    visual.get("title"),
-                    visual.get("visual_type"),
-                )
-
-                result["visuals"].append(
-                    visual
-                )
+                logger.info("Adding DOM visual | index=%d | title=%s | type=%s", index + 1, visual.get("title"), visual.get("visual_type"))
+                result["visuals"].append(visual)
 
             except Exception as exc:
-
-                logger.exception(
-                    "Visual extraction failed | index=%d",
-                    index + 1,
-                )
-
+                logger.exception("Visual extraction failed | index=%d", index + 1)
                 result["status"] = "partial"
+                result["errors"].append(f"Visual {index + 1}: {exc}")
 
-                result["errors"].append(
-                    f"Visual {index + 1}: {exc}"
+        # EXPORT ALL CAPTURED TABLES AT ONCE
+        if result["table_visuals"]:
+            try:
+                logger.info("Starting delegated table export | dashboard=%s | tables=%d", self.dashboard_name, len(result["table_visuals"]))
+                result["table_exports"] = await export_table_visuals(
+                    page=self.page,
+                    table_visuals=result["table_visuals"],
+                    dashboard_name=self.dashboard_name,
                 )
-
-        # --------------------------------------------------
-        # FINAL LOG
-        # --------------------------------------------------
+                successful_exports = sum(1 for item in result["table_exports"] if item.get("status") == "downloaded")
+                logger.info("Delegated table export completed | dashboard=%s | successful=%d | total=%d", self.dashboard_name, successful_exports, len(result["table_exports"]))
+            except Exception as exc:
+                logger.exception("Delegated table export failed | dashboard=%s", self.dashboard_name)
+                result["status"] = "partial"
+                result["errors"].append(f"Table export failed: {exc}")
+        else:
+            logger.info("No table or matrix visuals detected | dashboard=%s", self.dashboard_name)
 
         logger.info(
-            "Dashboard DOM extraction completed | "
-            "kpis=%d | visuals=%d | table_visuals=%d | "
-            "table_exports=%d | skipped=%d | errors=%d",
+            "Dashboard DOM extraction completed | kpis=%d | visuals=%d | table_visuals=%d | table_exports=%d | skipped=%d | errors=%d",
             len(result["kpi_cards"]),
             len(result["visuals"]),
             len(result["table_visuals"]),
@@ -1428,29 +653,11 @@ class VisualDataExporter:
         return result
 
 
-async def extract_visual_data(
-    page,
-    **kwargs,
-) -> dict[str, Any]:
-    """
-    Public convenience API for DOM KPI, visual,
-    and table data extraction.
-    """
-
-    dashboard_name = kwargs.pop(
-        "dashboard_name",
-        "Dashboard",
-    )
-
+async def extract_visual_data(page, **kwargs) -> dict[str, Any]:
+    """Public convenience API for DOM KPI, visual, and table data extraction."""
+    dashboard_name = kwargs.pop("dashboard_name", "Dashboard")
     if kwargs:
-        logger.debug(
-            "Ignoring unsupported extract_visual_data kwargs: %s",
-            list(kwargs.keys()),
-        )
+        logger.debug("Ignoring unsupported extract_visual_data kwargs: %s", list(kwargs.keys()))
 
-    exporter = VisualDataExporter(
-        page,
-        dashboard_name=dashboard_name,
-    )
-
+    exporter = VisualDataExporter(page, dashboard_name=dashboard_name)
     return await exporter.extract_dashboard_data()
