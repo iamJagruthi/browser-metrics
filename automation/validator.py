@@ -246,14 +246,27 @@ class DashboardValidator:
         screenshot_path=None,
     ) -> dict:
         """Build the metrics dict that the API returns to the frontend."""
+        
+        # Safe retrieval of page title and URL
+        title = "Unknown / Page Closed"
+        final_url = ""
+        
+        if page and not page.is_closed():
+            try:
+                title = await page.title()
+                final_url = page.url
+            except Exception as e:
+                self.logger.warning(f"Could not retrieve page title: {e}")
+                final_url = getattr(page, "url", "")
+
         metrics = build_metrics(
             dashboard_name=dashboard["name"],
             dashboard_url=dashboard["url"],
             timers=self.timer.summary(),
             network_summary=summary(),
             network_details=details(),
-            page_title=await page.title(),
-            final_url=page.url,
+            page_title=title,
+            final_url=final_url,
             http_status=response.status if response else None,
         )
         if page_name:
@@ -307,11 +320,30 @@ class DashboardValidator:
             resources.append((playwright, context))
 
             for index, dashboard in enumerate(links):
-                page = (
-                    first_page
-                    if index == 0
-                    else await context.new_page()
-                )
+                # Safe check: context in Playwright Python doesn't have .is_closed()
+                is_context_dead = False
+                try:
+                    _ = context.pages
+                except Exception:
+                    is_context_dead = True
+
+                if is_context_dead:
+                    logger.warning("Browser context died. Relaunching context...")
+                    playwright, context, first_page = await launch_browser()
+                    resources.append((playwright, context))
+                    page = first_page
+                else:
+                    try:
+                        page = (
+                            first_page
+                            if (index == 0 and not first_page.is_closed())
+                            else await context.new_page()
+                        )
+                    except Exception as page_err:
+                        logger.error(f"Failed to create new page, recreating context: {page_err}")
+                        playwright, context, first_page = await launch_browser()
+                        resources.append((playwright, context))
+                        page = first_page
 
                 try:
                     _, _, execution, page_filters = await self.run_dashboard(
@@ -1215,45 +1247,55 @@ class DashboardValidator:
 
     async def navigate_to_page(self, page, page_name):
         """Navigate to a Power BI report page and verify the selected page."""
+        
+        # Early target guard
+        if page.is_closed():
+            raise RuntimeError(f"Cannot navigate to '{page_name}': target page is closed or crashed.")
 
-        page_element = page.locator(
-            f'[role="tab"][aria-label="{page_name}"]'
-        )
-
-        if await page_element.count() == 0:
-            raise RuntimeError(
-                f"Dashboard page not found: {page_name}"
+        try:
+            page_element = page.locator(
+                f'[role="tab"][aria-label="{page_name}"]'
             )
 
-        await page_element.first.click()
+            if await page_element.count() == 0:
+                raise RuntimeError(
+                    f"Dashboard page tab not found: {page_name}"
+                )
 
-        await wait_for_dashboard(page)
+            await page_element.first.click()
+            await wait_for_dashboard(page)
 
-        selected_page = page.locator(
-            '[role="tab"][aria-label$=" Selected"]'
-        )
-
-        if await selected_page.count() == 0:
-            raise RuntimeError(
-                f"Could not verify selected page after navigating to: {page_name}"
+            selected_page = page.locator(
+                '[role="tab"][aria-label$=" Selected"]'
             )
 
-        selected_label = await selected_page.first.get_attribute(
-            "aria-label"
-        )
+            if await selected_page.count() == 0:
+                raise RuntimeError(
+                    f"Could not verify selected page after navigating to: {page_name}"
+                )
 
-        expected_label = f"{page_name} Selected"
-
-        if selected_label != expected_label:
-            raise RuntimeError(
-                f"Page navigation verification failed. "
-                f"Expected: {expected_label}, "
-                f"Actual: {selected_label}"
+            selected_label = await selected_page.first.get_attribute(
+                "aria-label"
             )
 
-        print(
-            f"Successfully navigated to page: {page_name}"
-        )
+            expected_label = f"{page_name} Selected"
+
+            if selected_label != expected_label:
+                raise RuntimeError(
+                    f"Page navigation verification failed. "
+                    f"Expected: {expected_label}, "
+                    f"Actual: {selected_label}"
+                )
+
+            print(
+                f"Successfully navigated to page: {page_name}"
+            )
+
+        except Exception as exc:
+            if page.is_closed():
+                logger.error(f"Browser target crashed during page navigation to '{page_name}': {exc}")
+                raise RuntimeError(f"Browser crashed while attempting to load page: {page_name}") from exc
+            raise
 
     # ============================================================
     # Arun - Multi Page Comparison Helpers

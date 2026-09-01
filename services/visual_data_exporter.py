@@ -35,10 +35,19 @@ class VisualDataExporter:
         try:
             logger.info("Starting DOM KPI extraction")
 
-            visual_count = await self.page.locator(
-                ".visualContainer, [data-visual-container]"
-            ).count()
+            # Guard: Check if page/browser is still alive
+            if self.page.is_closed():
+                logger.error("Page was already closed before KPI extraction.")
+                return []
 
+            # Inner try/except to catch sudden target closures gracefully
+            try:
+                visual_count = await self.page.locator(
+                    ".visualContainer, [data-visual-container]"
+                ).count()
+            except Exception as e:
+                logger.error(f"Failed to count visual containers due to closed target: {e}")
+                return []
             logger.info(
                 "DOM KPI extraction | visual containers detected=%d",
                 visual_count,

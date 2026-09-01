@@ -157,8 +157,11 @@ async def launch_profile(profile_path):
             slow_mo=300,
             no_viewport=True,
             args=[
-                "--start-maximized",
-            ],
+                "--disable-dev-shm-usage",
+                "--js-flags=--max-old-space-size=4096", 
+                "--no-sandbox",
+                "--disable-gpu",
+            ]
         )
 
         page = (
