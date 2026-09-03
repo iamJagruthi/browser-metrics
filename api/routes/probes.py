@@ -18,27 +18,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["probes"])
 
 
-@router.post("/api/filters")
-async def probe_filters(request: ProbeRequest) -> dict:
-    source_url = request.source_url.strip()
-    if not source_url:
-        raise HTTPException(status_code=400, detail="source_url is required.")
-    try:
-        logger.info("Filter probe started | source=%s", source_url)
-        validator = get_validator()
-        links = build_probe_links(source_url, request.target_url)
-        result = await validator.run_filter_probe(links)
-        logger.info("Filter probe completed | dashboards=%d", len(result.get("dashboards", [])))
-        return result
-    except HTTPException:
-        raise
-    except Exception:
-        logger.exception("Filter probe request failed")
-        raise HTTPException(
-            status_code=500,
-            detail="Filter probe failed. Review the server logs for details.",
-        )
-
+ 
 
 @router.post("/api/inventory")
 async def probe_inventory(request: ProbeRequest) -> dict:

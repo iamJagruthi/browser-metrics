@@ -289,16 +289,6 @@ def save_pages_snapshot(
         raise
 
 
-def load_pages_snapshot(run_id: str, output_directory: Path) -> dict[str, Any] | None:
-    path = output_directory / f"{run_id}_pages.json"
-    if not path.is_file():
-        return None
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        logger.exception("Failed to load pages snapshot | run_id=%s", run_id)
-        return None
-
 
 def build_dashboard_inventory_payload(execution: dict[str, Any]) -> dict[str, Any]:
     """One dashboard: filters (with selected values) plus visual inventory counts."""
@@ -350,13 +340,4 @@ def save_inventory_snapshot(
         logger.exception("Failed to save inventory snapshot | run_id=%s", run_id)
         raise
 
-
-def load_inventory_snapshot(run_id: str, output_directory: Path) -> dict[str, Any] | None:
-    path = output_directory / f"{run_id}_inventory.json"
-    if not path.is_file():
-        return None
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        logger.exception("Failed to load inventory snapshot | run_id=%s", run_id)
-        return None
+ 

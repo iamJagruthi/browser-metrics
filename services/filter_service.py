@@ -243,12 +243,4 @@ def save_filters_snapshot(
         raise
 
 
-def load_filters_snapshot(run_id: str, output_directory: Path) -> dict[str, Any] | None:
-    path = output_directory / f"{run_id}_filters.json"
-    if not path.is_file():
-        return None
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        logger.exception("Failed to load filter snapshot | run_id=%s", run_id)
-        return None
+ 
