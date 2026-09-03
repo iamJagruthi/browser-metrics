@@ -26,6 +26,7 @@ from utils.config import DASHBOARD_CONFIG, OUTPUT_DIR, PAGE_TIMEOUT, SCREENSHOT_
 # from ai.Text_Extraction import extract_dashboard_json
 from services.visual_data_exporter import extract_visual_data
 from automation.SlicerEngine import SlicerEngine
+from automation.test_page_navigation import get_dashboard_pages, navigate_to_page
 
 
 logger = logging.getLogger(__name__)
@@ -63,6 +64,7 @@ class DashboardValidator:
         extraction = {"status": "not_used", "data": None, "error": None}
         visual_data = {"status": "failed", "filters": [], "visuals": [], "errors": []}
         response = None
+        engine = SlicerEngine(page)
 
         try:
             clear()
@@ -98,7 +100,7 @@ class DashboardValidator:
             # Arun - Multi Page Dashboard Processing
             # ============================================================
 
-            pages = await self.get_dashboard_pages(page)
+            pages = await get_dashboard_pages(page)
 
             # Only use the new multi-page flow when the dashboard
             # actually contains more than one report page.
@@ -116,14 +118,14 @@ class DashboardValidator:
                     )
 
                     if not page_info["selected"]:
-                        await self.navigate_to_page(
+                        await navigate_to_page(
                             page,
                             page_name,
                         )
 
                     predetermined = (filter_selections or {}).get(page_name)
 
-                    execution, applied = await self.process_dashboard_page(
+                    execution, applied = await engine.process_dashboard_page(
                         dashboard=dashboard,
                         page=page,
                         response=response,
@@ -246,17 +248,17 @@ class DashboardValidator:
         screenshot_path=None,
     ) -> dict:
         """Build the metrics dict that the API returns to the frontend."""
-        
+
         # Safe retrieval of page title and URL
         title = "Unknown / Page Closed"
         final_url = ""
-        
+
         if page and not page.is_closed():
             try:
                 title = await page.title()
                 final_url = page.url
             except Exception as e:
-                self.logger.warning(f"Could not retrieve page title: {e}")
+                logger.warning(f"Could not retrieve page title: {e}")
                 final_url = getattr(page, "url", "")
 
         metrics = build_metrics(
@@ -1011,291 +1013,13 @@ class DashboardValidator:
     # Arun - Process Dashboard Page
     # ============================================================
 
-    async def process_dashboard_page(
-        self,
-        dashboard,
-        page,
-        response,
-        page_name,
-        predetermined_filters=None,
-    ):
-        """Process one currently selected dashboard page.
 
-        If `predetermined_filters` is None, this dashboard's filters are
-        chosen randomly for this page (this is the "source" role); the
-        filter/value pairs actually applied are returned so a later
-        dashboard can replay them.
-
-        If `predetermined_filters` is a {filter_name: value} dict, this
-        dashboard replays exactly those values instead of randomizing (this
-        is the "target" role), so it ends up compared against the source in
-        the same filtered state. If a value can't be reproduced on this
-        dashboard, that's recorded as an explicit failed execution rather
-        than silently skipped, so the mismatch report can show *why* a
-        filter state is missing here instead of it just looking like an
-        unrelated data mismatch.
-
-        Returns (executions, applied_selection) where applied_selection is
-        the {filter_name: value} map of whatever was actually applied on
-        this page.
-        """
-
-        executions = []
-        engine = SlicerEngine(page)
-        applied_selection = {}
-
-        # ---------------------------------------------------------
-        # STEP 1: Process the default (unfiltered) page state
-        # ---------------------------------------------------------
-
-        logger.info("Waiting for visual containers to stay stable before extraction")
-        await wait_for_dashboard(page)
-
-        default_visual_data = await extract_visual_data(page, attempt_export=False)
-        default_tables = await export_table_visuals(
-            page,
-            default_visual_data.get("table_visuals", []),
-            dashboard["name"],
-        )
-        default_metrics = await self._capture_metrics(
-            dashboard,
-            page,
-            response,
-            page_name=page_name,
-        )
-
-        executions.append({
-            "dashboard": {
-                **dashboard,
-                "page_name": page_name,
-                "filter_applied": "Default View"
-            },
-            "page_name": page_name,
-            "filter_applied": "Default View",
-            "extraction": {
-                "status": "not_used",
-                "data": None,
-                "error": None},
-            "visual_data": default_visual_data,
-            "metrics": default_metrics,
-            "tables": default_tables,
-            "_page": page,
-        })
-
-        # ---------------------------------------------------------
-        # STEP 2: Apply filters — random for source, replayed for target
-        # ---------------------------------------------------------
-        if predetermined_filters:
-            filters_to_apply = list(predetermined_filters.items())
-            logger.info(
-                "Replaying source's filter selections on target | page=%s | filters=%s",
-                page_name,
-                filters_to_apply,
-            )
-        else:
-            detected_filters = await engine.extract_filters_from_dom()
-            if detected_filters:
-                logger.info(f"Detected filters on page '{page_name}': {detected_filters}")
-            filters_to_apply = [(f_name, None) for f_name in detected_filters[:2]]
-
-        for f_name, predetermined_value in filters_to_apply:
-            previous_snapshot = await capture_dashboard_snapshot(page)
-
-            if predetermined_value is not None:
-                logger.info(f"Reproducing filter on target: {f_name} = '{predetermined_value}'")
-                success = await engine.apply_filter(f_name, predetermined_value)
-
-                if not success:
-                    logger.warning(
-                        "Target could not reproduce source filter | page=%s filter=%s value=%s",
-                        page_name,
-                        f_name,
-                        predetermined_value,
-                    )
-                    executions.append({
-                        "dashboard": {
-                            **dashboard,
-                            "page_name": page_name,
-                            "filter_applied": (
-                                f"{f_name} = '{predetermined_value}' "
-                                "(FAILED TO APPLY)"
-                            ),
-                        },
-                        "page_name": page_name,
-                        "filter_applied": f"{f_name} = '{predetermined_value}'",
-                        "extraction": {"status": "not_used", "data": None, "error": None},
-                        "visual_data": {
-                            "status": "failed",
-                            "kpi_cards": [],
-                            "visuals": [],
-                            "filters": [],
-                            "errors": [
-                                f"Could not reproduce source's filter selection "
-                                f"'{predetermined_value}' for '{f_name}' on target dashboard."
-                            ],
-                        },
-                        "_page": page,
-                    })
-                    continue
-
-                applied_option = predetermined_value
-            else:
-                logger.info(f"Applying random option to filter: {f_name}")
-                applied_option = await engine.apply_random_valid_option(f_name)
-
-                if not applied_option:
-                    continue
-
-            applied_selection[f_name] = applied_option
-            filter_label = f"{f_name} = '{applied_option}'"
-            logger.info(
-                "Filter applied | filter=%s | value=%s",
-                f_name,
-                applied_option,
-            )
-            self.timer.start("filter_dashboard_render")
-            logger.info("Waiting for Power BI visuals to recalculate...")
-            await wait_for_dashboard(page, previous_snapshot=previous_snapshot)
-            self.timer.stop("filter_dashboard_render")
-
-            filtered_screenshot = (
-                SCREENSHOT_DIR
-                / f"{dashboard['name']}_{page_name}_{f_name}_{uuid.uuid4().hex[:8]}.png"
-            )
-            await page.screenshot(path=str(filtered_screenshot), full_page=True)
-
-            filtered_visual_data = await extract_visual_data(page, attempt_export=False)
-            # as we decided not to go furthur with ai commenting the below line
-            # filtered_ai_data = await asyncio.to_thread(extract_dashboard_json, filtered_screenshot)
-            filtered_tables = await export_table_visuals(
-                page,
-                filtered_visual_data.get("table_visuals", []),
-                dashboard["name"],
-            )
-
-            executions.append({
-                "dashboard": {
-                    **dashboard,
-                    "page_name": page_name,
-                    "filter_applied": filter_label
-                },
-                "page_name": page_name,
-                "filter_applied": filter_label,
-                "extraction": {"status": "not_used", "data": None, "error": None},
-                "visual_data": filtered_visual_data,
-                "screenshot": str(filtered_screenshot),
-                "tables": filtered_tables,
-                "metrics": await self._capture_metrics(
-                    dashboard,
-                    page,
-                    response,
-                    page_name=page_name,
-                    screenshot_path=filtered_screenshot,
-                ),
-                "_page": page,
-            })
-
-        # Return the list of executions plus what was actually applied, so
-        # run_dashboard can hand it off as the next dashboard's replay set.
-        return executions, applied_selection
 
     # ============================================================
     # Arun - Multi Page Dashboard Navigation
     # ============================================================
 
-    async def get_dashboard_pages(self, page):
-        """Detect Power BI report pages from the Pages pane."""
 
-        page_elements = page.locator(
-            '[role="tab"][aria-label]'
-        )
-
-        pages = []
-
-        count = await page_elements.count()
-
-        for index in range(count):
-            element = page_elements.nth(index)
-
-            aria_label = await element.get_attribute(
-                "aria-label"
-            )
-
-            text = (await element.inner_text()).strip()
-
-            if not aria_label:
-                continue
-
-            if aria_label.endswith(" Selected"):
-                page_name = aria_label[
-                    :-len(" Selected")
-                ]
-                selected = True
-            else:
-                page_name = aria_label
-                selected = False
-
-            pages.append(
-                {
-                    "name": text or page_name,
-                    "selected": selected,
-                    "index": index,
-                }
-            )
-
-        return pages
-
-    async def navigate_to_page(self, page, page_name):
-        """Navigate to a Power BI report page and verify the selected page."""
-        
-        # Early target guard
-        if page.is_closed():
-            raise RuntimeError(f"Cannot navigate to '{page_name}': target page is closed or crashed.")
-
-        try:
-            page_element = page.locator(
-                f'[role="tab"][aria-label="{page_name}"]'
-            )
-
-            if await page_element.count() == 0:
-                raise RuntimeError(
-                    f"Dashboard page tab not found: {page_name}"
-                )
-
-            await page_element.first.click()
-            await wait_for_dashboard(page)
-
-            selected_page = page.locator(
-                '[role="tab"][aria-label$=" Selected"]'
-            )
-
-            if await selected_page.count() == 0:
-                raise RuntimeError(
-                    f"Could not verify selected page after navigating to: {page_name}"
-                )
-
-            selected_label = await selected_page.first.get_attribute(
-                "aria-label"
-            )
-
-            expected_label = f"{page_name} Selected"
-
-            if selected_label != expected_label:
-                raise RuntimeError(
-                    f"Page navigation verification failed. "
-                    f"Expected: {expected_label}, "
-                    f"Actual: {selected_label}"
-                )
-
-            print(
-                f"Successfully navigated to page: {page_name}"
-            )
-
-        except Exception as exc:
-            if page.is_closed():
-                logger.error(f"Browser target crashed during page navigation to '{page_name}': {exc}")
-                raise RuntimeError(f"Browser crashed while attempting to load page: {page_name}") from exc
-            raise
 
     # ============================================================
     # Arun - Multi Page Comparison Helpers
@@ -1462,25 +1186,7 @@ class DashboardValidator:
 
         return scenarios
 
-    async def run_filter_probe(self, links):
-        executions = await self._probe_dashboard_executions(links)
-        comparison_filters = []
-        if len(executions) >= 2:
-            source_data = self._build_comparison_payload(executions[0])
-            target_data = self._build_comparison_payload(executions[1])
-            if source_data.get("filters") or target_data.get("filters"):
-                # from ai.Text_Extraction import compare_filters
-                # comparison_filters = compare_filters(source_data, target_data)
-                from services.comparison_service import compare_filters
-                comparison_filters = compare_filters(
-                    source_data.get("filters", []),
-                    target_data.get("filters", []),
-                )
-        return build_filters_api_payload(
-            executions,
-            run_id=None,
-            comparison_filters=comparison_filters,
-        )
+
 
     async def run_inventory_probe(self, links):
         executions = await self._probe_dashboard_executions(links)

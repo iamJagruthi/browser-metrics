@@ -12,9 +12,9 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 
 from api.dependencies import validate_run_id
-from services.dashboard_inventory_service import load_inventory_snapshot, load_pages_snapshot
-from services.filter_service import load_filters_snapshot
-from services.mismatch_service import load_mismatch_snapshot
+# from services.dashboard_inventory_service import load_inventory_snapshot, load_pages_snapshot
+# from services.filter_service import load_filters_snapshot
+# from services.mismatch_service import load_mismatch_snapshot
 from utils.config import REPORT_DIR
 
 
@@ -98,75 +98,4 @@ async def download_docx_report(run_id: str) -> FileResponse:
     except Exception:
         logger.exception("DOCX download failed | run_id=%s", run_id)
         raise HTTPException(status_code=500, detail="DOCX download failed.")
-
-
-@router.get("/{run_id}/filters")
-async def get_run_filters(run_id: str) -> dict:
-    try:
-        validate_run_id(run_id)
-        payload = load_filters_snapshot(run_id, REPORT_DIR)
-        if payload is None:
-            logger.warning("Filter snapshot missing | run_id=%s", run_id)
-            raise HTTPException(status_code=404, detail="Filter snapshot is not ready for this run.")
-        return payload
-    except HTTPException:
-        raise
-    except Exception:
-        logger.exception("Filter snapshot read failed | run_id=%s", run_id)
-        raise HTTPException(status_code=500, detail="Unable to load filter snapshot.")
-
-
-@router.get("/{run_id}/inventory")
-async def get_run_inventory(run_id: str) -> dict:
-    try:
-        validate_run_id(run_id)
-        payload = load_inventory_snapshot(run_id, REPORT_DIR)
-        if payload is None:
-            logger.warning("Inventory snapshot missing | run_id=%s", run_id)
-            raise HTTPException(status_code=404, detail="Inventory snapshot is not ready for this run.")
-        return payload
-    except HTTPException:
-        raise
-    except Exception:
-        logger.exception("Inventory snapshot read failed | run_id=%s", run_id)
-        raise HTTPException(status_code=500, detail="Unable to load inventory snapshot.")
-
-
-@router.get("/{run_id}/pages")
-async def get_run_pages(run_id: str) -> dict:
-    """Jagruthi — page names, KPIs, visuals, and inventory per report page."""
-    try:
-        validate_run_id(run_id)
-        payload = load_pages_snapshot(run_id, REPORT_DIR)
-        if payload is None:
-            logger.warning("Pages snapshot missing | run_id=%s", run_id)
-            raise HTTPException(
-                status_code=404,
-                detail="Pages showcase snapshot is not ready for this run.",
-            )
-        return payload
-    except HTTPException:
-        raise
-    except Exception:
-        logger.exception("Pages snapshot read failed | run_id=%s", run_id)
-        raise HTTPException(status_code=500, detail="Unable to load pages snapshot.")
-
-
-@router.get("/{run_id}/mismatches")
-async def get_run_mismatches(run_id: str) -> dict:
-    """Jagruthi — mismatch-only comparison data for frontend diff views."""
-    try:
-        validate_run_id(run_id)
-        payload = load_mismatch_snapshot(run_id, REPORT_DIR)
-        if payload is None:
-            logger.warning("Mismatch snapshot missing | run_id=%s", run_id)
-            raise HTTPException(
-                status_code=404,
-                detail="Mismatch snapshot is not ready for this run.",
-            )
-        return payload
-    except HTTPException:
-        raise
-    except Exception:
-        logger.exception("Mismatch snapshot read failed | run_id=%s", run_id)
-        raise HTTPException(status_code=500, detail="Unable to load mismatch snapshot.")
+ 
