@@ -10,7 +10,7 @@ import { Hero } from './components/layout/Hero.jsx';
 import { ValidationForm } from './components/form/ValidationForm.jsx';
 import { ErrorBanner } from './components/form/ErrorBanner.jsx';
 import { MetricsSection } from './components/metrics/MetricsSection.jsx';
-import { ComparisonSection } from './components/comparison/ComparsionSection.jsx';
+import { AppliedFiltersSection } from './components/comparison/AppliedFiltersSection.jsx';
 import { ReportsPanel } from './components/reports/ReportsPanel.jsx';
 
 import './App.css';
@@ -21,7 +21,6 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [result, setResult] = useState(null);
-  console.log(result,"Result:");
 
   const [theme, toggleTheme] = useTheme();
   const apiStatus = useApiHealth();
@@ -55,6 +54,8 @@ function App() {
       }
 
       const data = await response.json();
+      console.log('APPLIED FILTER SELECTIONS:', data.applied_filter_selections);
+      console.log('MISMATCHES:', data.mismatches);
       setResult(data);
     } catch (err) {
       setError(err.message || 'Something went wrong while validating.');
@@ -86,8 +87,17 @@ function App() {
         {result && (
           <div className="mt-12 space-y-12">
             <MetricsSection metrics={result.metrics} />
-            {result.mismatches && <ComparisonSection mismatches={result.mismatches} />}
-            {result.run_id && <ReportsPanel runId={result.run_id} reportStatus={reportStatus} polling={reportPolling} />}
+
+            {result.applied_filter_selections && (
+              <AppliedFiltersSection
+                appliedFilters={result.applied_filter_selections}
+                mismatches={result.mismatches}
+              />
+            )}
+
+            {result.run_id && (
+              <ReportsPanel runId={result.run_id} reportStatus={reportStatus} polling={reportPolling} />
+            )}
           </div>
         )}
       </div>
