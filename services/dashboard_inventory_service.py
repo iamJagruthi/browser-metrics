@@ -1,7 +1,7 @@
-"""Dashboard inventory for API consumers — filters (with selection), visual counts, and table comparisons.
+"""Dashboard inventory service for API consumers — filters, visual counts, and table comparisons.
 
 Pure DOM Extraction Mode — No Gemini/AI dependencies.
-Provides API JSON payloads for frontend and Postman consumers.
+Provides lightweight API JSON payloads for frontend and Postman consumers.
 """
 
 from __future__ import annotations
@@ -13,7 +13,6 @@ from typing import Any
 
 from services.comparison_service import (
     build_dashboard_filters_payload,
-    build_filters_api_payload,
 )
 
 logger = logging.getLogger(__name__)
@@ -67,53 +66,47 @@ def _classify_dom_visual(visual: dict[str, Any]) -> str:
     return _normalize_chart_bucket(type_source)
 
 
-def _extract_table_comparisons_for_execution(execution: dict[str, Any]) -> dict[str, Any]:
-    """Extract table comparison results, including mismatched tables and columns."""
+def _extract_table_comparisons_for_execution(
+    execution: dict[str, Any], 
+    top_level_comparison: dict[str, Any] | None = None
+) -> dict[str, Any]:
     visual_data = execution.get("visual_data") or {}
-    table_comp = visual_data.get("table_comparisons") or execution.get("table_comparisons") or {}
+    table_comp = (
+        visual_data.get("table_comparisons") 
+        or execution.get("table_comparisons") 
+        or (top_level_comparison.get("tables") if top_level_comparison else {})
+        or {}
+    )
     
-    tables = table_comp.get("tables", [])
-    summary = table_comp.get("summary", {})
+    raw_tables = table_comp.get("tables", table_comp)
     
-    mismatched_tables = []
-    column_mismatches = []
-    
-    for table in tables:
-        status = table.get("status")
-        visual_title = table.get("visual") or "Table Visual"
-        
-        source_only = table.get("source_only_columns", [])
-        target_only = table.get("target_only_columns", [])
-        col_diffs = table.get("column_differences", [])
-        
-        if source_only or target_only or col_diffs:
-            column_mismatches.append({
-                "visual": visual_title,
-                "status": status,
-                "source_only_columns": source_only,
-                "target_only_columns": target_only,
-                "column_differences": col_diffs
-            })
-            
-        if status != "Match":
-            mismatched_tables.append({
-                "visual": visual_title,
-                "status": status,
-                "key_strategy": table.get("key_strategy"),
-                "key_warning": table.get("key_warning"),
-                "summary": table.get("summary", {}),
-                "mismatched_records_count": len(table.get("mismatched_records", [])),
-                "missing_in_source_count": len(table.get("missing_in_source", [])),
-                "missing_in_target_count": len(table.get("missing_in_target", [])),
-            })
-            
+    if isinstance(raw_tables, dict):
+        comparisons = raw_tables.get("comparisons", [])
+        overall_status = raw_tables.get("overall_status", "NOT_COMPARED")
+        table_count = raw_tables.get("source_table_count", len(comparisons))
+        match_count = raw_tables.get("match_count", 0)
+        mismatch_count = raw_tables.get("mismatch_count", 0)
+    elif isinstance(raw_tables, list):
+        comparisons = raw_tables
+        overall_status = table_comp.get("summary", {}).get("overall_status", "NOT_COMPARED")
+        table_count = len(comparisons)
+        match_count = sum(1 for t in comparisons if t.get("status") in ("Match", "TABLE_MATCHED"))
+        mismatch_count = table_count - match_count
+    else:
+        return {
+            "overall_status": "NOT_COMPARED",
+            "table_count": 0,
+            "match_count": 0,
+            "mismatched_count": 0,
+            "compared_count": 0,
+        }
+
     return {
-        "overall_status": summary.get("overall_status", "NOT_COMPARED"),
-        "table_count": summary.get("table_count", len(tables)),
-        "match_count": summary.get("match_count", 0),
-        "mismatched_tables": mismatched_tables,
-        "column_mismatches": column_mismatches,
-        "all_table_comparisons": tables
+        "overall_status": overall_status,
+        "table_count": table_count,
+        "match_count": match_count,
+        "mismatched_count": mismatch_count,
+        "compared_count": len(comparisons),
     }
 
 
@@ -195,7 +188,6 @@ def _count_inventory_for_execution(execution: dict[str, Any]) -> dict[str, Any]:
 
 
 def _list_kpis_for_execution(execution: dict[str, Any]) -> list[dict[str, Any]]:
-    """DOM KPI cards for page showcase and API payloads."""
     visual_data = execution.get("visual_data") or {}
     seen: set[str] = set()
     kpis: list[dict[str, Any]] = []
@@ -220,51 +212,7 @@ def _list_kpis_for_execution(execution: dict[str, Any]) -> list[dict[str, Any]]:
     return kpis
 
 
-def _list_visuals_for_execution(execution: dict[str, Any]) -> list[dict[str, Any]]:
-    """DOM visual inventory list (title, type, category, slicer flag)."""
-    visual_data = execution.get("visual_data") or {}
-    visuals: list[dict[str, Any]] = []
-    seen_titles: set[str] = set()
-
-    for visual in visual_data.get("visuals", []):
-        if visual.get("is_loading_placeholder"):
-            continue
-        title = visual.get("title") or visual.get("name")
-        title_key = " ".join(str(title or "").casefold().split())
-        if title_key:
-            seen_titles.add(title_key)
-        visuals.append(
-            {
-                "title": title,
-                "visual_type": visual.get("visual_type"),
-                "category": _classify_dom_visual(visual),
-                "is_slicer": bool(visual.get("is_slicer")),
-                "extraction_source": "dom",
-            }
-        )
-
-    table_visuals = visual_data.get("table_visuals", []) or visual_data.get("table_exports", [])
-    for table in table_visuals:
-        title = table.get("title") or table.get("name") or "Table"
-        title_key = " ".join(str(title).casefold().split())
-        if title_key in seen_titles:
-            continue
-        seen_titles.add(title_key)
-        visuals.append(
-            {
-                "title": title,
-                "visual_type": table.get("visual_type") or "table",
-                "category": "matrix" if table.get("is_matrix") else "table",
-                "is_slicer": False,
-                "extraction_source": "dom",
-            }
-        )
-
-    return visuals
-
-
 def build_page_showcase_entry(execution: dict[str, Any]) -> dict[str, Any]:
-    """One report page: filters, KPIs, visuals, table comparisons, and inventory counts."""
     dashboard = execution.get("dashboard") or {}
     filters_section = build_dashboard_filters_payload(execution)
     inventory = _count_inventory_for_execution(execution)
@@ -273,10 +221,8 @@ def build_page_showcase_entry(execution: dict[str, Any]) -> dict[str, Any]:
     return {
         "page_name": dashboard.get("page_name") or inventory.get("page_name") or "Default",
         "filter_count": filters_section["filter_count"],
-        "filters": filters_section["filters"],
         "inventory": inventory,
         "kpis": _list_kpis_for_execution(execution),
-        "visuals": _list_visuals_for_execution(execution),
         "table_comparisons": table_comparisons_data,
         "extraction_status": filters_section.get("extraction_status"),
         "visual_extraction_status": filters_section.get("visual_extraction_status"),
@@ -289,7 +235,6 @@ def build_pages_showcase_payload(
     executions_by_dashboard: list[list[dict[str, Any]]] | None = None,
     run_id: str | None = None,
 ) -> dict[str, Any]:
-    """Multi-page showcase: page names, KPIs, visuals, and visual inventory."""
     try:
         grouped = executions_by_dashboard or []
         if not grouped and executions:
@@ -325,7 +270,6 @@ def build_pages_showcase_payload(
 
 
 def build_dashboard_inventory_payload(execution: dict[str, Any]) -> dict[str, Any]:
-    """One dashboard: filters, itemized KPIs, visuals, plus table comparisons."""
     filters_section = build_dashboard_filters_payload(execution)
     inventory = _count_inventory_for_execution(execution)
     inventory["filter_count"] = filters_section["filter_count"]
@@ -337,10 +281,8 @@ def build_dashboard_inventory_payload(execution: dict[str, Any]) -> dict[str, An
         "extraction_status": filters_section.get("extraction_status"),
         "visual_extraction_status": filters_section.get("visual_extraction_status"),
         "filter_count": filters_section["filter_count"],
-        "filters": filters_section["filters"],
         "inventory": inventory,
         "kpis": _list_kpis_for_execution(execution),
-        "visuals": _list_visuals_for_execution(execution),
         "table_comparisons": table_comparisons_data,
     }
 
@@ -349,9 +291,26 @@ def build_inventory_api_payload(
     executions: list[dict[str, Any]],
     *,
     run_id: str | None = None,
+    comparison: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     try:
-        dashboards = [build_dashboard_inventory_payload(item) for item in executions]
+        dashboards = []
+        table_comp_data = (comparison or {}).get("tables", {})
+
+        for item in executions:
+            dash_payload = build_dashboard_inventory_payload(item)
+            if table_comp_data and isinstance(table_comp_data, dict):
+                dash_payload["table_comparisons"] = {
+                    "overall_status": table_comp_data.get("overall_status", "NOT_COMPARED"),
+                    "source_table_count": table_comp_data.get("source_table_count", 0),
+                    "target_table_count": table_comp_data.get("target_table_count", 0),
+                    "paired_table_count": table_comp_data.get("paired_table_count", 0),
+                    "compared_table_count": table_comp_data.get("compared_table_count", 0),
+                    "match_count": table_comp_data.get("match_count", 0),
+                    "mismatch_count": table_comp_data.get("mismatch_count", 0),
+                }
+            dashboards.append(dash_payload)
+
         return {
             "run_id": run_id,
             "dashboards": dashboards,
@@ -363,4 +322,35 @@ def build_inventory_api_payload(
         raise
 
 
+<<<<<<< Updated upstream
  
+=======
+def save_pages_snapshot(
+    run_id: str,
+    payload: dict[str, Any],
+    output_directory: Path,
+) -> Path:
+    try:
+        output_directory.mkdir(parents=True, exist_ok=True)
+        path = output_directory / f"{run_id}_pages.json"
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return path
+    except Exception:
+        logger.exception("Failed to save pages snapshot | run_id=%s", run_id)
+        raise
+
+
+def save_inventory_snapshot(
+    run_id: str,
+    payload: dict[str, Any],
+    output_directory: Path,
+) -> Path:
+    try:
+        output_directory.mkdir(parents=True, exist_ok=True)
+        path = output_directory / f"{run_id}_inventory.json"
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return path
+    except Exception:
+        logger.exception("Failed to save inventory snapshot | run_id=%s", run_id)
+        raise
+>>>>>>> Stashed changes

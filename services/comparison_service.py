@@ -176,8 +176,39 @@ def build_filters_api_payload(
 
 
 # ============================================================================
-# 2. COMPARISON ENGINE (KPIs, Visuals, Filters, Buttons)
+# 2. SANITIZATION & COMPARISON ENGINE
 # ============================================================================
+
+def sanitize_execution_for_api(execution: dict) -> dict:
+    """Strip internal DOM bloat, full table rows, and redundant UI fields."""
+    if not execution:
+        return execution
+
+    visual_data = execution.get("visual_data") or {}
+
+    # 1. Clean visual metadata
+    for key in ("visuals", "table_visuals"):
+        if key in visual_data:
+            for vis in visual_data[key]:
+                vis.pop("accessible_text", None)
+                vis.pop("position", None)
+                vis.pop("svg_text", None)
+                vis.pop("dom_content", None)
+                vis.pop("type_source", None)
+
+    # 2. Strip raw CSV rows from table exports (keep only summary row_count)
+    if "table_exports" in visual_data:
+        for tbl in visual_data["table_exports"]:
+            data = tbl.get("data")
+            if isinstance(data, dict):
+                tbl["data"] = {
+                    "columns": data.get("columns", []),
+                    "row_count": data.get("row_count", len(data.get("rows", []))),
+                    "rows_truncated": True,
+                }
+
+    return execution
+
 
 def compare_browser_metrics(
     source_metrics: dict[str, Any] | None,
@@ -191,7 +222,6 @@ def compare_browser_metrics(
 
     mismatches = []
     
-    # Timing keys to compare across runs
     metric_keys = [
         "page_load_seconds",
         "dashboard_render_seconds",
@@ -207,7 +237,6 @@ def compare_browser_metrics(
         if source_val is None and target_val is None:
             continue
 
-        # Format floats to 2 decimal places for clean UI presentation
         s_formatted = round(float(source_val), 2) if source_val is not None else "N/A"
         t_formatted = round(float(target_val), 2) if target_val is not None else "N/A"
 
@@ -221,6 +250,7 @@ def compare_browser_metrics(
             })
 
     return mismatches
+
 
 def _visual_key(item: dict[str, Any], fallback_index: int) -> str:
     title = _normalise(item.get("title"))
@@ -302,21 +332,16 @@ def compare_visuals(source_visuals: list[dict[str, Any]], target_visuals: list[d
             continue
 
         type_match = _normalise(source.get("visual_type")) == _normalise(target.get("visual_type"))
-        source_content = {_normalise(item.get("text")) for item in source.get("dom_content", []) if item.get("text")}
-        target_content = {_normalise(item.get("text")) for item in target.get("dom_content", []) if item.get("text")}
-
-        content_match = (source_content == target_content)
-        overall_match = type_match and content_match
         confidence = _pair_confidence(source, target)
-        status = "Match" if overall_match else "Mismatch"
+        status = "Match" if type_match else "Mismatch"
         if confidence is not None and confidence < 0.7 and status == "Mismatch":
             status = "needs_review"
 
         results.append({
             "visual": source.get("title") or target.get("title"),
             "status": status,
-            "source": f"Data points: {len(source_content)}",
-            "target": f"Data points: {len(target_content)}",
+            "source": f"Type: {source.get('visual_type', 'unknown')}",
+            "target": f"Type: {target.get('visual_type', 'unknown')}",
             "confidence": confidence,
         })
     return results
@@ -352,25 +377,38 @@ def compare_filters(source_filters: list[dict[str, Any]], target_filters: list[d
         })
     return results
 
+
+# services/comparison_service.py
+
 def _extract_table_cell_mismatches(table_comparison: dict[str, Any], max_cells: int = 50) -> list[dict[str, Any]]:
-    """Extract cell-level differences without loading full table row arrays."""
+    """Extract cell-level differences from structured table comparisons."""
     mismatched_cells: list[dict[str, Any]] = []
     
-    # Process cell diffs returned from table_comparison engine
-    for cell in table_comparison.get("cells", []):
-        if _is_mismatch(cell):
+    # 1. Unpack tables dict structure
+    tables_data = table_comparison.get("tables", {})
+    comparisons = tables_data.get("comparisons", []) if isinstance(tables_data, dict) else tables_data
+
+    # 2. Extract cell diffs across all compared tables
+    for comp in comparisons:
+        title = comp.get("source_table") or comp.get("target_table") or "Table"
+        
+        for cell_diff in comp.get("cell_mismatches", []):
             mismatched_cells.append({
-                "table_title": cell.get("table_title") or cell.get("visual"),
-                "row": cell.get("row"),
-                "column": cell.get("column"),
-                "source_value": cell.get("source"),
-                "target_value": cell.get("target"),
+                "table_title": title,
+                "row_identifier": cell_diff.get("row_identifier"),
+                "column": cell_diff.get("column"),
+                "source_value": cell_diff.get("source_value"),
+                "target_value": cell_diff.get("target_value"),
                 "status": "Mismatch",
             })
             if len(mismatched_cells) >= max_cells:
                 break
                 
+        if len(mismatched_cells) >= max_cells:
+            break
+
     return mismatched_cells
+
 
 def compare_button_groups(source_groups: list[dict[str, Any]], target_groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
     source_map = {_normalise(item.get("name")): item for item in source_groups if item.get("name")}
@@ -422,29 +460,6 @@ def calculate_match_percentage(results: list) -> float | None:
     matches = sum(1 for result in results if result.get("status") == "Match")
     return round((matches / len(results)) * 100, 2)
 
-def sanitize_execution_for_api(execution: dict) -> dict:
-    """Strip internal DOM bloat, full table rows, and redundant UI fields."""
-    if not execution:
-        return execution
-
-    visual_data = execution.get("visual_data") or {}
-
-    # 1. Clean visual metadata
-    if "visuals" in visual_data:
-        for vis in visual_data["visuals"]:
-            vis.pop("accessible_text", None)
-            vis.pop("position", None)
-            vis.pop("svg_text", None)
-            vis.pop("dom_content", None)
-            vis.pop("type_source", None)
-
-    # 2. Strip raw CSV rows from table exports
-    if "table_exports" in visual_data:
-        for tbl in visual_data["table_exports"]:
-            if isinstance(tbl.get("data"), dict):
-                tbl["data"].pop("rows", None)  # Omit full row arrays
-
-    return execution
 
 def build_comparison_summary(filter_comparison, kpi_comparison, visual_comparison) -> dict:
     filter_percentage = calculate_match_percentage(filter_comparison)
@@ -465,8 +480,13 @@ def build_comparison_summary(filter_comparison, kpi_comparison, visual_compariso
     }
 
 
+# services/comparison_service.py
+
 def compare_dashboard_payloads(source_data: dict[str, Any], target_data: dict[str, Any]) -> dict[str, Any]:
     try:
+        source_data = sanitize_execution_for_api(source_data)
+        target_data = sanitize_execution_for_api(target_data)
+
         kpis = compare_kpis(source_data.get("kpi_cards") or [], target_data.get("kpi_cards") or [])
         visuals = compare_visuals(source_data.get("visuals") or [], target_data.get("visuals") or [])
         filters = compare_filters(source_data.get("filters") or [], target_data.get("filters") or [])
@@ -476,12 +496,11 @@ def compare_dashboard_payloads(source_data: dict[str, Any], target_data: dict[st
         button_percentage = calculate_match_percentage(buttons)
         summary["button_match_percentage"] = button_percentage if button_percentage is not None else 0.0
 
-        # Extract table summary stats without row arrays
-        table_comparison = build_table_comparisons({
+        # Build table comparisons
+        table_comparison_result = build_table_comparisons({
             "Source": source_data,
             "Target": target_data,
         })
-        tables_summary = table_comparison.get("summary", [])
 
         return {
             "status": "success",
@@ -489,7 +508,7 @@ def compare_dashboard_payloads(source_data: dict[str, Any], target_data: dict[st
             "kpis": kpis,
             "visuals": visuals,
             "buttons": buttons,
-            "tables": tables_summary,  #Summary status only (Match/Mismatch, Row counts)
+            "tables": table_comparison_result.get("tables", {}),  # Preserves detailed comparison structure
             "summary": summary,
             "results": kpis,
             "match_percentage": summary.get("overall_match_percentage"),
@@ -499,7 +518,7 @@ def compare_dashboard_payloads(source_data: dict[str, Any], target_data: dict[st
         return {
             "status": "not_compared",
             "reason": str(exc),
-            "filters": [], "kpis": [], "visuals": [], "tables": [],
+            "filters": [], "kpis": [], "visuals": [], "tables": {},
             "summary": {"filter_match_percentage": 0.0, "kpi_match_percentage": 0.0, "visual_match_percentage": 0.0, "overall_match_percentage": 0.0},
         }
 
@@ -529,10 +548,12 @@ def build_mismatch_payload(
     kpis = _filter_mismatches(comparison.get("kpis")) or _filter_mismatches(comparison.get("results"))
     visuals = _filter_mismatches(comparison.get("visuals"))
 
+    # services/comparison_service.py (inside build_mismatch_payload)
+
     table_visuals: list[dict[str, Any]] = []
     table_cells: list[dict[str, Any]] = []
+    
     if visual_data:
-        # Pass dictionary structure to match build_table_comparisons expectations
         table_comp_input = (
             visual_data
             if isinstance(visual_data, dict) and "Source" in visual_data
@@ -540,10 +561,26 @@ def build_mismatch_payload(
         )
         table_comparison = build_table_comparisons(table_comp_input)
         
-        table_visuals = _filter_mismatches(table_comparison.get("summary"))
+        # Pull table-level shape/column mismatches
+        tables_data = table_comparison.get("tables", {})
+        comparisons = tables_data.get("comparisons", []) if isinstance(tables_data, dict) else tables_data
+        
+        for comp in comparisons:
+            if comp.get("status") != "TABLE_MATCHED":
+                table_visuals.append({
+                    "table_title": comp.get("source_table"),
+                    "status": comp.get("status"),
+                    "source_row_count": comp.get("source_row_count"),
+                    "target_row_count": comp.get("target_row_count"),
+                    "missing_columns_in_target": comp.get("missing_columns_in_target"),
+                    "extra_columns_in_target": comp.get("extra_columns_in_target"),
+                    "missing_rows_in_target_count": len(comp.get("missing_rows_in_target", [])),
+                    "extra_rows_in_target_count": len(comp.get("extra_rows_in_target", [])),
+                })
+        
+        # Pull cell-level value diffs
         table_cells = _extract_table_cell_mismatches(table_comparison, max_cells=50)
 
-    # Compare browser execution timing metrics
     browser_metrics: list[dict[str, Any]] = []
     if metrics and len(metrics) >= 2:
         browser_metrics = compare_browser_metrics(metrics[0], metrics[1])

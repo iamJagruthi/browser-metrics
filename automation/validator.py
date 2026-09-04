@@ -79,10 +79,6 @@ class DashboardValidator:
             await wait_for_dashboard(page)
             self.timer.stop("dashboard_render")
 
-            # ============================================================
-            # Multi-Page Dashboard Processing
-            # ============================================================
-
             pages = await get_dashboard_pages(page)
 
             if len(pages) > 1:
@@ -91,12 +87,6 @@ class DashboardValidator:
 
                 for page_info in pages:
                     current_page_name = page_info["name"]
-
-                    logger.info(
-                        "Processing dashboard page | dashboard=%s | page=%s",
-                        dashboard.get("name"),
-                        current_page_name,
-                    )
 
                     if not page_info["selected"]:
                         await navigate_to_page(page, current_page_name)
@@ -121,10 +111,6 @@ class DashboardValidator:
 
                 return playwright, context, executions, page_filter_selections
 
-            # ============================================================
-            # Single-Page Processing
-            # ============================================================
-
             self.timer.start("screenshot")
             screenshot_path = (
                 SCREENSHOT_DIR
@@ -136,6 +122,8 @@ class DashboardValidator:
             )
             self.timer.stop("screenshot")
 
+            # automation/validator.py
+
             self.timer.start("visual_extraction")
             try:
                 visual_data = await extract_visual_data(
@@ -143,6 +131,11 @@ class DashboardValidator:
                     download_directory=OUTPUT_DIR / "visual_exports",
                     attempt_export=True,
                 )
+                
+                # Guard: Only wait if page is still open and active
+                if page and not page.is_closed():
+                    await page.wait_for_timeout(1500)
+                    
             except Exception as exc:
                 logger.exception(
                     "DOM visual extraction failed | dashboard=%s",
@@ -191,11 +184,9 @@ class DashboardValidator:
                 pass
 
             raise
+
     @staticmethod
     def _build_comparison_payload(execution: dict) -> dict:
-        """
-        Build the comparison payload entirely from DOM-extracted data.
-        """
         visual_data = execution.get("visual_data") or {}
 
         return {
@@ -215,9 +206,6 @@ class DashboardValidator:
         page_name=None,
         screenshot_path=None,
     ) -> dict:
-        """Build the metrics dict that the API returns to the frontend."""
-
-        # Safe retrieval of page title and URL
         title = "Unknown / Page Closed"
         final_url = ""
 
@@ -234,13 +222,12 @@ class DashboardValidator:
             dashboard_url=dashboard["url"],
             timers=self.timer.summary(),
             network_summary=summary(),
-            network_details={}, #by passing the empty dic stopping the network in json paylod
+            network_details={},
             page_title=title,
             final_url=final_url,
             http_status=response.status if response else None,
         )
         
-        # Optionally remove the key entirely if build_metrics still includes it:
         metrics.pop("network_details", None)
 
         if page_name:
@@ -250,23 +237,10 @@ class DashboardValidator:
         return metrics
 
     async def run_links(self, links):
-        """Validate source/target URLs and return data suitable for the API/frontend."""
         executions = []
         resources = []
-
-        # ============================================================
-        # Arun - Multi Page Execution Tracking
-        # ============================================================
-
         executions_by_dashboard = []
         multi_page_mode = False
-
-        # ============================================================
-        # Filter replay: the first dashboard picks filters randomly per
-        # page; every dashboard after it replays those exact selections
-        # instead of randomizing its own, so source and target are always
-        # compared in the same filtered state.
-        # ============================================================
         source_filter_selections = None
 
         if not links:
@@ -282,19 +256,12 @@ class DashboardValidator:
             }
 
         try:
-            # A persistent Edge profile can only be launched once at a time.
-            # Reuse one authenticated context and open the dashboards in tabs.
             launch_started = time.perf_counter()
             playwright, context, first_page = await launch_browser()
             browser_launch_elapsed = time.perf_counter() - launch_started
-            logger.info(
-                "Browser launch completed | elapsed=%.3f seconds",
-                browser_launch_elapsed,
-            )
             resources.append((playwright, context))
 
             for index, dashboard in enumerate(links):
-                # Safe check: context in Playwright Python doesn't have .is_closed()
                 is_context_dead = False
                 try:
                     _ = context.pages
@@ -302,7 +269,6 @@ class DashboardValidator:
                     is_context_dead = True
 
                 if is_context_dead:
-                    logger.warning("Browser context died. Relaunching context...")
                     playwright, context, first_page = await launch_browser()
                     resources.append((playwright, context))
                     page = first_page
@@ -314,7 +280,6 @@ class DashboardValidator:
                             else await context.new_page()
                         )
                     except Exception as page_err:
-                        logger.error(f"Failed to create new page, recreating context: {page_err}")
                         playwright, context, first_page = await launch_browser()
                         resources.append((playwright, context))
                         page = first_page
@@ -330,13 +295,7 @@ class DashboardValidator:
                     )
 
                     if index == 0:
-                        # Whatever the first (source) dashboard actually
-                        # applied is what every later dashboard will replay.
                         source_filter_selections = page_filters
-
-                    # ========================================================
-                    # Arun - Accept Single or Multiple Page Executions
-                    # ========================================================
 
                     if isinstance(execution, list):
                         multi_page_mode = True
@@ -351,11 +310,6 @@ class DashboardValidator:
                     )
 
                 except Exception as exc:
-                    logger.exception(
-                        "Dashboard run failed | dashboard=%s",
-                        dashboard.get("name"),
-                    )
-
                     failed_execution = {
                         "dashboard": dashboard,
                         "metrics": None,
@@ -372,19 +326,10 @@ class DashboardValidator:
                         },
                     }
 
-                    executions.append(
-                        failed_execution
-                    )
-
-                    executions_by_dashboard.append(
-                        [failed_execution]
-                    )
+                    executions.append(failed_execution)
+                    executions_by_dashboard.append([failed_execution])
 
         except Exception as exc:
-            logger.exception(
-                "Unable to launch shared Edge context"
-            )
-
             executions = [
                 {
                     "dashboard": dashboard,
@@ -404,16 +349,9 @@ class DashboardValidator:
                 for dashboard in links
             ]
 
-            executions_by_dashboard = [
-                [execution]
-                for execution in executions
-            ]
+            executions_by_dashboard = [[execution] for execution in executions]
 
         try:
-            # ============================================================
-            # Arun - Page-wise Comparison
-            # ============================================================
-
             if multi_page_mode:
                 comparison = self._compare_multi_page_executions(
                     executions_by_dashboard
@@ -425,10 +363,6 @@ class DashboardValidator:
                     )
                 )
 
-                # Reports currently expect one source and one target
-                # execution. Use the first matching page pair for the
-                # existing report generator while API results contain
-                # every page.
                 report_executions = (
                     self._get_first_matching_page_pair(
                         executions_by_dashboard
@@ -453,10 +387,6 @@ class DashboardValidator:
 
             run_id = uuid.uuid4().hex
 
-            # Persist exactly what filter values were applied on the source
-            # dashboard (and therefore replayed on every dashboard after it),
-            # so the run's filtered state is auditable independent of the
-            # comparison/mismatch report.
             if multi_page_mode and source_filter_selections:
                 try:
                     applied_filters_path = (
@@ -476,7 +406,6 @@ class DashboardValidator:
                         run_id,
                     )
 
-            # Generates mismatchpayload directly without calling document exporters
             mismatches_payload = build_mismatch_payload(
                 comparison, 
                 run_id=run_id
@@ -503,9 +432,12 @@ class DashboardValidator:
                 run_id=run_id,
                 comparison_filters=comparison.get("filters", []),
             )
+            
+            # Pass comparison dict explicitly to merge top-level tables into dashboard payloads
             inventory_payload = build_inventory_api_payload(
                 public_executions,
                 run_id=run_id,
+                comparison=comparison,
             )
             public_groups = [
                 [
@@ -524,12 +456,7 @@ class DashboardValidator:
                 run_id=run_id,
             )
 
-            # ============================================================
-            # Arun - Page-aware API response
-            # ============================================================
-
             if multi_page_mode:
-
                 visual_results = [
                     {
                         "dashboard": item["dashboard"].get("name"),
@@ -617,12 +544,6 @@ class DashboardValidator:
                     )
 
     async def _run_slicer_scenarios(self, executions):
-        """Apply one common, non-selected slicer value to both dashboards.
-
-        This is intentionally opt-in by available common options only.  It
-        never guesses a value, and it preserves a record when the UI cannot
-        safely expose a matching slicer option.
-        """
         if len(executions) < 2 or not all(
             item.get("_page")
             for item in executions[:2]
@@ -708,11 +629,6 @@ class DashboardValidator:
                 or right.get("name")
             )
 
-            logger.info(
-                "Running matched slicer scenario | slicer=%s | value=%s",
-                slicer_name,
-                value,
-            )
             source_engine = SlicerEngine(source["_page"])
             target_engine = SlicerEngine(target["_page"])
 
@@ -770,7 +686,6 @@ class DashboardValidator:
                     "source": str(source_image),
                     "target": str(target_image),
                 }
-
 
             else:
                 scenario["status"] = "not_run"
