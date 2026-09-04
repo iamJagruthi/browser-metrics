@@ -422,6 +422,29 @@ def calculate_match_percentage(results: list) -> float | None:
     matches = sum(1 for result in results if result.get("status") == "Match")
     return round((matches / len(results)) * 100, 2)
 
+def sanitize_execution_for_api(execution: dict) -> dict:
+    """Strip internal DOM bloat, full table rows, and redundant UI fields."""
+    if not execution:
+        return execution
+
+    visual_data = execution.get("visual_data") or {}
+
+    # 1. Clean visual metadata
+    if "visuals" in visual_data:
+        for vis in visual_data["visuals"]:
+            vis.pop("accessible_text", None)
+            vis.pop("position", None)
+            vis.pop("svg_text", None)
+            vis.pop("dom_content", None)
+            vis.pop("type_source", None)
+
+    # 2. Strip raw CSV rows from table exports
+    if "table_exports" in visual_data:
+        for tbl in visual_data["table_exports"]:
+            if isinstance(tbl.get("data"), dict):
+                tbl["data"].pop("rows", None)  # Omit full row arrays
+
+    return execution
 
 def build_comparison_summary(filter_comparison, kpi_comparison, visual_comparison) -> dict:
     filter_percentage = calculate_match_percentage(filter_comparison)
@@ -454,7 +477,10 @@ def compare_dashboard_payloads(source_data: dict[str, Any], target_data: dict[st
         summary["button_match_percentage"] = button_percentage if button_percentage is not None else 0.0
 
         # Extract table summary stats without row arrays
-        table_comparison = build_table_comparisons([source_data, target_data])
+        table_comparison = build_table_comparisons({
+            "Source": source_data,
+            "Target": target_data,
+        })
         tables_summary = table_comparison.get("summary", [])
 
         return {
@@ -506,12 +532,15 @@ def build_mismatch_payload(
     table_visuals: list[dict[str, Any]] = []
     table_cells: list[dict[str, Any]] = []
     if visual_data:
-        table_comparison = build_table_comparisons(visual_data)
+        # Pass dictionary structure to match build_table_comparisons expectations
+        table_comp_input = (
+            visual_data
+            if isinstance(visual_data, dict) and "Source" in visual_data
+            else {"Source": visual_data.get("source", {}), "Target": visual_data.get("target", {})}
+        )
+        table_comparison = build_table_comparisons(table_comp_input)
         
-        # 1. High-level table summary diffs (e.g., Row count or column mismatch)
         table_visuals = _filter_mismatches(table_comparison.get("summary"))
-        
-        # 2. Cell-level diffs only (capped at 50 to keep payload small)
         table_cells = _extract_table_cell_mismatches(table_comparison, max_cells=50)
 
     # Compare browser execution timing metrics
