@@ -583,15 +583,7 @@ def build_mismatch_payload(
     }
 
 
-def save_mismatch_snapshot(run_id: str, payload: dict[str, Any], output_directory: Path) -> Path:
-    output_directory.mkdir(parents=True, exist_ok=True)
-    path = output_directory / f"{run_id}_mismatches.json"
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    return path
+ 
 
 
-def save_filters_snapshot(run_id: str, payload: dict[str, Any], output_directory: Path) -> Path:
-    output_directory.mkdir(parents=True, exist_ok=True)
-    path = output_directory / f"{run_id}_filters.json"
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    return path
+ 

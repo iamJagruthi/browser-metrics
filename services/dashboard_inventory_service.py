@@ -363,33 +363,4 @@ def build_inventory_api_payload(
         raise
 
 
-def save_pages_snapshot(
-    run_id: str,
-    payload: dict[str, Any],
-    output_directory: Path,
-) -> Path:
-    try:
-        output_directory.mkdir(parents=True, exist_ok=True)
-        path = output_directory / f"{run_id}_pages.json"
-        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        logger.info("Pages showcase snapshot saved | run_id=%s | path=%s", run_id, path)
-        return path
-    except Exception:
-        logger.exception("Failed to save pages snapshot | run_id=%s", run_id)
-        raise
-
-
-def save_inventory_snapshot(
-    run_id: str,
-    payload: dict[str, Any],
-    output_directory: Path,
-) -> Path:
-    try:
-        output_directory.mkdir(parents=True, exist_ok=True)
-        path = output_directory / f"{run_id}_inventory.json"
-        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        logger.info("Inventory snapshot saved | run_id=%s | path=%s", run_id, path)
-        return path
-    except Exception:
-        logger.exception("Failed to save inventory snapshot | run_id=%s", run_id)
-        raise
+ 
