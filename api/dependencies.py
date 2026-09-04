@@ -26,13 +26,6 @@ def validate_run_id(run_id: str) -> str:
     return run_id
 
 
-def build_probe_links(source_url: str, target_url: str | None = None) -> list[dict[str, str]]:
-    """Build dashboard link objects for probe endpoints."""
-    links = [{"name": "Dashboard A", "url": source_url.strip()}]
-    cleaned_target = (target_url or "").strip()
-    if cleaned_target:
-        links.append({"name": "Dashboard B", "url": cleaned_target})
-    return links
 
 
 def get_validator() -> DashboardValidator:
