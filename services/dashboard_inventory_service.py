@@ -1,7 +1,7 @@
-"""Dashboard inventory for API consumers — filters (with selection) and visual counts.
+"""Dashboard inventory for API consumers — filters (with selection), visual counts, and table comparisons.
 
 Pure DOM Extraction Mode — No Gemini/AI dependencies.
-Provides frontend, Excel exporter, and Word reporter payloads.
+Provides API JSON payloads for frontend and Postman consumers.
 """
 
 from __future__ import annotations
@@ -11,8 +11,10 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from services.filter_service import build_dashboard_filters_payload
-
+from services.comparison_service import (
+    build_dashboard_filters_payload,
+    build_filters_api_payload,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +67,56 @@ def _classify_dom_visual(visual: dict[str, Any]) -> str:
     return _normalize_chart_bucket(type_source)
 
 
+def _extract_table_comparisons_for_execution(execution: dict[str, Any]) -> dict[str, Any]:
+    """Extract table comparison results, including mismatched tables and columns."""
+    visual_data = execution.get("visual_data") or {}
+    table_comp = visual_data.get("table_comparisons") or execution.get("table_comparisons") or {}
+    
+    tables = table_comp.get("tables", [])
+    summary = table_comp.get("summary", {})
+    
+    mismatched_tables = []
+    column_mismatches = []
+    
+    for table in tables:
+        status = table.get("status")
+        visual_title = table.get("visual") or "Table Visual"
+        
+        source_only = table.get("source_only_columns", [])
+        target_only = table.get("target_only_columns", [])
+        col_diffs = table.get("column_differences", [])
+        
+        if source_only or target_only or col_diffs:
+            column_mismatches.append({
+                "visual": visual_title,
+                "status": status,
+                "source_only_columns": source_only,
+                "target_only_columns": target_only,
+                "column_differences": col_diffs
+            })
+            
+        if status != "Match":
+            mismatched_tables.append({
+                "visual": visual_title,
+                "status": status,
+                "key_strategy": table.get("key_strategy"),
+                "key_warning": table.get("key_warning"),
+                "summary": table.get("summary", {}),
+                "mismatched_records_count": len(table.get("mismatched_records", [])),
+                "missing_in_source_count": len(table.get("missing_in_source", [])),
+                "missing_in_target_count": len(table.get("missing_in_target", [])),
+            })
+            
+    return {
+        "overall_status": summary.get("overall_status", "NOT_COMPARED"),
+        "table_count": summary.get("table_count", len(tables)),
+        "match_count": summary.get("match_count", 0),
+        "mismatched_tables": mismatched_tables,
+        "column_mismatches": column_mismatches,
+        "all_table_comparisons": tables
+    }
+
+
 def _count_inventory_for_execution(execution: dict[str, Any]) -> dict[str, Any]:
     visual_data = execution.get("visual_data") or {}
 
@@ -76,7 +128,6 @@ def _count_inventory_for_execution(execution: dict[str, Any]) -> dict[str, Any]:
     other = 0
     skipped = 0
 
-    # 1. Standard DOM Visuals
     for visual in visual_data.get("visuals", []):
         if visual.get("is_loading_placeholder"):
             skipped += 1
@@ -100,7 +151,6 @@ def _count_inventory_for_execution(execution: dict[str, Any]) -> dict[str, Any]:
             chart_types[bucket] += 1
             dom_charts += 1
 
-    # 2. DOM Table/Matrix Visuals
     table_visuals = visual_data.get("table_visuals", []) or visual_data.get("table_exports", [])
     for table_vis in table_visuals:
         if table_vis.get("is_matrix"):
@@ -110,7 +160,6 @@ def _count_inventory_for_execution(execution: dict[str, Any]) -> dict[str, Any]:
 
     skipped += len(visual_data.get("skipped_visuals", []))
 
-    # 3. DOM KPIs
     dom_kpis = visual_data.get("kpi_cards", []) or []
     kpi_names = {
         _kpi_key(item.get("name"))
@@ -146,7 +195,7 @@ def _count_inventory_for_execution(execution: dict[str, Any]) -> dict[str, Any]:
 
 
 def _list_kpis_for_execution(execution: dict[str, Any]) -> list[dict[str, Any]]:
-    """DOM KPI cards for page showcase, Excel, and Word reports."""
+    """DOM KPI cards for page showcase and API payloads."""
     visual_data = execution.get("visual_data") or {}
     seen: set[str] = set()
     kpis: list[dict[str, Any]] = []
@@ -215,10 +264,11 @@ def _list_visuals_for_execution(execution: dict[str, Any]) -> list[dict[str, Any
 
 
 def build_page_showcase_entry(execution: dict[str, Any]) -> dict[str, Any]:
-    """One report page: filters, KPIs, visuals, and inventory counts."""
+    """One report page: filters, KPIs, visuals, table comparisons, and inventory counts."""
     dashboard = execution.get("dashboard") or {}
     filters_section = build_dashboard_filters_payload(execution)
     inventory = _count_inventory_for_execution(execution)
+    table_comparisons_data = _extract_table_comparisons_for_execution(execution)
 
     return {
         "page_name": dashboard.get("page_name") or inventory.get("page_name") or "Default",
@@ -227,6 +277,7 @@ def build_page_showcase_entry(execution: dict[str, Any]) -> dict[str, Any]:
         "inventory": inventory,
         "kpis": _list_kpis_for_execution(execution),
         "visuals": _list_visuals_for_execution(execution),
+        "table_comparisons": table_comparisons_data,
         "extraction_status": filters_section.get("extraction_status"),
         "visual_extraction_status": filters_section.get("visual_extraction_status"),
     }
@@ -273,28 +324,12 @@ def build_pages_showcase_payload(
         raise
 
 
-def save_pages_snapshot(
-    run_id: str,
-    payload: dict[str, Any],
-    output_directory: Path,
-) -> Path:
-    try:
-        output_directory.mkdir(parents=True, exist_ok=True)
-        path = output_directory / f"{run_id}_pages.json"
-        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        logger.info("Pages showcase snapshot saved | run_id=%s | path=%s", run_id, path)
-        return path
-    except Exception:
-        logger.exception("Failed to save pages snapshot | run_id=%s", run_id)
-        raise
-
-
-
 def build_dashboard_inventory_payload(execution: dict[str, Any]) -> dict[str, Any]:
-    """One dashboard: filters (with selected values) plus visual inventory counts."""
+    """One dashboard: filters, itemized KPIs, visuals, plus table comparisons."""
     filters_section = build_dashboard_filters_payload(execution)
     inventory = _count_inventory_for_execution(execution)
     inventory["filter_count"] = filters_section["filter_count"]
+    table_comparisons_data = _extract_table_comparisons_for_execution(execution)
 
     return {
         "dashboard_name": filters_section.get("dashboard_name"),
@@ -304,6 +339,9 @@ def build_dashboard_inventory_payload(execution: dict[str, Any]) -> dict[str, An
         "filter_count": filters_section["filter_count"],
         "filters": filters_section["filters"],
         "inventory": inventory,
+        "kpis": _list_kpis_for_execution(execution),
+        "visuals": _list_visuals_for_execution(execution),
+        "table_comparisons": table_comparisons_data,
     }
 
 
@@ -325,6 +363,22 @@ def build_inventory_api_payload(
         raise
 
 
+def save_pages_snapshot(
+    run_id: str,
+    payload: dict[str, Any],
+    output_directory: Path,
+) -> Path:
+    try:
+        output_directory.mkdir(parents=True, exist_ok=True)
+        path = output_directory / f"{run_id}_pages.json"
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        logger.info("Pages showcase snapshot saved | run_id=%s | path=%s", run_id, path)
+        return path
+    except Exception:
+        logger.exception("Failed to save pages snapshot | run_id=%s", run_id)
+        raise
+
+
 def save_inventory_snapshot(
     run_id: str,
     payload: dict[str, Any],
@@ -339,5 +393,3 @@ def save_inventory_snapshot(
     except Exception:
         logger.exception("Failed to save inventory snapshot | run_id=%s", run_id)
         raise
-
- 

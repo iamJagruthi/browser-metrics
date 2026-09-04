@@ -272,7 +272,11 @@ class SlicerEngine:
             page_name,
             predetermined_filters=None,
         ):
-            """..."""
+            """Process one report page with tab closure safety."""
+            # Guard check: stop immediately if the page tab was killed
+            if not page or page.is_closed():
+                logger.error("Cannot process page '%s': Target browser page is closed.", page_name)
+                raise RuntimeError(f"Target page closed before processing page '{page_name}'")
 
             validator = _get_validator()
 
@@ -281,6 +285,9 @@ class SlicerEngine:
 
             logger.info("Waiting for visual containers to stay stable before extraction")
             await wait_for_dashboard(page)
+
+            if page.is_closed():
+                raise RuntimeError(f"Target page closed during initial render on page '{page_name}'")
 
             default_visual_data = await extract_visual_data(page, attempt_export=False)
             default_tables = await export_table_visuals(
@@ -324,9 +331,12 @@ class SlicerEngine:
                 detected_filters = await self.extract_filters_from_dom()
                 if detected_filters:
                     logger.info(f"Detected filters on page '{page_name}': {detected_filters}")
-                filters_to_apply = [(f_name, None) for f_name in detected_filters[:2]]
-
+                filters_to_apply = [(f_name, None) for f_name in (detected_filters or [])[:2]]
             for f_name, predetermined_value in filters_to_apply:
+                if page.is_closed():
+                    logger.warning("Page closed before applying filter '%s'. Skipping.", f_name)
+                    break
+
                 previous_snapshot = await capture_dashboard_snapshot(page)
 
                 if predetermined_value is not None:
@@ -344,10 +354,7 @@ class SlicerEngine:
                             "dashboard": {
                                 **dashboard,
                                 "page_name": page_name,
-                                "filter_applied": (
-                                    f"{f_name} = '{predetermined_value}' "
-                                    "(FAILED TO APPLY)"
-                                ),
+                                "filter_applied": f"{f_name} = '{predetermined_value}' (FAILED TO APPLY)",
                             },
                             "page_name": page_name,
                             "filter_applied": f"{f_name} = '{predetermined_value}'",
@@ -385,6 +392,9 @@ class SlicerEngine:
                 logger.info("Waiting for Power BI visuals to recalculate...")
                 await wait_for_dashboard(page, previous_snapshot=previous_snapshot)
                 validator.timer.stop("filter_dashboard_render")
+
+                if page.is_closed():
+                    break
 
                 filtered_visual_data = await extract_visual_data(page, attempt_export=False)
                 filtered_tables = await export_table_visuals(

@@ -1,19 +1,226 @@
 """
 comparison_service.py
 
-Central DOM-only comparison layer.
+Unified DOM comparison, filter normalization, and mismatch extraction service.
+Pure DOM Extraction Mode 
 """
+
 from __future__ import annotations
 
+import json
 import logging
+from pathlib import Path
 from typing import Any
-from services.excel_exporter import build_comparison_summary, calculate_match_percentage
+
+from services.table_comparison import build_table_comparisons
 
 logger = logging.getLogger(__name__)
 
+# ============================================================================
+# 1. FILTER NORMALIZATION & HELPERS
+# ============================================================================
 
-def _normalise(value: Any) -> str:
-    return " ".join(str(value if value is not None else "").casefold().split())
+_BUTTON_FILTER_TYPES = frozenset({"buttons", "button", "button-style selector"})
+_UI_NOISE = frozenset(
+    {
+        "more options",
+        "focus mode",
+        "drill down",
+        "expand",
+        "drill up",
+        "see more",
+    }
+)
+_MATCH_STATUSES = frozenset({"Match"})
+
+
+def _normalise(name: Any) -> str:
+    if not name:
+        return ""
+    cleaned = str(name).replace("\xa0", " ").strip().lower()
+    return " ".join(cleaned.split())
+
+
+def _is_button_filter(filter_type: str | None) -> bool:
+    return _normalise(filter_type or "") in _BUTTON_FILTER_TYPES
+
+
+def _build_options(dom_filter: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build a normalized options list with selection flags strictly from DOM filter data."""
+    raw_options = dom_filter.get("options") or []
+    if raw_options:
+        return [
+            {
+                "value": str(item.get("value", "")).strip(),
+                "selected": bool(item.get("selected")),
+                "control_type": item.get("control_type") or "option",
+            }
+            for item in raw_options
+            if str(item.get("value", "")).strip()
+            and _normalise(str(item.get("value", ""))) not in _UI_NOISE
+        ]
+
+    visible = [
+        str(value).strip()
+        for value in (dom_filter.get("visible_values") or [])
+        if str(value).strip() and _normalise(str(value)) not in _UI_NOISE
+    ]
+
+    selected_set = {
+        _normalise(value)
+        for value in (dom_filter.get("selected_values") or [])
+        if str(value).strip()
+    }
+
+    unique_visible: list[str] = []
+    seen: set[str] = set()
+    for value in visible:
+        key = _normalise(value)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_visible.append(value)
+
+    filter_type = dom_filter.get("filter_type")
+    control_type = "button" if _is_button_filter(str(filter_type or "")) else "option"
+    
+    return [
+        {
+            "value": value,
+            "selected": _normalise(value) in selected_set,
+            "control_type": control_type,
+        }
+        for value in unique_visible
+    ]
+
+
+def normalize_dom_filter(raw: dict[str, Any]) -> dict[str, Any] | None:
+    """Shape a single DOM filter record for API output."""
+    if not raw or not raw.get("name"):
+        return None
+
+    name = str(raw.get("name")).strip()
+    filter_type = str(raw.get("filter_type") or "Dropdown")
+    options = _build_options(raw)
+    
+    selected_values = [
+        item["value"] for item in options if item.get("selected")
+    ] or list(raw.get("selected_values") or [])
+    
+    available_values = [item["value"] for item in options] or list(raw.get("visible_values") or [])
+
+    payload: dict[str, Any] = {
+        "filter_id": raw.get("id"),
+        "filter_name": name,
+        "filter_type": filter_type,
+        "selected_values": selected_values,
+        "available_values": available_values,
+        "options": options,
+        "extraction_source": "dom",
+    }
+    
+    if _is_button_filter(filter_type) or any(
+        item.get("control_type") == "button" for item in options
+    ):
+        payload["filter_type"] = "Buttons"
+        payload["buttons"] = [
+            {"label": item["value"], "selected": item["selected"]}
+            for item in options
+        ]
+        
+    return payload
+
+
+def build_dashboard_filters_payload(execution: dict[str, Any]) -> dict[str, Any]:
+    """Build filter API payload for one dashboard execution using DOM data."""
+    dashboard = execution.get("dashboard") or {}
+    visual_data = execution.get("visual_data") or {}
+    extraction = execution.get("extraction") or {}
+
+    dom_filters = {
+        _normalise(item.get("name", "")): item
+        for item in visual_data.get("filters", [])
+        if item.get("name")
+    }
+
+    filters: list[dict[str, Any]] = []
+    for key in sorted(dom_filters):
+        normalized = normalize_dom_filter(dom_filters[key])
+        if normalized:
+            filters.append(normalized)
+
+    return {
+        "dashboard_name": dashboard.get("name"),
+        "dashboard_url": dashboard.get("url"),
+        "extraction_status": extraction.get("status", "skipped"),
+        "visual_extraction_status": visual_data.get("status"),
+        "filter_count": len(filters),
+        "filters": filters,
+    }
+
+
+def build_filters_api_payload(
+    executions: list[dict[str, Any]],
+    *,
+    run_id: str | None = None,
+    comparison_filters: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Build the full filters API response for a validation run."""
+    dashboards = [build_dashboard_filters_payload(item) for item in executions]
+    return {
+        "run_id": run_id,
+        "dashboards": dashboards,
+        "comparison": comparison_filters or [],
+        "filter_download_url": f"/api/reports/{run_id}/filters" if run_id else None,
+    }
+
+
+# ============================================================================
+# 2. COMPARISON ENGINE (KPIs, Visuals, Filters, Buttons)
+# ============================================================================
+
+def compare_browser_metrics(
+    source_metrics: dict[str, Any] | None,
+    target_metrics: dict[str, Any] | None,
+    *,
+    page_name: str | None = None,
+) -> list[dict[str, Any]]:
+    """Compare performance timing metrics between Source and Target executions."""
+    if not source_metrics or not target_metrics:
+        return []
+
+    mismatches = []
+    
+    # Timing keys to compare across runs
+    metric_keys = [
+        "page_load_seconds",
+        "dashboard_render_seconds",
+        "total_execution_seconds",
+        "visual_extraction_seconds",
+        "screenshot_seconds",
+    ]
+
+    for key in metric_keys:
+        source_val = source_metrics.get(key)
+        target_val = target_metrics.get(key)
+
+        if source_val is None and target_val is None:
+            continue
+
+        # Format floats to 2 decimal places for clean UI presentation
+        s_formatted = round(float(source_val), 2) if source_val is not None else "N/A"
+        t_formatted = round(float(target_val), 2) if target_val is not None else "N/A"
+
+        if s_formatted != t_formatted:
+            mismatches.append({
+                "metric": key,
+                "page_name": page_name or source_metrics.get("page_name", "Default"),
+                "source": s_formatted,
+                "target": t_formatted,
+                "status": "Different",
+            })
+
+    return mismatches
 
 def _visual_key(item: dict[str, Any], fallback_index: int) -> str:
     title = _normalise(item.get("title"))
@@ -26,7 +233,6 @@ def _visual_key(item: dict[str, Any], fallback_index: int) -> str:
 
 
 def _pair_confidence(left: dict[str, Any] | None, right: dict[str, Any] | None) -> float | None:
-    """Use the lower of the two 0-1 scores so a weak side keeps the pair cautious."""
     scores = []
     for item in (left, right):
         if not item:
@@ -43,210 +249,191 @@ def _pair_confidence(left: dict[str, Any] | None, right: dict[str, Any] | None) 
 
 
 def compare_kpis(source_kpis: list[dict[str, Any]], target_kpis: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    logger.info("Starting KPI comparison | source=%d | target=%d", len(source_kpis), len(target_kpis))
-    try:
-        source_map = {_normalise(item.get("name")): item for item in source_kpis if item.get("name")}
-        target_map = {_normalise(item.get("name")): item for item in target_kpis if item.get("name")}
-        results = []
+    source_map = {_normalise(item.get("name")): item for item in source_kpis if item.get("name")}
+    target_map = {_normalise(item.get("name")): item for item in target_kpis if item.get("name")}
+    results = []
 
-        for key in sorted(set(source_map) | set(target_map)):
-            source = source_map.get(key)
-            target = target_map.get(key)
+    for key in sorted(set(source_map) | set(target_map)):
+        source = source_map.get(key)
+        target = target_map.get(key)
 
-            if not source:
-                results.append({"kpi": target.get("name"), "status": "Missing in Source", "source": None, "target": target.get("value")})
-                continue
-            if not target:
-                results.append({"kpi": source.get("name"), "status": "Missing in Target", "source": source.get("value"), "target": None})
-                continue
+        if not source:
+            results.append({"kpi": target.get("name"), "status": "Missing in Source", "source": None, "target": target.get("value")})
+            continue
+        if not target:
+            results.append({"kpi": source.get("name"), "status": "Missing in Target", "source": source.get("value"), "target": None})
+            continue
 
-            source_value = _normalise(source.get("value"))
-            target_value = _normalise(target.get("value"))
-            status = "Match" if source_value == target_value else "Mismatch"
-            confidence = _pair_confidence(source, target)
-            if confidence is not None and confidence < 0.7 and status == "Mismatch":
-                status = "needs_review"
+        source_value = _normalise(source.get("value"))
+        target_value = _normalise(target.get("value"))
+        status = "Match" if source_value == target_value else "Mismatch"
+        confidence = _pair_confidence(source, target)
+        if confidence is not None and confidence < 0.7 and status == "Mismatch":
+            status = "needs_review"
 
-            results.append({
-                "kpi": source.get("name"),
-                "status": status,
-                "source": source.get("value"),
-                "target": target.get("value"),
-                "source_prior": source.get("previous_value"),
-                "target_prior": target.get("previous_value"),
-                "source_variance": source.get("variance"),
-                "target_variance": target.get("variance"),
-                "confidence": confidence,
-            })
-        logger.info("KPI comparison completed | total=%d", len(results))
-        return results
-    except Exception:
-        logger.exception("KPI comparison failed")
-        return []
+        results.append({
+            "kpi": source.get("name"),
+            "status": status,
+            "source": source.get("value"),
+            "target": target.get("value"),
+            "source_prior": source.get("previous_value"),
+            "target_prior": target.get("previous_value"),
+            "source_variance": source.get("variance"),
+            "target_variance": target.get("variance"),
+            "confidence": confidence,
+        })
+    return results
 
 
 def compare_visuals(source_visuals: list[dict[str, Any]], target_visuals: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    logger.info("Starting visual comparison | source=%d | target=%d", len(source_visuals), len(target_visuals))
-    try:
-        source_map = {_visual_key(item, index): item for index, item in enumerate(source_visuals)}
-        target_map = {_visual_key(item, index): item for index, item in enumerate(target_visuals)}
-        results = []
+    source_map = {_visual_key(item, index): item for index, item in enumerate(source_visuals)}
+    target_map = {_visual_key(item, index): item for index, item in enumerate(target_visuals)}
+    results = []
 
-        for key in sorted(set(source_map) | set(target_map)):
-            source = source_map.get(key)
-            target = target_map.get(key)
+    for key in sorted(set(source_map) | set(target_map)):
+        source = source_map.get(key)
+        target = target_map.get(key)
 
-            if not source:
-                results.append({"visual": target.get("title"), "status": "Missing in Source", "source": "N/A", "target": "Present"})
-                continue
-            if not target:
-                results.append({"visual": source.get("title"), "status": "Missing in Target", "source": "Present", "target": "N/A"})
-                continue
+        if not source:
+            results.append({"visual": target.get("title"), "status": "Missing in Source", "source": "N/A", "target": "Present"})
+            continue
+        if not target:
+            results.append({"visual": source.get("title"), "status": "Missing in Target", "source": "Present", "target": "N/A"})
+            continue
 
-            type_match = _normalise(source.get("visual_type")) == _normalise(target.get("visual_type"))
-            source_content = { _normalise(item.get("text")) for item in source.get("dom_content", []) if item.get("text") }
-            target_content = { _normalise(item.get("text")) for item in target.get("dom_content", []) if item.get("text") }
+        type_match = _normalise(source.get("visual_type")) == _normalise(target.get("visual_type"))
+        source_content = {_normalise(item.get("text")) for item in source.get("dom_content", []) if item.get("text")}
+        target_content = {_normalise(item.get("text")) for item in target.get("dom_content", []) if item.get("text")}
 
-            content_match = (source_content == target_content)
-            overall_match = type_match and content_match
-            confidence = _pair_confidence(source, target)
-            status = "Match" if overall_match else "Mismatch"
-            if confidence is not None and confidence < 0.7 and status == "Mismatch":
-                status = "needs_review"
+        content_match = (source_content == target_content)
+        overall_match = type_match and content_match
+        confidence = _pair_confidence(source, target)
+        status = "Match" if overall_match else "Mismatch"
+        if confidence is not None and confidence < 0.7 and status == "Mismatch":
+            status = "needs_review"
 
-            results.append({
-                "visual": source.get("title") or target.get("title"),
-                "status": status,
-                "source": f"Data points: {len(source_content)}",
-                "target": f"Data points: {len(target_content)}",
-                "confidence": confidence,
-            })
-        logger.info("Visual comparison completed | total=%d", len(results))
-        return results
-    except Exception:
-        logger.exception("Visual comparison failed")
-        return []
+        results.append({
+            "visual": source.get("title") or target.get("title"),
+            "status": status,
+            "source": f"Data points: {len(source_content)}",
+            "target": f"Data points: {len(target_content)}",
+            "confidence": confidence,
+        })
+    return results
 
 
 def compare_filters(source_filters: list[dict[str, Any]], target_filters: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    logger.info("Starting filter comparison | source=%d | target=%d", len(source_filters), len(target_filters))
-    try:
-        source_map = {_normalise(item.get("filter_name")): item for item in source_filters if item.get("filter_name")}
-        target_map = {_normalise(item.get("filter_name")): item for item in target_filters if item.get("filter_name")}
-        results = []
+    source_map = {_normalise(item.get("filter_name")): item for item in source_filters if item.get("filter_name")}
+    target_map = {_normalise(item.get("filter_name")): item for item in target_filters if item.get("filter_name")}
+    results = []
 
-        for key in sorted(set(source_map) | set(target_map)):
-            source = source_map.get(key)
-            target = target_map.get(key)
+    for key in sorted(set(source_map) | set(target_map)):
+        source = source_map.get(key)
+        target = target_map.get(key)
 
-            if not source:
-                results.append({"filter_name": target.get("filter_name"), "status": "Missing in Source"})
-                continue
-            if not target:
-                results.append({"filter_name": source.get("filter_name"), "status": "Missing in Target"})
-                continue
+        if not source:
+            results.append({"filter_name": target.get("filter_name"), "status": "Missing in Source"})
+            continue
+        if not target:
+            results.append({"filter_name": source.get("filter_name"), "status": "Missing in Target"})
+            continue
 
-            source_values = { _normalise(val) for val in source.get("selected_values", []) }
-            target_values = { _normalise(val) for val in target.get("selected_values", []) }
-            status = "Match" if source_values == target_values else "Mismatch"
+        source_values = {_normalise(val) for val in source.get("selected_values", [])}
+        target_values = {_normalise(val) for val in target.get("selected_values", [])}
+        status = "Match" if source_values == target_values else "Mismatch"
 
+        results.append({
+            "filter_name": source.get("filter_name"),
+            "status": status,
+            "source_selected": list(source.get("selected_values", [])),
+            "target_selected": list(target.get("selected_values", [])),
+            "source_values": list(source.get("available_values", [])),
+            "target_values": list(target.get("available_values", [])),
+        })
+    return results
+
+
+def compare_button_groups(source_groups: list[dict[str, Any]], target_groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    source_map = {_normalise(item.get("name")): item for item in source_groups if item.get("name")}
+    target_map = {_normalise(item.get("name")): item for item in target_groups if item.get("name")}
+    results = []
+
+    for key in sorted(set(source_map) | set(target_map)):
+        source = source_map.get(key)
+        target = target_map.get(key)
+        if not source:
             results.append({
-                "filter_name": source.get("filter_name"),
-                "status": status,
-                "source_selected": list(source.get("selected_values", [])),
-                "target_selected": list(target.get("selected_values", [])),
-                "source_values": list(source.get("available_values", [])),
-                "target_values": list(target.get("available_values", [])),
+                "name": target.get("name"),
+                "status": "Missing in Source",
+                "source_selected": None,
+                "target_selected": target.get("selected_values"),
+                "confidence": target.get("confidence"),
             })
-        logger.info("Filter comparison completed | total=%d", len(results))
-        return results
-    except Exception:
-        logger.exception("Filter comparison failed")
-        return []
-
-
-def compare_button_groups(
-    source_groups: list[dict[str, Any]],
-    target_groups: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Compare which button-slicer chips are selected on Source vs Target."""
-    logger.info("Starting button comparison | source=%d | target=%d", len(source_groups), len(target_groups))
-    try:
-        source_map = {_normalise(item.get("name")): item for item in source_groups if item.get("name")}
-        target_map = {_normalise(item.get("name")): item for item in target_groups if item.get("name")}
-        results = []
-        for key in sorted(set(source_map) | set(target_map)):
-            source = source_map.get(key)
-            target = target_map.get(key)
-            if not source:
-                results.append({
-                    "name": target.get("name"),
-                    "status": "Missing in Source",
-                    "source_selected": None,
-                    "target_selected": target.get("selected_values"),
-                    "confidence": target.get("confidence"),
-                })
-                continue
-            if not target:
-                results.append({
-                    "name": source.get("name"),
-                    "status": "Missing in Target",
-                    "source_selected": source.get("selected_values"),
-                    "target_selected": None,
-                    "confidence": source.get("confidence"),
-                })
-                continue
-            source_sel = {_normalise(val) for val in (source.get("selected_values") or [])}
-            target_sel = {_normalise(val) for val in (target.get("selected_values") or [])}
-            status = "Match" if source_sel == target_sel else "Mismatch"
-            confidence = _pair_confidence(source, target)
-            if confidence is not None and confidence < 0.7 and status == "Mismatch":
-                status = "needs_review"
+            continue
+        if not target:
             results.append({
                 "name": source.get("name"),
-                "status": status,
-                "source_selected": source.get("selected_values") or [],
-                "target_selected": target.get("selected_values") or [],
-                "source_available": source.get("available_values") or [],
-                "target_available": target.get("available_values") or [],
-                "confidence": confidence,
+                "status": "Missing in Target",
+                "source_selected": source.get("selected_values"),
+                "target_selected": None,
+                "confidence": source.get("confidence"),
             })
-        logger.info("Button comparison completed | total=%d", len(results))
-        return results
-    except Exception:
-        logger.exception("Button comparison failed")
-        return []
+            continue
+        source_sel = {_normalise(val) for val in (source.get("selected_values") or [])}
+        target_sel = {_normalise(val) for val in (target.get("selected_values") or [])}
+        status = "Match" if source_sel == target_sel else "Mismatch"
+        confidence = _pair_confidence(source, target)
+        if confidence is not None and confidence < 0.7 and status == "Mismatch":
+            status = "needs_review"
+        results.append({
+            "name": source.get("name"),
+            "status": status,
+            "source_selected": source.get("selected_values") or [],
+            "target_selected": target.get("selected_values") or [],
+            "source_available": source.get("available_values") or [],
+            "target_available": target.get("available_values") or [],
+            "confidence": confidence,
+        })
+    return results
+
+
+def calculate_match_percentage(results: list) -> float | None:
+    if not results:
+        return None
+    matches = sum(1 for result in results if result.get("status") == "Match")
+    return round((matches / len(results)) * 100, 2)
+
+
+def build_comparison_summary(filter_comparison, kpi_comparison, visual_comparison) -> dict:
+    filter_percentage = calculate_match_percentage(filter_comparison)
+    kpi_percentage = calculate_match_percentage(kpi_comparison)
+    visual_percentage = calculate_match_percentage(visual_comparison)
+
+    scored = [v for v in (filter_percentage, kpi_percentage, visual_percentage) if v is not None]
+    overall_percentage = round(sum(scored) / len(scored), 2) if scored else 0.0
+
+    return {
+        "filter_match_percentage": filter_percentage if filter_percentage is not None else 0.0,
+        "kpi_match_percentage": kpi_percentage if kpi_percentage is not None else 0.0,
+        "visual_match_percentage": visual_percentage if visual_percentage is not None else 0.0,
+        "overall_match_percentage": overall_percentage,
+        "kpi_compared": bool(kpi_comparison),
+        "filter_compared": bool(filter_comparison),
+        "visual_compared": bool(visual_comparison),
+    }
 
 
 def compare_dashboard_payloads(source_data: dict[str, Any], target_data: dict[str, Any]) -> dict[str, Any]:
-    logger.info("Starting dashboard comparison")
     try:
-        source_kpis = source_data.get("kpi_cards", []) or []
-        target_kpis = target_data.get("kpi_cards", []) or []
-        source_visuals = source_data.get("visuals", []) or []
-        target_visuals = target_data.get("visuals", []) or []
-        source_filters = source_data.get("filters", []) or []
-        target_filters = target_data.get("filters", []) or []
-
-        kpis = compare_kpis(source_kpis, target_kpis)
-        visuals = compare_visuals(source_visuals, target_visuals)
-        filters = compare_filters(source_filters, target_filters)
-        buttons = compare_button_groups(
-            source_data.get("button_groups") or [],
-            target_data.get("button_groups") or [],
-        )
+        kpis = compare_kpis(source_data.get("kpi_cards") or [], target_data.get("kpi_cards") or [])
+        visuals = compare_visuals(source_data.get("visuals") or [], target_data.get("visuals") or [])
+        filters = compare_filters(source_data.get("filters") or [], target_data.get("filters") or [])
+        buttons = compare_button_groups(source_data.get("button_groups") or [], target_data.get("button_groups") or [])
 
         summary = build_comparison_summary(filters, kpis, visuals)
         button_percentage = calculate_match_percentage(buttons)
         summary["button_match_percentage"] = button_percentage if button_percentage is not None else 0.0
 
-        logger.info(
-            "Dashboard comparison completed | filters=%d | kpis=%d | visuals=%d | buttons=%d",
-            len(filters),
-            len(kpis),
-            len(visuals),
-            len(buttons),
-        )
         return {
             "status": "success",
             "filters": filters,
@@ -255,7 +442,7 @@ def compare_dashboard_payloads(source_data: dict[str, Any], target_data: dict[st
             "buttons": buttons,
             "tables": [],
             "summary": summary,
-            "results": kpis, # Backward compatibility
+            "results": kpis,
             "match_percentage": summary.get("overall_match_percentage"),
         }
     except Exception as exc:
@@ -266,3 +453,89 @@ def compare_dashboard_payloads(source_data: dict[str, Any], target_data: dict[st
             "filters": [], "kpis": [], "visuals": [], "tables": [],
             "summary": {"filter_match_percentage": 0.0, "kpi_match_percentage": 0.0, "visual_match_percentage": 0.0, "overall_match_percentage": 0.0},
         }
+
+
+# ============================================================================
+# 3. MISMATCH EXTRACTION & SNAPSHOTS
+# ============================================================================
+
+def _is_mismatch(item: dict[str, Any]) -> bool:
+    status = str(item.get("status", "")).strip()
+    return bool(status and status not in _MATCH_STATUSES)
+
+
+def _filter_mismatches(items: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    return [item for item in (items or []) if _is_mismatch(item)]
+
+
+def build_mismatch_payload(
+    comparison: dict[str, Any],
+    *,
+    visual_data: dict[str, Any] | None = None,
+    metrics: list[dict[str, Any] | None] | None = None,
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    """Build mismatch-only payload from a validation comparison result."""
+    filters = _filter_mismatches(comparison.get("filters"))
+    kpis = _filter_mismatches(comparison.get("kpis")) or _filter_mismatches(comparison.get("results"))
+    visuals = _filter_mismatches(comparison.get("visuals"))
+
+    table_visuals: list[dict[str, Any]] = []
+    table_cells: list[dict[str, Any]] = []
+    if visual_data:
+        table_comparison = build_table_comparisons(visual_data)
+        table_visuals = _filter_mismatches(table_comparison.get("summary"))
+        table_cells = _filter_mismatches(table_comparison.get("cells"))
+
+    # Compare browser execution timing metrics
+    browser_metrics: list[dict[str, Any]] = []
+    if metrics and len(metrics) >= 2:
+        browser_metrics = compare_browser_metrics(metrics[0], metrics[1])
+
+    total = (
+        len(filters)
+        + len(kpis)
+        + len(visuals)
+        + len(table_cells)
+        + len(browser_metrics)
+    )
+    summary = comparison.get("summary") or {}
+
+    return {
+        "run_id": run_id,
+        "status": comparison.get("status"),
+        "reason": comparison.get("reason"),
+        "summary": {
+            "total_mismatches": total,
+            "filter_mismatch_count": len(filters),
+            "kpi_mismatch_count": len(kpis),
+            "visual_mismatch_count": len(visuals),
+            "table_visual_mismatch_count": len(table_visuals),
+            "table_cell_mismatch_count": len(table_cells),
+            "browser_metric_mismatch_count": len(browser_metrics),
+            "overall_match_percentage": summary.get("overall_match_percentage"),
+        },
+        "filters": filters,
+        "kpis": kpis,
+        "results": kpis,
+        "visuals": visuals,
+        "table_visuals": table_visuals,
+        "table_cells": table_cells,
+        "browser_metrics": browser_metrics,
+        "match_percentage": comparison.get("match_percentage"),
+        "mismatches_download_url": f"/api/reports/{run_id}/mismatches" if run_id else None,
+    }
+
+
+def save_mismatch_snapshot(run_id: str, payload: dict[str, Any], output_directory: Path) -> Path:
+    output_directory.mkdir(parents=True, exist_ok=True)
+    path = output_directory / f"{run_id}_mismatches.json"
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return path
+
+
+def save_filters_snapshot(run_id: str, payload: dict[str, Any], output_directory: Path) -> Path:
+    output_directory.mkdir(parents=True, exist_ok=True)
+    path = output_directory / f"{run_id}_filters.json"
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return path

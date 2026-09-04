@@ -196,17 +196,19 @@ def _snapshot_is_busy(snapshot: dict) -> bool:
 
 
 async def wait_for_dashboard(page, *, previous_snapshot: dict | None = None):
-    """
-    Wait until visual containers exist, stop appearing, and stop showing
-    loading placeholders.
-
-    Pass previous_snapshot (from capture_dashboard_snapshot) after a filter
-    click. We then wait until visuals change or a loading state appears,
-    so we do not treat the old stable screen as "already done".
-    """
+    """Wait until visual containers exist, stop appearing, and stop showing loading placeholders."""
+    # 1. Guard against closed/dead Playwright pages
+    if not page or page.is_closed():
+        logger.warning("Skipping wait_for_dashboard: Page target is closed or unavailable.")
+        return
 
     try:
-        await page.wait_for_function(_DASHBOARD_READY_JS, timeout=PAGE_TIMEOUT)
+        # Guard check before Playwright call
+        if not page.is_closed():
+            await page.wait_for_function(_DASHBOARD_READY_JS, timeout=PAGE_TIMEOUT)
+
+        if page.is_closed():
+            return
 
         # Let Power BI finish creating the rest of the visual shells.
         await page.wait_for_timeout(750)
@@ -216,10 +218,12 @@ async def wait_for_dashboard(page, *, previous_snapshot: dict | None = None):
         max_wait_ms = max(int(RENDER_WAIT), 15000)
         max_loops = max(8, max_wait_ms // poll_ms)
 
-        if previous_snapshot:
+        if previous_snapshot and not page.is_closed():
             before_sig = _snapshot_signature(previous_snapshot)
             changed = False
             for _ in range(max(8, 20000 // poll_ms)):
+                if page.is_closed():
+                    break
                 current = await capture_dashboard_snapshot(page)
                 if _snapshot_is_busy(current) or _snapshot_signature(current) != before_sig:
                     changed = True
@@ -231,15 +235,17 @@ async def wait_for_dashboard(page, *, previous_snapshot: dict | None = None):
                     break
                 await page.wait_for_timeout(poll_ms)
             if not changed:
-                logger.info(
-                    "No visual change yet after filter; waiting for a quiet render anyway"
-                )
+                logger.info("No visual change yet after filter; waiting for a quiet render anyway")
 
         stable_samples = 0
         previous_signature = None
         previous_count = None
 
         for _ in range(max_loops):
+            if page.is_closed():
+                logger.warning("Page closed during stability polling loops.")
+                return
+
             snapshot = await capture_dashboard_snapshot(page)
             signature = _snapshot_signature(snapshot)
             count = snapshot.get("count") or 0
@@ -255,10 +261,7 @@ async def wait_for_dashboard(page, *, previous_snapshot: dict | None = None):
             ):
                 stable_samples += 1
                 if stable_samples >= stable_needed:
-                    logger.info(
-                        "Dashboard visuals are stable | containers=%d",
-                        count,
-                    )
+                    logger.info("Dashboard visuals are stable | containers=%d", count)
                     return
             else:
                 stable_samples = 0
@@ -267,14 +270,15 @@ async def wait_for_dashboard(page, *, previous_snapshot: dict | None = None):
             previous_count = count
             await page.wait_for_timeout(poll_ms)
 
-        logger.warning(
-            "Dashboard did not reach a fully stable state; continuing after timeout"
-        )
+        logger.warning("Dashboard did not reach a fully stable state; continuing after timeout")
 
     except Exception as e:
-        print(f"Error while waiting for dashboard to render: {e}")
+        # If the tab was closed by Playwright or Edge, log gracefully instead of re-raising
+        if page and page.is_closed():
+            logger.error("Target page or context was closed while waiting for dashboard render.")
+            return
+        logger.error(f"Error while waiting for dashboard to render: {e}")
         raise
-
 
 async def launch_browser():
     """

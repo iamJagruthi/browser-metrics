@@ -1666,3 +1666,64 @@ async def export_table_visuals(
     )
 
     return exported_tables
+
+# Add this at the bottom of table_exporter.py
+
+from services.table_comparison import build_table_comparisons
+
+def export_and_compare_tables(
+    source_exports: list[dict[str, Any]], 
+    target_exports: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """
+    Takes completed Source and Target export results, runs Pandas table comparison,
+    and returns structured results including column mismatches for reporting services.
+    """
+    # 1. Format exports into the structure expected by build_table_comparisons()
+    visual_data = {
+        "Source": {
+            "visuals": [
+                {
+                    "title": item.get("title"),
+                    "data": item.get("data") or {"columns": [], "rows": []},
+                    "scrollable": True
+                }
+                for item in source_exports if item.get("status") == "downloaded"
+            ]
+        },
+        "Target": {
+            "visuals": [
+                {
+                    "title": item.get("title"),
+                    "data": item.get("data") or {"columns": [], "rows": []},
+                    "scrollable": True
+                }
+                for item in target_exports if item.get("status") == "downloaded"
+            ]
+        }
+    }
+
+    # 2. Run the Pandas comparison engine
+    comparison_results = build_table_comparisons(visual_data)
+
+    # 3. Extract mismatched columns directly for Word document reporting
+    column_mismatches = []
+    for table in comparison_results.get("tables", []):
+        source_only = table.get("source_only_columns", [])
+        target_only = table.get("target_only_columns", [])
+        col_diffs = table.get("column_differences", [])
+
+        if source_only or target_only or col_diffs:
+            column_mismatches.append({
+                "visual": table.get("visual"),
+                "status": table.get("status"),
+                "source_only_columns": source_only,
+                "target_only_columns": target_only,
+                "column_differences": col_diffs,
+            })
+
+    # 4. Return combined comparison output
+    return {
+        **comparison_results,
+        "column_mismatches": column_mismatches,
+    }

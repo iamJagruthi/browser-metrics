@@ -435,6 +435,15 @@ class VisualDataExporter:
                                 .filter(Boolean)
                         )];
 
+                    // 1. EXTRACT BASIC TYPE INFORMATION FIRST
+                    const visualType = clean(
+                        node.getAttribute('data-visual-type')
+                    ).toLowerCase();
+
+                    const ariaRoleDescription = clean(
+                        node.getAttribute('aria-roledescription')
+                    ).toLowerCase();
+
                     const typeAttributes = [
                         node.getAttribute('data-visual-type'),
                         node.getAttribute('aria-roledescription'),
@@ -463,13 +472,32 @@ class VisualDataExporter:
                         return label && !chromeButton.test(label);
                     });
 
-                    // Bookmark/nav = action button. Name chips like Overall = button slicer.
-                    const isActionButton = /actionbutton|bookmark|navigation/i.test(typeSource);
+                    // 2. ACTION BUTTONS, NAV, IMAGES, & NON-DATA CHECKS
+                    const isActionButton = /actionbutton|bookmark|navigation|weburl/i.test(typeSource);
+
                     const isButtonSlicer =
                         /buttonslicer|chicletslicer/i.test(typeSource)
                         || Boolean(node.querySelector('.buttonSlicerVisual, [class*="buttonSlicer" i]'))
                         || (buttonNodes.length >= 2 && /slicer|button/i.test(typeSource));
+
                     const isButton = isButtonSlicer && !isActionButton;
+
+                    const isImage =
+                        visualType === 'image' ||
+                        visualType === 'img' ||
+                        ariaRoleDescription === 'image' ||
+                        Boolean(node.querySelector('img, image, svg[class*="image" i]'));
+
+                    const isShape =
+                        /shape|basicShape|textbox|line/i.test(typeSource) ||
+                        visualType === 'shape' ||
+                        visualType === 'textbox';
+
+                    const rawText = clean(node.innerText || node.getAttribute('aria-label') || '');
+                    const isNavigationOrBookmarkText = /click here to|bookmark|page navigation|web url|open the document/i.test(rawText);
+
+                    // Master non-data flag to exclude decorative or navigation elements
+                    const isNonDataElement = (isActionButton || isImage || isShape || isNavigationOrBookmarkText) && !isButtonSlicer;
 
                     const isDropdown =
                         /dropdown/i.test(typeSource) ||
@@ -487,14 +515,6 @@ class VisualDataExporter:
                         /card|kpi|callout|multirowcard/i.test(typeSource) && !isButton && !isSlicer;
 
                     // TABLE / MATRIX DETECTION
-                    const visualType = clean(
-                        node.getAttribute('data-visual-type')
-                    ).toLowerCase();
-
-                    const ariaRoleDescription = clean(
-                        node.getAttribute('aria-roledescription')
-                    ).toLowerCase();
-
                     const classSource = [
                         typeof node.className === 'string'
                             ? node.className
@@ -701,8 +721,8 @@ class VisualDataExporter:
                         id: node.getAttribute('data-visual-id') || node.id || `visual-${index + 1}`,
                         index: index,
                         title: title || `Visual ${index + 1}`,
-                        visual_type: clean(node.getAttribute('data-visual-type')) || clean(node.getAttribute('aria-roledescription')) || 'unknown',
-                        aria_role: clean(node.getAttribute('aria-roledescription')),
+                        visual_type: visualType || ariaRoleDescription || 'unknown',
+                        aria_role: ariaRoleDescription,
                         type_source: clean(typeSource),
                         accessible_text: accessibleText,
                         accessible_text_length: accessibleText.length,
@@ -716,6 +736,7 @@ class VisualDataExporter:
                             width: Math.round(rect.width),
                             height: Math.round(rect.height)
                         },
+                        is_non_data_element: Boolean(isNonDataElement),
                         is_button: Boolean(isButton),
                         is_dropdown: Boolean(isDropdown),
                         is_kpi_or_card: Boolean(isKpiOrCard),
@@ -744,6 +765,30 @@ class VisualDataExporter:
             )
 
             return metadata
+
+        except Exception as exc:
+            logger.exception("Visual inspection failed | dashboard=%s | index=%d", self.dashboard_name, index + 1)
+            return {
+                "id": f"visual-{index + 1}",
+                "index": index,
+                "title": f"Visual {index + 1}",
+                "visual_type": "unknown",
+                "is_non_data_element": False,
+                "is_button": False,
+                "is_dropdown": False,
+                "is_kpi_or_card": False,
+                "is_slicer": False,
+                "is_tabular": False,
+                "is_table": False,
+                "is_matrix": False,
+                "scrollable": False,
+                "horizontally_scrollable": False,
+                "is_loading_placeholder": False,
+                "confidence": 0.3,
+                "selected_values": [],
+                "available_values": [],
+                "inspection_error": str(exc),
+            }
 
         except Exception as exc:
             logger.exception("Visual inspection failed | dashboard=%s | index=%d", self.dashboard_name, index + 1)
@@ -831,10 +876,19 @@ class VisualDataExporter:
 
                 visual = await self._inspect_visual(locator, index)
 
-                # LOADING PLACEHOLDER
-                if visual.get("is_loading_placeholder"):
-                    # logger.info("Skipping loading visual | index=%d | title=%s", index + 1, visual.get("title"))
-                    # result["skipped_visuals"].append({"index": index + 1, "reason": "loading_placeholder", "title": visual.get("title")})
+                # NEW: Skip non-data elements (Images, Bookmarks, Page Nav, Web URLs, Shapes)
+                if visual.get("is_non_data_element"):
+                    logger.info(
+                        "Skipping non-data element | index=%d | title=%s | type=%s",
+                        index + 1,
+                        visual.get("title"),
+                        visual.get("visual_type"),
+                    )
+                    result["skipped_visuals"].append({
+                        "index": index + 1, 
+                        "reason": "non_data_element", 
+                        "title": visual.get("title")
+                    })
                     continue
 
                 # KPI / CARD — already stored in kpi_cards; do not treat as a chart.

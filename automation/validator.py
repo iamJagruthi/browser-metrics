@@ -13,21 +13,17 @@ from .metrics import build_metrics
 from services.dashboard_inventory_service import (
     build_inventory_api_payload,
     build_pages_showcase_payload,
-    save_inventory_snapshot,
-    save_pages_snapshot,
 )
-from services.excel_exporter import export_validation_workbook
-from services.mismatch_service import build_mismatch_payload, save_mismatch_snapshot
-from services.filter_service import build_filters_api_payload, save_filters_snapshot
+
 from services.visual_data_exporter import extract_visual_data
-from services.table_exporter import export_table_visuals
 from utils.config import DASHBOARD_CONFIG, OUTPUT_DIR, PAGE_TIMEOUT, SCREENSHOT_DIR
-# commenting the below import as we are going ahead without ai
-# from ai.Text_Extraction import extract_dashboard_json
-from services.visual_data_exporter import extract_visual_data
 from automation.SlicerEngine import SlicerEngine
 from automation.test_page_navigation import get_dashboard_pages, navigate_to_page
-
+from services.comparison_service import (
+    build_filters_api_payload,
+    build_mismatch_payload,
+    compare_dashboard_payloads,
+)    
 
 logger = logging.getLogger(__name__)
 
@@ -140,7 +136,14 @@ class DashboardValidator:
                     self.timer.stop("total_execution")
                 except Exception:
                     pass
-
+                
+                metrics = await self._capture_metrics(
+                dashboard,
+                page,
+                response,
+                page_name=page_name,
+                screenshot_path=screenshot_path,
+            )
                 return playwright, context, executions, page_filter_selections
 
             # ============================================================
@@ -165,20 +168,20 @@ class DashboardValidator:
                 attempt_export=True,
             )
 
+            # ✅ CORRECT (Single extraction call wrapped inside the performance timer)
             self.timer.start("visual_extraction")
 
             try:
                 visual_data = await extract_visual_data(
                     page,
-                    attempt_export=False,
+                    download_directory=OUTPUT_DIR / "visual_exports",
+                    attempt_export=True,
                 )
-
             except Exception as exc:
                 logger.exception(
                     "DOM visual extraction failed | dashboard=%s",
                     dashboard.get("name"),
                 )
-
                 visual_data = {
                     "status": "failed",
                     "kpi_cards": [],
@@ -186,7 +189,6 @@ class DashboardValidator:
                     "filters": [],
                     "errors": [str(exc)],
                 }
-
             finally:
                 self.timer.stop("visual_extraction")
 
@@ -196,6 +198,7 @@ class DashboardValidator:
                 dashboard,
                 page,
                 response,
+                page_name = page_name,
                 screenshot_path=screenshot_path,
             )
             metrics["extraction_status"] = extraction["status"]
@@ -266,11 +269,15 @@ class DashboardValidator:
             dashboard_url=dashboard["url"],
             timers=self.timer.summary(),
             network_summary=summary(),
-            network_details=details(),
+            network_details={}, #by passing the empty dic stopping the network in json paylod
             page_title=title,
             final_url=final_url,
             http_status=response.status if response else None,
         )
+        
+        # Optionally remove the key entirely if build_metrics still includes it:
+        metrics.pop("network_details", None)
+
         if page_name:
             metrics["page_name"] = page_name
         if screenshot_path:
@@ -504,13 +511,18 @@ class DashboardValidator:
                         run_id,
                     )
 
-            report_paths = self._export_reports(
-                run_id,
-                report_executions,
-                comparison,
-                executions_by_dashboard=executions_by_dashboard,
-                multi_page_mode=multi_page_mode,
+            # Generates mismatchpayload directly without calling document exporters
+            mismatches_payload = build_mismatch_payload(
+                comparison, 
+                run_id=run_id
             )
+
+            report_paths = {
+                "excel": None,
+                "document": None,
+                "document_error": None,
+                "mismatches_data": mismatches_payload,
+            }
 
             public_executions = [
                 {
@@ -552,14 +564,6 @@ class DashboardValidator:
             # ============================================================
 
             if multi_page_mode:
-                llm_results = [
-                    {
-                        "dashboard": item["dashboard"].get("name"),
-                        "page_name": item["dashboard"].get("page_name"),
-                        "extraction": item["visual_data"].get("data"),
-                    }
-                    for item in executions
-                ]
 
                 visual_results = [
                     {
@@ -775,19 +779,6 @@ class DashboardValidator:
                     download_directory=OUTPUT_DIR / "visual_exports",
                 )
 
-                from services.excel_exporter import (
-                    build_visual_data_comparison,
-                )
-
-                scenario["visual_comparison"] = (
-                    build_visual_data_comparison(
-                        {
-                            "Source": source_visual,
-                            "Target": target_visual,
-                        }
-                    )["summary"]
-                )
-
                 scenario_id = uuid.uuid4().hex[:8]
 
                 source_image = (
@@ -815,41 +806,6 @@ class DashboardValidator:
                     "target": str(target_image),
                 }
 
-                # try:
-                #     from ai.Text_Extraction import (
-                #         extract_dashboard_json,
-                #     )
-
-                #     source_analysis, target_analysis = (
-                #         await asyncio.gather(
-                #             asyncio.to_thread(
-                #                 extract_dashboard_json,
-                #                 source_image,
-                #             ),
-                #             asyncio.to_thread(
-                #                 extract_dashboard_json,
-                #                 target_image,
-                #             ),
-                #         )
-                #     )
-
-                #     scenario["ai_analysis"] = {
-                #         "source_kpis": source_analysis.get(
-                #             "kpi_cards",
-                #             [],
-                #         ),
-                #         "target_kpis": target_analysis.get(
-                #             "kpi_cards",
-                #             [],
-                #         ),
-                #     }
-
-                # except Exception as exc:
-                #     logger.exception(
-                #         "Slicer screenshot AI analysis failed"
-                #     )
-
-                #     scenario["ai_analysis_error"] = str(exc)
 
             else:
                 scenario["status"] = "not_run"
@@ -877,153 +833,6 @@ class DashboardValidator:
             source_data,
             target_data,
         )
-
-    def _export_reports(
-        self,
-        run_id,
-        executions,
-        comparison,
-        executions_by_dashboard=None,
-        multi_page_mode=False,
-    ):
-        if len(executions) < 2:
-            return {}
-
-        paths = {}
-        page_comparisons = comparison.get("page_comparisons", [])
-        public_groups = None
-        if executions_by_dashboard:
-            public_groups = [
-                [
-                    {key: value for key, value in item.items() if key != "_page"}
-                    for item in group
-                ]
-                for group in executions_by_dashboard
-            ]
-
-        try:
-            from services.docx_reporter import (
-                generate_validation_document,
-            )
-
-            document = generate_validation_document(
-                run_id,
-                executions,
-                comparison,
-                OUTPUT_DIR / "reports",
-                page_comparisons=page_comparisons if multi_page_mode else None,
-                executions_by_dashboard=public_groups,
-            )
-
-            paths["document"] = str(document)
-
-        except ModuleNotFoundError as exc:
-            if exc.name != "docx":
-                raise
-
-            paths["document_error"] = (
-                "Word report skipped: install "
-                "python-docx from requirements.txt."
-            )
-        except Exception:
-            logger.exception("Word report generation failed | run_id=%s", run_id)
-            paths["document_error"] = "Word report generation failed. See server logs."
-
-        try:
-            comparison_payload = comparison if comparison.get("status") == "success" else {
-                "filters": comparison.get("filters", []),
-                "kpis": comparison.get("kpis", []),
-                "visuals": comparison.get("visuals", []),
-                "summary": comparison.get("summary", {
-                    "filter_match_percentage": 0.0,
-                    "kpi_match_percentage": 0.0,
-                    "visual_match_percentage": 0.0,
-                    "overall_match_percentage": 0.0,
-                }),
-                "slicer_scenarios": comparison.get("slicer_scenarios", []),
-            }
-            source_payload = self._build_comparison_payload(executions[0])
-            target_payload = self._build_comparison_payload(executions[1])
-            workbook = export_validation_workbook(
-                run_id,
-                source_payload,
-                target_payload,
-                comparison_payload.get("filters", []),
-                comparison_payload.get("kpis", []),
-                comparison_payload.get("visuals", []),
-                comparison_payload.get("summary", {}),
-                [item.get("metrics", {}) for item in executions],
-                OUTPUT_DIR / "reports",
-                visual_data={
-                    "Source": executions[0]["visual_data"],
-                    "Target": executions[1]["visual_data"],
-                },
-                slicer_scenarios=comparison_payload.get("slicer_scenarios", []),
-                page_comparisons=page_comparisons if multi_page_mode else None,
-                executions_by_dashboard=public_groups,
-            )
-            paths["excel"] = str(workbook)
-        except Exception as exc:
-            logger.exception("Excel workbook generation failed | run_id=%s", run_id)
-            paths["excel_error"] = f"Excel report failed: {exc}"
-
-        try:
-            public_executions = [
-                {key: value for key, value in item.items() if key != "_page"}
-                for item in executions
-            ]
-            filters_payload = build_filters_api_payload(
-                public_executions,
-                run_id=run_id,
-                comparison_filters=comparison.get("filters", []),
-            )
-            save_filters_snapshot(run_id, filters_payload, OUTPUT_DIR / "reports")
-            paths["filters"] = str(OUTPUT_DIR / "reports" / f"{run_id}_filters.json")
-            inventory_payload = build_inventory_api_payload(
-                public_executions,
-                run_id=run_id,
-            )
-            save_inventory_snapshot(run_id, inventory_payload, OUTPUT_DIR / "reports")
-            paths["inventory"] = str(OUTPUT_DIR / "reports" / f"{run_id}_inventory.json")
-            pages_payload = build_pages_showcase_payload(
-                public_executions,
-                executions_by_dashboard=public_groups,
-                run_id=run_id,
-            )
-            save_pages_snapshot(run_id, pages_payload, OUTPUT_DIR / "reports")
-            paths["pages"] = str(OUTPUT_DIR / "reports" / f"{run_id}_pages.json")
-            mismatch_payload = build_mismatch_payload(
-                comparison,
-                visual_data={
-                    "Source": executions[0]["visual_data"],
-                    "Target": executions[1]["visual_data"],
-                },
-                metrics=[item.get("metrics", {}) for item in executions],
-                run_id=run_id,
-            )
-            save_mismatch_snapshot(run_id, mismatch_payload, OUTPUT_DIR / "reports")
-            paths["mismatches"] = str(OUTPUT_DIR / "reports" / f"{run_id}_mismatches.json")
-            paths["mismatches_data"] = mismatch_payload
-        except Exception:
-            logger.exception("Filter/inventory snapshot save failed | run_id=%s", run_id)
-
-        return paths
-
-    # ============================================================
-    # Arun - Process Dashboard Page
-    # ============================================================
-
-
-
-    # ============================================================
-    # Arun - Multi Page Dashboard Navigation
-    # ============================================================
-
-
-
-    # ============================================================
-    # Arun - Multi Page Comparison Helpers
-    # ============================================================
 
     @staticmethod
     def _get_first_matching_page_pair(
@@ -1221,7 +1030,7 @@ class DashboardValidator:
                         timeout=PAGE_TIMEOUT,
                     )
                     await wait_for_dashboard(page)
-                    pages = await self.get_dashboard_pages(page)
+                    pages = await get_dashboard_pages(page)
                     page_items = pages if len(pages) > 1 else [{"name": "Default", "selected": True}]
                     for page_info in page_items:
                         page_name = page_info["name"]
