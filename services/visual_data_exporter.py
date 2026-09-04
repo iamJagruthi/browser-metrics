@@ -411,7 +411,6 @@ class VisualDataExporter:
 
             metadata = await locator.evaluate(
                 r"""(node, index) => {
-
                     const clean = value =>
                         String(value || '')
                             .replace(/\s+/g, ' ')
@@ -419,7 +418,6 @@ class VisualDataExporter:
 
                     const getText = element => {
                         if (!element) return '';
-
                         return clean(
                             element.innerText ||
                             element.getAttribute('aria-label') ||
@@ -650,46 +648,6 @@ class VisualDataExporter:
                             return canScrollX(element) && /(auto|scroll|hidden)/i.test(style.overflowX);
                         });
 
-                    // GRAPH / VISUAL CONTENT EXTRACTION
-                    const contentSelectors = [
-                        'svg text',
-                        '[aria-label]',
-                        '[title]',
-                        '[role="img"]',
-                        '[role="graphics-symbol"]',
-                        '[role="graphics-document"]',
-                        '[role="listitem"]'
-                    ];
-
-                    const elements = [...node.querySelectorAll(contentSelectors.join(','))];
-                    const domContent = [];
-                    const seenContent = new Set();
-
-                    for (const element of elements) {
-                        if (!element || !element.isConnected) continue;
-
-                        const text =
-                            getText(element) ||
-                            clean(element.getAttribute('aria-label')) ||
-                            clean(element.getAttribute('title'));
-
-                        if (!text) continue;
-
-                        const item = {
-                            tag: clean(element.tagName).toLowerCase(),
-                            role: clean(element.getAttribute('role')),
-                            aria_label: clean(element.getAttribute('aria-label')),
-                            title: clean(element.getAttribute('title')),
-                            text
-                        };
-
-                        const key = [item.tag, item.role, item.aria_label, item.title, item.text].join('|');
-                        if (seenContent.has(key)) continue;
-
-                        seenContent.add(key);
-                        domContent.push(item);
-                    }
-
                     const svgText = unique([...node.querySelectorAll('svg text')].map(e => clean(e.textContent)));
                     const ariaLabels = unique([...node.querySelectorAll('[aria-label]')].map(e => clean(e.getAttribute('aria-label'))));
                     const titles = unique([...node.querySelectorAll('[title]')].map(e => clean(e.getAttribute('title'))));
@@ -712,7 +670,6 @@ class VisualDataExporter:
                     if (title && !/^Visual \d+$/i.test(title)) confidence += 0.2;
                     const knownType = clean(node.getAttribute('data-visual-type') || node.getAttribute('aria-roledescription'));
                     if (knownType && knownType !== 'unknown') confidence += 0.15;
-                    if (domContent.length >= 2) confidence += 0.15;
                     if ((accessibleText || '').length > 20) confidence += 0.1;
                     if (isButton && selectedValues.length) confidence = Math.max(confidence, 0.75);
                     confidence = Math.min(0.99, Math.round(confidence * 100) / 100);
@@ -726,7 +683,6 @@ class VisualDataExporter:
                         type_source: clean(typeSource),
                         accessible_text: accessibleText,
                         accessible_text_length: accessibleText.length,
-                        dom_content: domContent,
                         svg_text: svgText,
                         aria_labels: ariaLabels,
                         titles: titles,
@@ -774,29 +730,6 @@ class VisualDataExporter:
                 "title": f"Visual {index + 1}",
                 "visual_type": "unknown",
                 "is_non_data_element": False,
-                "is_button": False,
-                "is_dropdown": False,
-                "is_kpi_or_card": False,
-                "is_slicer": False,
-                "is_tabular": False,
-                "is_table": False,
-                "is_matrix": False,
-                "scrollable": False,
-                "horizontally_scrollable": False,
-                "is_loading_placeholder": False,
-                "confidence": 0.3,
-                "selected_values": [],
-                "available_values": [],
-                "inspection_error": str(exc),
-            }
-
-        except Exception as exc:
-            logger.exception("Visual inspection failed | dashboard=%s | index=%d", self.dashboard_name, index + 1)
-            return {
-                "id": f"visual-{index + 1}",
-                "index": index,
-                "title": f"Visual {index + 1}",
-                "visual_type": "unknown",
                 "is_button": False,
                 "is_dropdown": False,
                 "is_kpi_or_card": False,
@@ -1039,9 +972,25 @@ class VisualDataExporter:
                     continue
 
                 # TABULAR VISUALS
-                if visual.get("is_table") or visual.get("is_matrix"):
-                    logger.info("Adding tabular visual for export | index=%d", index + 1)
-                    result["table_visuals"].append(visual)
+                #Triggers table exports for any visual flagged as tabular
+                is_exportable_table = (
+                    (
+                        visual.get("is_table") 
+                        or visual.get("is_matrix") 
+                        or visual.get("is_tabular")
+                    )
+                    and not visual.get("is_button")
+                    and not visual.get("is_non_data_element")
+                )
+
+                if is_exportable_table:
+                    # Double-check title text to avoid action buttons
+                    raw_title = str(visual.get("title") or "").lower()
+                    if "click here to" in raw_title or "bookmark" in raw_title:
+                        logger.info("Skipping bookmark navigation from table export | title=%s", visual.get("title"))
+                    else:
+                        logger.info("Adding tabular visual for export | index=%d", index + 1)
+                        result["table_visuals"].append(visual)
                     continue
 
                 # NORMAL GRAPH / VISUAL

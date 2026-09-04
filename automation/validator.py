@@ -46,17 +46,7 @@ class DashboardValidator:
         filter_selections=None,
         browser_launch_elapsed=0.0,
     ):
-        """Run one dashboard in a supplied authenticated Edge tab when available.
-
-        `filter_selections`, if provided, is a {page_name: {filter_name: value}}
-        map captured from an earlier (source) dashboard run. When present,
-        each report page replays exactly those filter/value pairs instead of
-        picking new random ones, so the two dashboards end up compared in the
-        same filtered state. Returns a 4th value: a {page_name: {filter_name:
-        value}} map of whatever this dashboard actually applied, so a later
-        (target) dashboard can replay it. This is empty for the single-page
-        path, since no page-level filter randomization happens there.
-        """
+        """Run one dashboard in a supplied authenticated Edge tab when available."""
         extraction = {"status": "not_used", "data": None, "error": None}
         visual_data = {"status": "failed", "filters": [], "visuals": [], "errors": []}
         response = None
@@ -67,9 +57,6 @@ class DashboardValidator:
             self.timer.reset()
             self.timer.start("total_execution")
 
-            # Compare runs launch Edge in run_links, then pass in `page`.
-            # Time that launch there and inject it here, otherwise this
-            # timer never starts and browser_launch_seconds stays 0.
             if page is None:
                 self.timer.start("browser_launch")
                 playwright, context, page = await launch_browser()
@@ -93,61 +80,49 @@ class DashboardValidator:
             self.timer.stop("dashboard_render")
 
             # ============================================================
-            # Arun - Multi Page Dashboard Processing
+            # Multi-Page Dashboard Processing
             # ============================================================
 
             pages = await get_dashboard_pages(page)
 
-            # Only use the new multi-page flow when the dashboard
-            # actually contains more than one report page.
             if len(pages) > 1:
                 executions = []
                 page_filter_selections = {}
 
                 for page_info in pages:
-                    page_name = page_info["name"]
+                    current_page_name = page_info["name"]
 
                     logger.info(
                         "Processing dashboard page | dashboard=%s | page=%s",
                         dashboard.get("name"),
-                        page_name,
+                        current_page_name,
                     )
 
                     if not page_info["selected"]:
-                        await navigate_to_page(
-                            page,
-                            page_name,
-                        )
+                        await navigate_to_page(page, current_page_name)
 
-                    predetermined = (filter_selections or {}).get(page_name)
+                    predetermined = (filter_selections or {}).get(current_page_name)
 
                     execution, applied = await engine.process_dashboard_page(
                         dashboard=dashboard,
                         page=page,
                         response=response,
-                        page_name=page_name,
+                        page_name=current_page_name,
                         predetermined_filters=predetermined,
                     )
 
                     executions.extend(execution)
-                    page_filter_selections[page_name] = applied
+                    page_filter_selections[current_page_name] = applied
 
                 try:
                     self.timer.stop("total_execution")
                 except Exception:
                     pass
-                
-                metrics = await self._capture_metrics(
-                dashboard,
-                page,
-                response,
-                page_name=page_name,
-                screenshot_path=screenshot_path,
-            )
+
                 return playwright, context, executions, page_filter_selections
 
             # ============================================================
-            # Existing single-page processing
+            # Single-Page Processing
             # ============================================================
 
             self.timer.start("screenshot")
@@ -161,16 +136,7 @@ class DashboardValidator:
             )
             self.timer.stop("screenshot")
 
-            # Independent of Gemini: sees the live signed-in browser and filters.
-            visual_data = await extract_visual_data(
-                page,
-                download_directory=OUTPUT_DIR / "visual_exports",
-                attempt_export=True,
-            )
-
-            # ✅ CORRECT (Single extraction call wrapped inside the performance timer)
             self.timer.start("visual_extraction")
-
             try:
                 visual_data = await extract_visual_data(
                     page,
@@ -198,7 +164,7 @@ class DashboardValidator:
                 dashboard,
                 page,
                 response,
-                page_name = page_name,
+                page_name="Default",
                 screenshot_path=screenshot_path,
             )
             metrics["extraction_status"] = extraction["status"]
@@ -225,7 +191,6 @@ class DashboardValidator:
                 pass
 
             raise
-
     @staticmethod
     def _build_comparison_payload(execution: dict) -> dict:
         """

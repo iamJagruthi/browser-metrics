@@ -352,6 +352,25 @@ def compare_filters(source_filters: list[dict[str, Any]], target_filters: list[d
         })
     return results
 
+def _extract_table_cell_mismatches(table_comparison: dict[str, Any], max_cells: int = 50) -> list[dict[str, Any]]:
+    """Extract cell-level differences without loading full table row arrays."""
+    mismatched_cells: list[dict[str, Any]] = []
+    
+    # Process cell diffs returned from table_comparison engine
+    for cell in table_comparison.get("cells", []):
+        if _is_mismatch(cell):
+            mismatched_cells.append({
+                "table_title": cell.get("table_title") or cell.get("visual"),
+                "row": cell.get("row"),
+                "column": cell.get("column"),
+                "source_value": cell.get("source"),
+                "target_value": cell.get("target"),
+                "status": "Mismatch",
+            })
+            if len(mismatched_cells) >= max_cells:
+                break
+                
+    return mismatched_cells
 
 def compare_button_groups(source_groups: list[dict[str, Any]], target_groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
     source_map = {_normalise(item.get("name")): item for item in source_groups if item.get("name")}
@@ -434,13 +453,17 @@ def compare_dashboard_payloads(source_data: dict[str, Any], target_data: dict[st
         button_percentage = calculate_match_percentage(buttons)
         summary["button_match_percentage"] = button_percentage if button_percentage is not None else 0.0
 
+        # Extract table summary stats without row arrays
+        table_comparison = build_table_comparisons([source_data, target_data])
+        tables_summary = table_comparison.get("summary", [])
+
         return {
             "status": "success",
             "filters": filters,
             "kpis": kpis,
             "visuals": visuals,
             "buttons": buttons,
-            "tables": [],
+            "tables": tables_summary,  #Summary status only (Match/Mismatch, Row counts)
             "summary": summary,
             "results": kpis,
             "match_percentage": summary.get("overall_match_percentage"),
@@ -484,8 +507,12 @@ def build_mismatch_payload(
     table_cells: list[dict[str, Any]] = []
     if visual_data:
         table_comparison = build_table_comparisons(visual_data)
+        
+        # 1. High-level table summary diffs (e.g., Row count or column mismatch)
         table_visuals = _filter_mismatches(table_comparison.get("summary"))
-        table_cells = _filter_mismatches(table_comparison.get("cells"))
+        
+        # 2. Cell-level diffs only (capped at 50 to keep payload small)
+        table_cells = _extract_table_cell_mismatches(table_comparison, max_cells=50)
 
     # Compare browser execution timing metrics
     browser_metrics: list[dict[str, Any]] = []

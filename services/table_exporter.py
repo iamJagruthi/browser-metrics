@@ -1271,16 +1271,16 @@ async def _export_visual(
 
     last_error = None
 
-    for attempt in range(
-        1,
-        MAX_EXPORT_RETRIES + 1,
-    ):
+    for attempt in range(1, MAX_EXPORT_RETRIES + 1):
+        # Guard: Do not attempt export if browser page was closed
+        if not page or page.is_closed():
+            logger.error("Target page closed before export attempt. Aborting export.")
+            last_error = "Target page closed."
+            break
 
         try:
-
             logger.info(
-                "Export attempt %s/%s | "
-                "dashboard=%s | visual=%s",
+                "Export attempt %s/%s | dashboard=%s | visual=%s",
                 attempt,
                 MAX_EXPORT_RETRIES,
                 dashboard_name,
