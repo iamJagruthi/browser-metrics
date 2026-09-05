@@ -144,69 +144,6 @@ async def _get_visual_locator(page, visual: dict[str, Any]):
     aria_label = _clean(visual.get("aria_label"))
     visual_type = _clean(visual.get("visual_type"))
 
-<<<<<<< Updated upstream
-    rows = tuple(
-        tuple(
-            _clean(value).casefold()
-            for value in row
-        )
-        for row in table.get(
-            "rows",
-            [],
-        )
-    )
-
-    return (columns,) + rows
-
-
- 
-# ---------------------------------------------------------------------------
-# Visual detection
-# ---------------------------------------------------------------------------
-# NOTE:
-# This function is retained for debugging/backward compatibility.
-#
-# Normal project flow does NOT call this function.
-#
-# Table/Matrix detection is performed by:
-# services/visual_data_exporter.py
-#
-# Detected table metadata is then passed to:
-# export_table_visuals()
-
- 
-# ---------------------------------------------------------------------------
-# Visual lookup
-# ---------------------------------------------------------------------------
-
-async def _get_visual_locator(
-    page,
-    visual: dict[str, Any],
-):
-    """
-    Re-find the visual every time.
-
-    Power BI frequently rebuilds visual DOM nodes,
-    so retaining an old locator can result in:
-
-        element was detached from the DOM
-    """
-
-    visuals = page.locator(
-        VISUAL_SELECTOR
-    )
-
-    aria_label = _clean(
-        visual.get("aria_label")
-    )
-
-    visual_type = _clean(
-        visual.get("visual_type")
-    )
-
-    # First try to locate using aria-label + role.
-=======
->>>>>>> Stashed changes
     if aria_label:
         for index in range(await visuals.count()):
             candidate = visuals.nth(index)
@@ -417,8 +354,21 @@ async def _export_visual(
             filename = f"{_safe_filename(dashboard_name, 'dashboard')}_{_safe_filename(visual['title'], 'table')}_{uuid.uuid4().hex[:8]}{suffix}"
             path = RAW_DIR / filename
 
+            logger.info(
+                "Before save_as | page_closed=%s | context_closed=%s | browser_closed=%s",
+                page.is_closed(),
+                page.context.is_closed(),
+                page.context.browser.is_connected(),
+            )
+
             await download.save_as(str(path))
-            
+
+            logger.info(
+                "After save_as | page_closed=%s | context_closed=%s | browser_connected=%s",
+                page.is_closed(),
+                page.context.is_closed(),
+                page.context.browser.is_connected(),
+            )
             # Guard: Only wait if page is open
             if page and not page.is_closed():
                 await page.wait_for_timeout(1000)
@@ -469,51 +419,6 @@ async def export_table_visuals(
             result = await _export_visual(page, table_visual, dashboard_name)
             exported_tables.append(result)
         except Exception as exc:
-<<<<<<< Updated upstream
-
-            logger.exception(
-                "Unexpected table export failure | dashboard=%s | "
-                "title=%s",
-                dashboard_name,
-                table_visual.get("title"),
-            )
-
-            exported_tables.append(
-                {
-                    "title": table_visual.get("title"),
-                    "visual_index": table_visual.get("index"),
-                    "status": "failed",
-                    "file_path": None,
-                    "data": None,
-                    "error": str(exc),
-                    "validation_data_type": "unavailable",
-                    "validation_option": None,
-                    "validation_note": None,
-                }
-            )
-
-    successful = sum(
-        1
-        for item in exported_tables
-        if item.get("status") == "downloaded"
-    )
-
-    failed = len(exported_tables) - successful
-
-    logger.info(
-        "Table export completed | dashboard=%s | "
-        "successful=%d | failed=%d",
-        dashboard_name,
-        successful,
-        failed,
-    )
-
-    return exported_tables
-
-# Add this at the bottom of table_exporter.py
-
-from services.table_comparison import build_table_comparisons
-=======
             exported_tables.append({
                 "title": table_visual.get("title"),
                 "visual_index": table_visual.get("index"),
@@ -525,4 +430,3 @@ from services.table_comparison import build_table_comparisons
             })
 
     return exported_tables
->>>>>>> Stashed changes

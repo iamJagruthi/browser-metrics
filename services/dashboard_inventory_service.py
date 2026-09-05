@@ -322,9 +322,7 @@ def build_inventory_api_payload(
         raise
 
 
-<<<<<<< Updated upstream
  
-=======
 def save_pages_snapshot(
     run_id: str,
     payload: dict[str, Any],
@@ -353,4 +351,3 @@ def save_inventory_snapshot(
     except Exception:
         logger.exception("Failed to save inventory snapshot | run_id=%s", run_id)
         raise
->>>>>>> Stashed changes

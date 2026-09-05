@@ -273,10 +273,10 @@ class SlicerEngine:
             predetermined_filters=None,
         ):
             """Process one report page with tab closure safety."""
-            # Guard check: stop immediately if the page tab was killed
+            # Guard check: stop gracefully if the page tab was closed
             if not page or page.is_closed():
                 logger.error("Cannot process page '%s': Target browser page is closed.", page_name)
-                raise RuntimeError(f"Target page closed before processing page '{page_name}'")
+                return [], {}
 
             validator = _get_validator()
 
@@ -284,10 +284,14 @@ class SlicerEngine:
             applied_selection = {}
 
             logger.info("Waiting for visual containers to stay stable before extraction")
-            await wait_for_dashboard(page)
+            try:
+                await wait_for_dashboard(page)
+            except Exception as e:
+                logger.warning("Wait for dashboard failed on page '%s': %s", page_name, e)
 
             if page.is_closed():
-                raise RuntimeError(f"Target page closed during initial render on page '{page_name}'")
+                logger.warning("Target page closed during initial render on page '%s'. Skipping.", page_name)
+                return [], {}
 
             default_visual_data = await extract_visual_data(page, attempt_export=False)
             default_tables = await export_table_visuals(

@@ -88,21 +88,40 @@ class DashboardValidator:
                 for page_info in pages:
                     current_page_name = page_info["name"]
 
-                    if not page_info["selected"]:
-                        await navigate_to_page(page, current_page_name)
+                    # Guard: Stop multi-page traversal if browser tab was destroyed
+                    if page is None or page.is_closed():
+                        logger.error(
+                            "Browser page is closed. Stopping page traversal at '%s'.",
+                            current_page_name
+                        )
+                        break
 
-                    predetermined = (filter_selections or {}).get(current_page_name)
+                    try:
+                        if not page_info["selected"]:
+                            await navigate_to_page(page, current_page_name)
 
-                    execution, applied = await engine.process_dashboard_page(
-                        dashboard=dashboard,
-                        page=page,
-                        response=response,
-                        page_name=current_page_name,
-                        predetermined_filters=predetermined,
-                    )
+                        predetermined = (filter_selections or {}).get(current_page_name)
 
-                    executions.extend(execution)
-                    page_filter_selections[current_page_name] = applied
+                        execution, applied = await engine.process_dashboard_page(
+                            dashboard=dashboard,
+                            page=page,
+                            response=response,
+                            page_name=current_page_name,
+                            predetermined_filters=predetermined,
+                        )
+
+                        if execution:
+                            executions.extend(execution)
+                        if applied:
+                            page_filter_selections[current_page_name] = applied
+
+                    except Exception as page_err:
+                        logger.error(
+                            "Failed processing page '%s' | error=%s",
+                            current_page_name,
+                            page_err
+                        )
+                        break
 
                 try:
                     self.timer.stop("total_execution")
