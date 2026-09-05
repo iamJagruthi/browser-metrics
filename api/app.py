@@ -1,6 +1,6 @@
 """FastAPI application factory.
 
-Jagruthi — production layout: routers grouped by domain (health, validation, probes, reports).
+Jagruthi — production layout: routers grouped by domain (health, validation).
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.logging_config import setup_logging
-from api.routes import health_router, probes_router, reports_router, validation_router
+from api.routes import health_router, validation_router
 
 
 logger = logging.getLogger(__name__)
@@ -41,8 +41,6 @@ def create_app() -> FastAPI:
 
     application.include_router(health_router)
     application.include_router(validation_router)
-    application.include_router(probes_router)
-    application.include_router(reports_router)
 
     logger.info("FastAPI application initialized")
     return application

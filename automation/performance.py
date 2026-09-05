@@ -33,20 +33,44 @@ class PerformanceTimer:
         """Stop a named timer."""
         try:
             if name not in self._timers:
-                logger.warning("Timer stop requested for unknown name | name=%s", name)
+                logger.warning(
+                    "Timer stop requested for unknown name | name=%s",
+                    name,
+                )
                 return 0.0
 
-            elapsed = round(
-                time.perf_counter() - self._timers[name]["start"],
-                3,
+            elapsed = (
+                time.perf_counter()
+                - self._timers[name]["start"]
             )
 
             self._timers[name]["elapsed"] = elapsed
+
+            logger.info(
+                "Timer stopped | name=%s | elapsed=%.6f seconds | %.2f ms",
+                name,
+                elapsed,
+                elapsed * 1000,
+            )
+
             return elapsed
 
         except Exception:
-            logger.exception("Error stopping timer | name=%s", name)
+            logger.exception(
+                "Error stopping timer | name=%s",
+                name,
+            )
             return 0.0
+
+    def set_elapsed(self, name: str, elapsed: float):
+        """Record a duration that was measured outside this timer instance."""
+        try:
+            self._timers[name] = {
+                "start": None,
+                "elapsed": float(elapsed or 0.0),
+            }
+        except Exception:
+            logger.exception("Error setting timer | name=%s", name)
 
     def get(self, name: str):
         """Get elapsed time for a timer."""

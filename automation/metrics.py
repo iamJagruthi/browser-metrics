@@ -17,8 +17,9 @@ _TIMER_FIELD_MAP = {
     "browser_launch": "browser_launch_seconds",
     "page_load": "page_load_seconds",
     "dashboard_render": "dashboard_render_seconds",
+    "filter_dashboard_render": "filter_dashboard_render_seconds",
     "screenshot": "screenshot_seconds",
-    "ocr": "gemini_extraction_seconds",
+    "ai": "gemini_extraction_seconds",
     "total_execution": "total_execution_seconds",
 }
 
@@ -61,18 +62,14 @@ def build_metrics(
             "dashboard_url": dashboard_url,
             "page_title": page_title,
             "final_url": final_url,
-            "http_status": http_status,
-            "browser_launch_seconds": timers.get("browser_launch", 0) or 0,
-            "page_load_seconds": timers.get("page_load", 0) or 0,
-            "dashboard_render_seconds": timers.get("dashboard_render", 0) or 0,
-            "screenshot_seconds": timers.get("screenshot", 0) or 0,
-            "gemini_extraction_seconds": timers.get("ocr", 0) or 0,
-            "total_execution_seconds": timers.get("total_execution", 0) or 0,
-            "total_requests": network_summary.get("total_requests", 0),
-            "total_responses": network_summary.get("total_responses", 0),
-            "failed_requests": network_summary.get("failed_requests", 0),
-            "console_messages": network_summary.get("console_messages", 0),
-            "page_errors": network_summary.get("page_errors", 0),
+            "browser_launch_seconds": timers.get("browser_launch", 0.0),
+            "page_load_seconds": timers.get("page_load", 0.0),
+            "dashboard_render_seconds": timers.get("dashboard_render", 0.0),
+            "visual_extraction_seconds": timers.get("visual_extraction", 0.0),
+            "filter_dashboard_render_seconds": timers.get("filter_dashboard_render", 0.0),
+            "screenshot_seconds": timers.get("screenshot", 0.0),
+            "total_execution_seconds": timers.get("total_execution", 0.0),
+            
         }
 
         # Include any additional timers without dropping unknown keys.
