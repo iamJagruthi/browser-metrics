@@ -279,24 +279,66 @@ def _pair_confidence(left: dict[str, Any] | None, right: dict[str, Any] | None) 
 
 
 def compare_kpis(source_kpis: list[dict[str, Any]], target_kpis: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    logger.info(
+        "comparison.kpis.start | source_count=%d | target_count=%d",
+        len(source_kpis), len(target_kpis),
+    )
+    logger.debug(
+        "comparison.kpis.inputs | source=%s | target=%s",
+        [
+            {
+                "name": item.get("name"),
+                "value": item.get("value"),
+                "confidence": item.get("confidence"),
+            }
+            for item in source_kpis
+        ],
+        [
+            {
+                "name": item.get("name"),
+                "value": item.get("value"),
+                "confidence": item.get("confidence"),
+            }
+            for item in target_kpis
+        ],
+    )
+
     source_map = {_normalise(item.get("name")): item for item in source_kpis if item.get("name")}
     target_map = {_normalise(item.get("name")): item for item in target_kpis if item.get("name")}
     results = []
+
+    logger.debug(
+        "comparison.kpis.pair_keys | source_keys=%s | target_keys=%s",
+        sorted(source_map), sorted(target_map),
+    )
 
     for key in sorted(set(source_map) | set(target_map)):
         source = source_map.get(key)
         target = target_map.get(key)
 
         if not source:
+            logger.warning(
+                "comparison.kpis.unpaired | side=source | key=%s | target_name=%r | target_value=%r",
+                key, target.get("name"), target.get("value"),
+            )
             results.append({"kpi": target.get("name"), "status": "Missing in Source", "source": None, "target": target.get("value")})
             continue
         if not target:
+            logger.warning(
+                "comparison.kpis.unpaired | side=target | key=%s | source_name=%r | source_value=%r",
+                key, source.get("name"), source.get("value"),
+            )
             results.append({"kpi": source.get("name"), "status": "Missing in Target", "source": source.get("value"), "target": None})
             continue
 
         source_value = _normalise(source.get("value"))
         target_value = _normalise(target.get("value"))
         status = "Match" if source_value == target_value else "Mismatch"
+        logger.debug(
+            "comparison.kpis.pair | key=%s | source_name=%r | target_name=%r | source_value=%r | target_value=%r | confidence=%r | status=%s",
+            key, source.get("name"), target.get("name"),
+            source.get("value"), target.get("value"), _pair_confidence(source, target), status,
+        )
         confidence = _pair_confidence(source, target)
         if confidence is not None and confidence < 0.7 and status == "Mismatch":
             status = "needs_review"
@@ -312,12 +354,56 @@ def compare_kpis(source_kpis: list[dict[str, Any]], target_kpis: list[dict[str, 
             "target_variance": target.get("variance"),
             "confidence": confidence,
         })
+    logger.info(
+        "comparison.kpis.complete | result_count=%d | matches=%d | mismatches=%d",
+        len(results),
+        sum(1 for item in results if item.get("status") == "Match"),
+        sum(1 for item in results if item.get("status") != "Match"),
+    )
     return results
 
 
 def compare_visuals(source_visuals: list[dict[str, Any]], target_visuals: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    logger.info(
+        "comparison.visuals.start | source_count=%d | target_count=%d",
+        len(source_visuals), len(target_visuals),
+    )
+    logger.debug(
+        "comparison.visuals.inputs | source=%s | target=%s",
+        [
+            {
+                "index": item.get("index"),
+                "title": item.get("title"),
+                "visual_type": item.get("visual_type"),
+                "family": item.get("family"),
+                "is_chart": item.get("is_chart"),
+                "is_table": item.get("is_table"),
+                "is_matrix": item.get("is_matrix"),
+                "confidence": item.get("confidence"),
+            }
+            for item in source_visuals
+        ],
+        [
+            {
+                "index": item.get("index"),
+                "title": item.get("title"),
+                "visual_type": item.get("visual_type"),
+                "family": item.get("family"),
+                "is_chart": item.get("is_chart"),
+                "is_table": item.get("is_table"),
+                "is_matrix": item.get("is_matrix"),
+                "confidence": item.get("confidence"),
+            }
+            for item in target_visuals
+        ],
+    )
+
     source_map = {_visual_key(item, index): item for index, item in enumerate(source_visuals)}
     target_map = {_visual_key(item, index): item for index, item in enumerate(target_visuals)}
+    logger.debug(
+        "comparison.visuals.pair_keys | source=%s | target=%s",
+        sorted(source_map), sorted(target_map),
+    )
     results = []
 
     for key in sorted(set(source_map) | set(target_map)):
@@ -325,13 +411,39 @@ def compare_visuals(source_visuals: list[dict[str, Any]], target_visuals: list[d
         target = target_map.get(key)
 
         if not source:
+            logger.warning(
+                "comparison.visuals.unpaired | side=source | key=%s | target_title=%r | target_type=%r",
+                key, target.get("title"), target.get("visual_type"),
+            )
             results.append({"visual": target.get("title"), "status": "Missing in Source", "source": "N/A", "target": "Present"})
             continue
         if not target:
+            logger.warning(
+                "comparison.visuals.unpaired | side=target | key=%s | source_title=%r | source_type=%r",
+                key, source.get("title"), source.get("visual_type"),
+            )
             results.append({"visual": source.get("title"), "status": "Missing in Target", "source": "Present", "target": "N/A"})
             continue
 
         type_match = _normalise(source.get("visual_type")) == _normalise(target.get("visual_type"))
+        logger.debug(
+            "comparison.visuals.pair | key=%s | source_title=%r | target_title=%r | source_type=%r | target_type=%r | source_family=%r | target_family=%r | source_flags=%s | target_flags=%s | confidence=%r | type_match=%s",
+            key,
+            source.get("title"), target.get("title"),
+            source.get("visual_type"), target.get("visual_type"),
+            source.get("family"), target.get("family"),
+            {
+                "chart": source.get("is_chart"),
+                "table": source.get("is_table"),
+                "matrix": source.get("is_matrix"),
+            },
+            {
+                "chart": target.get("is_chart"),
+                "table": target.get("is_table"),
+                "matrix": target.get("is_matrix"),
+            },
+            _pair_confidence(source, target), type_match,
+        )
         confidence = _pair_confidence(source, target)
         status = "Match" if type_match else "Mismatch"
         if confidence is not None and confidence < 0.7 and status == "Mismatch":
@@ -344,12 +456,48 @@ def compare_visuals(source_visuals: list[dict[str, Any]], target_visuals: list[d
             "target": f"Type: {target.get('visual_type', 'unknown')}",
             "confidence": confidence,
         })
+    logger.info(
+        "comparison.visuals.complete | result_count=%d | matches=%d | mismatches=%d",
+        len(results),
+        sum(1 for item in results if item.get("status") == "Match"),
+        sum(1 for item in results if item.get("status") != "Match"),
+    )
     return results
 
 
 def compare_filters(source_filters: list[dict[str, Any]], target_filters: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    logger.info(
+        "comparison.filters.start | source_count=%d | target_count=%d",
+        len(source_filters), len(target_filters),
+    )
+    logger.debug(
+        "comparison.filters.inputs | source=%s | target=%s",
+        [
+            {
+                "name": item.get("filter_name"),
+                "type": item.get("filter_type"),
+                "selected": item.get("selected_values"),
+                "available_count": len(item.get("available_values") or []),
+            }
+            for item in source_filters
+        ],
+        [
+            {
+                "name": item.get("filter_name"),
+                "type": item.get("filter_type"),
+                "selected": item.get("selected_values"),
+                "available_count": len(item.get("available_values") or []),
+            }
+            for item in target_filters
+        ],
+    )
+
     source_map = {_normalise(item.get("filter_name")): item for item in source_filters if item.get("filter_name")}
     target_map = {_normalise(item.get("filter_name")): item for item in target_filters if item.get("filter_name")}
+    logger.debug(
+        "comparison.filters.pair_keys | source=%s | target=%s",
+        sorted(source_map), sorted(target_map),
+    )
     results = []
 
     for key in sorted(set(source_map) | set(target_map)):
@@ -375,6 +523,12 @@ def compare_filters(source_filters: list[dict[str, Any]], target_filters: list[d
             "source_values": list(source.get("available_values", [])),
             "target_values": list(target.get("available_values", [])),
         })
+    logger.info(
+        "comparison.filters.complete | result_count=%d | matches=%d | mismatches=%d",
+        len(results),
+        sum(1 for item in results if item.get("status") == "Match"),
+        sum(1 for item in results if item.get("status") != "Match"),
+    )
     return results
 
 
@@ -411,8 +565,28 @@ def _extract_table_cell_mismatches(table_comparison: dict[str, Any], max_cells: 
 
 
 def compare_button_groups(source_groups: list[dict[str, Any]], target_groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    logger.info(
+        "comparison.buttons.start | source_count=%d | target_count=%d",
+        len(source_groups), len(target_groups),
+    )
+    logger.debug(
+        "comparison.buttons.inputs | source=%s | target=%s",
+        [
+            {"name": item.get("name"), "selected": item.get("selected_values"), "confidence": item.get("confidence")}
+            for item in source_groups
+        ],
+        [
+            {"name": item.get("name"), "selected": item.get("selected_values"), "confidence": item.get("confidence")}
+            for item in target_groups
+        ],
+    )
+
     source_map = {_normalise(item.get("name")): item for item in source_groups if item.get("name")}
     target_map = {_normalise(item.get("name")): item for item in target_groups if item.get("name")}
+    logger.debug(
+        "comparison.buttons.pair_keys | source=%s | target=%s",
+        sorted(source_map), sorted(target_map),
+    )
     results = []
 
     for key in sorted(set(source_map) | set(target_map)):
@@ -451,6 +625,12 @@ def compare_button_groups(source_groups: list[dict[str, Any]], target_groups: li
             "target_available": target.get("available_values") or [],
             "confidence": confidence,
         })
+    logger.info(
+        "comparison.buttons.complete | result_count=%d | matches=%d | mismatches=%d",
+        len(results),
+        sum(1 for item in results if item.get("status") == "Match"),
+        sum(1 for item in results if item.get("status") != "Match"),
+    )
     return results
 
 
@@ -462,12 +642,21 @@ def calculate_match_percentage(results: list) -> float | None:
 
 
 def build_comparison_summary(filter_comparison, kpi_comparison, visual_comparison) -> dict:
+    logger.info(
+        "comparison.summary.input_counts | filters=%d | kpis=%d | visuals=%d",
+        len(filter_comparison or []), len(kpi_comparison or []), len(visual_comparison or []),
+    )
     filter_percentage = calculate_match_percentage(filter_comparison)
     kpi_percentage = calculate_match_percentage(kpi_comparison)
     visual_percentage = calculate_match_percentage(visual_comparison)
 
     scored = [v for v in (filter_percentage, kpi_percentage, visual_percentage) if v is not None]
     overall_percentage = round(sum(scored) / len(scored), 2) if scored else 0.0
+
+    logger.warning(
+        "comparison.summary.current_scoring | filter_pct=%r | kpi_pct=%r | visual_pct=%r | overall_pct=%r | NOTE=overall currently excludes tables and buttons",
+        filter_percentage, kpi_percentage, visual_percentage, overall_percentage,
+    )
 
     return {
         "filter_match_percentage": filter_percentage if filter_percentage is not None else 0.0,
@@ -484,8 +673,25 @@ def build_comparison_summary(filter_comparison, kpi_comparison, visual_compariso
 
 def compare_dashboard_payloads(source_data: dict[str, Any], target_data: dict[str, Any]) -> dict[str, Any]:
     try:
+        logger.info(
+            "comparison.dashboard.start | source_keys=%s | target_keys=%s",
+            sorted(source_data.keys()) if isinstance(source_data, dict) else type(source_data).__name__,
+            sorted(target_data.keys()) if isinstance(target_data, dict) else type(target_data).__name__,
+        )
+        logger.debug(
+            "comparison.dashboard.shape | source_visual_data_keys=%s | target_visual_data_keys=%s",
+            sorted((source_data.get("visual_data") or {}).keys()) if isinstance(source_data, dict) else [],
+            sorted((target_data.get("visual_data") or {}).keys()) if isinstance(target_data, dict) else [],
+        )
+
         source_data = sanitize_execution_for_api(source_data)
         target_data = sanitize_execution_for_api(target_data)
+
+        logger.debug(
+            "comparison.dashboard.post_sanitize | source_keys=%s | target_keys=%s",
+            sorted(source_data.keys()) if isinstance(source_data, dict) else [],
+            sorted(target_data.keys()) if isinstance(target_data, dict) else [],
+        )
 
         kpis = compare_kpis(source_data.get("kpi_cards") or [], target_data.get("kpi_cards") or [])
         visuals = compare_visuals(source_data.get("visuals") or [], target_data.get("visuals") or [])
@@ -501,6 +707,26 @@ def compare_dashboard_payloads(source_data: dict[str, Any], target_data: dict[st
             "Source": source_data,
             "Target": target_data,
         })
+        logger.info(
+            "comparison.tables.result | top_level_keys=%s | tables_keys=%s",
+            sorted(table_comparison_result.keys()) if isinstance(table_comparison_result, dict) else [],
+            sorted((table_comparison_result.get("tables") or {}).keys())
+            if isinstance(table_comparison_result, dict) and isinstance(table_comparison_result.get("tables"), dict)
+            else [],
+        )
+        if isinstance(table_comparison_result, dict):
+            logger.info(
+                "comparison.tables.summary | %s",
+                table_comparison_result.get("tables", {}).get("overall_status")
+                if isinstance(table_comparison_result.get("tables"), dict)
+                else table_comparison_result.get("summary"),
+            )
+
+        logger.info(
+            "comparison.dashboard.complete | kpis=%d | visuals=%d | filters=%d | buttons=%d | overall_pct=%r",
+            len(kpis), len(visuals), len(filters), len(buttons),
+            summary.get("overall_match_percentage"),
+        )
 
         return {
             "status": "success",
@@ -618,9 +844,3 @@ def build_mismatch_payload(
         "match_percentage": comparison.get("match_percentage"),
         "mismatches_download_url": f"/api/reports/{run_id}/mismatches" if run_id else None,
     }
-
-
- 
-
-
- 

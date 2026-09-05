@@ -17,13 +17,14 @@ from typing import Any
 from openpyxl import load_workbook
 
 from utils.config import OUTPUT_DIR
+from automation.canvas_diagnostics import measure_canvas, log_delta
 
 logger = logging.getLogger(__name__)
 
 VISUAL_SELECTOR = ".visualContainer, [data-visual-container]"
 MAX_EXPORT_RETRIES = 3
-MENU_TIMEOUT = 8_000
-DOWNLOAD_TIMEOUT = 30_000
+MENU_TIMEOUT = 15_000
+DOWNLOAD_TIMEOUT = 60_000
 
 EXPORT_DIR = OUTPUT_DIR / "table_exports"
 RAW_DIR = EXPORT_DIR / "raw"
@@ -139,9 +140,94 @@ async def _close_open_overlays(page) -> None:
         pass
 
 
+def _attach_lifecycle_diagnostics(page) -> None:
+    """Attach one-time lifecycle diagnostics to identify premature closure."""
+    try:
+        if getattr(page, "_table_exporter_lifecycle_diagnostics_attached", False):
+            return
+
+        def _on_page_close() -> None:
+            logger.error(
+                "TABLE_EXPORT_LIFECYCLE | event=page_close | page_id=%s",
+                id(page),
+            )
+
+        page.on("close", _on_page_close)
+
+        try:
+            context = page.context
+
+            def _on_context_close() -> None:
+                logger.error(
+                    "TABLE_EXPORT_LIFECYCLE | event=context_close | page_id=%s | context_id=%s",
+                    id(page),
+                    id(context),
+                )
+
+            context.on("close", _on_context_close)
+        except Exception:
+            pass
+
+        try:
+            browser = page.context.browser
+            if browser is not None:
+                def _on_browser_disconnected() -> None:
+                    logger.error(
+                        "TABLE_EXPORT_LIFECYCLE | event=browser_disconnected | page_id=%s | browser_id=%s",
+                        id(page),
+                        id(browser),
+                    )
+
+                browser.on("disconnected", _on_browser_disconnected)
+        except Exception:
+            pass
+
+        setattr(page, "_table_exporter_lifecycle_diagnostics_attached", True)
+        logger.info(
+            "TABLE_EXPORT_LIFECYCLE | event=diagnostics_attached | page_id=%s",
+            id(page),
+        )
+    except Exception:
+        logger.debug("Unable to attach table export lifecycle diagnostics", exc_info=True)
+
+
+def _page_state(page) -> dict[str, Any]:
+    """Return lifecycle state safely, including after closure."""
+    state = {
+        "page_id": id(page) if page is not None else None,
+        "page_closed": None,
+        "context_id": None,
+        "browser_connected": None,
+    }
+    if page is None:
+        return state
+
+    try:
+        state["page_closed"] = page.is_closed()
+    except Exception:
+        state["page_closed"] = True
+
+    try:
+        context = page.context
+        state["context_id"] = id(context)
+        try:
+            browser = context.browser
+            state["browser_connected"] = (
+                browser.is_connected() if browser is not None else None
+            )
+        except Exception:
+            state["browser_connected"] = False
+    except Exception:
+        state["context_id"] = None
+        state["browser_connected"] = False
+
+    return state
+
+
 async def _get_visual_locator(page, visual: dict[str, Any]):
     visuals = page.locator(VISUAL_SELECTOR)
     aria_label = _clean(visual.get("aria_label"))
+    title = _clean(visual.get("title"))
     visual_type = _clean(visual.get("visual_type"))
 
     if aria_label:
@@ -159,89 +245,214 @@ async def _get_visual_locator(page, visual: dict[str, Any]):
                 if _clean(candidate_info["ariaLabel"]) == aria_label and (
                     not visual_type or _clean(candidate_info["ariaRole"]).casefold() == visual_type.casefold()
                 ):
+                    logger.info(
+                        "_get_visual_locator | path=aria_label | title=%r | index=%s | matched=True",
+                        visual.get("title"), visual.get("index"),
+                    )
+                    return candidate
+            except Exception:
+                continue
+
+    # Fallback identity check: the DOM extractor does not currently populate
+    # aria_label, so the block above never matches in production and this
+    # function would otherwise fall straight through to a raw position index.
+    # A position index is not stable across a Power BI DOM re-render (slicer
+    # filtering, visual reflow, etc.), which risks opening the wrong visual's
+    # menu. The visual's own displayed title is reliably populated instead,
+    # so match on that before resorting to position.
+    if title:
+        for index in range(await visuals.count()):
+            candidate = visuals.nth(index)
+            try:
+                if not await candidate.is_visible():
+                    continue
+                candidate_title = await candidate.evaluate(
+                    """node => {
+                        const el = node.querySelector(
+                            '.visualTitle, [class*="visualTitle" i], [data-visual-title], [class*="title" i]'
+                        );
+                        return el ? el.textContent : "";
+                    }"""
+                )
+                if _clean(candidate_title).casefold() == title.casefold():
+                    logger.info(
+                        "_get_visual_locator | path=title | title=%r | index=%s | matched=True",
+                        visual.get("title"), visual.get("index"),
+                    )
                     return candidate
             except Exception:
                 continue
 
     original_index = visual.get("index")
     if original_index is not None and original_index < await visuals.count():
+        logger.info(
+            "_get_visual_locator | path=index | title=%r | index=%s | matched=True",
+            visual.get("title"), visual.get("index"),
+        )
         return visuals.nth(original_index)
 
+    logger.info(
+        "_get_visual_locator | path=none | title=%r | index=%s | matched=False",
+        visual.get("title"), visual.get("index"),
+    )
     return None
 
-
-async def _open_more_options(page, visual: dict[str, Any]) -> bool:
+async def _open_more_options(page, visual: dict[str, Any]):
     for attempt in range(1, MAX_EXPORT_RETRIES + 1):
         try:
             await _close_open_overlays(page)
+
             locator = await _get_visual_locator(page, visual)
             if locator is None:
                 continue
 
+            _diag_before = await measure_canvas(page)
             try:
                 await locator.scroll_into_view_if_needed(timeout=3000)
             except Exception:
                 pass
+            _diag_after = await measure_canvas(page)
+            log_delta(
+                "table_exporter._open_more_options.scroll_into_view_if_needed",
+                visual.get("title"),
+                _diag_before,
+                _diag_after,
+            )
 
             await page.wait_for_timeout(300)
+
             locator = await _get_visual_locator(page, visual)
             if locator is None:
                 continue
 
+            _diag_before = await measure_canvas(page)
             try:
                 await locator.hover(timeout=3000)
             except Exception:
                 await locator.hover(timeout=3000, force=True)
+            _diag_after = await measure_canvas(page)
+            log_delta(
+                "table_exporter._open_more_options.hover",
+                visual.get("title"),
+                _diag_before,
+                _diag_after,
+            )
 
             await page.wait_for_timeout(500)
+
             locator = await _get_visual_locator(page, visual)
             if locator is None:
                 continue
 
-            menu = locator.locator(
+            more_options_btn = locator.locator(
                 "button[data-testid='visual-more-options-btn'], "
                 "button[aria-label='More options'], "
                 "[role='button'][aria-label='More options']"
             ).first
 
-            if await menu.count() == 0:
+            more_options_count = await more_options_btn.count()
+            logger.info(
+                "_open_more_options | attempt=%s | title=%r | more_options_btn_count=%s",
+                attempt, visual.get("title"), more_options_count,
+            )
+
+            # TEMPORARY DIAGNOSTICS ONLY
+            page_more_options = page.locator(
+                "[aria-label*='More options' i], "
+                "[data-testid*='more-options' i], "
+                "[role='button'][aria-label*='More options' i]"
+            )
+            logger.info(
+                "_open_more_options | AFTER HOVER | "
+                "inside_visual=%s | anywhere_page=%s",
+                await more_options_btn.count(),
+                await page_more_options.count(),
+            )
+            if await page_more_options.count() > 0:
+                for i in range(await page_more_options.count()):
+                    candidate = page_more_options.nth(i)
+                    try:
+                        logger.info(
+                            "_open_more_options | page_more_options[%s] | visible=%s",
+                            i,
+                            await candidate.is_visible(),
+                        )
+                    except Exception:
+                        pass
+            # END TEMPORARY DIAGNOSTICS
+
+            if more_options_count == 0:
                 continue
 
+            _diag_before = await measure_canvas(page)
             try:
-                await menu.click(timeout=3000)
+                await more_options_btn.click(timeout=3000)
             except Exception:
-                await menu.click(timeout=3000, force=True)
+                await more_options_btn.click(timeout=3000, force=True)
+            _diag_after = await measure_canvas(page)
+            log_delta(
+                "table_exporter._open_more_options.more_options_click",
+                visual.get("title"),
+                _diag_before,
+                _diag_after,
+            )
 
+            opened_menu = page.get_by_role("menu").first
+
+            menu_timed_out = False
             try:
-                await page.get_by_role("menu").wait_for(state="visible", timeout=MENU_TIMEOUT)
+                await opened_menu.wait_for(
+                    state="visible",
+                    timeout=MENU_TIMEOUT,
+                )
             except Exception:
+                menu_timed_out = True
                 await page.wait_for_timeout(500)
 
-            return True
+            menu_count = await opened_menu.count()
+            menu_visible = await opened_menu.is_visible() if menu_count > 0 else False
+            logger.info(
+                "_open_more_options | attempt=%s | title=%r | menu_count=%s | menu_visible=%s | wait_for_timed_out=%s",
+                attempt, visual.get("title"), menu_count, menu_visible, menu_timed_out,
+            )
+
+            return opened_menu
+
         except Exception:
             await _close_open_overlays(page)
             await page.wait_for_timeout(500)
 
-    return False
+    return None
 
 
 async def _find_export_data_item(page):
+    """Find the Power BI Export data command from the currently open menu.
+
+    Power BI can render the More Options menu as an overlay outside the
+    visual's DOM subtree, so this lookup intentionally searches the page.
+    """
     try:
-        item = page.get_by_role("menuitem", name=re.compile(r"^\s*export data\s*$", re.I)).first
+        item = page.get_by_role(
+            "menuitem",
+            name=re.compile(r"^\s*export data\s*$", re.I),
+        ).first
+
         if await item.count() > 0:
             return item
     except Exception:
         pass
 
     try:
-        item = page.get_by_text(re.compile(r"^\s*export data\s*$", re.I)).first
+        item = page.get_by_text(
+            re.compile(r"^\s*export data\s*$", re.I),
+        ).first
+
         if await item.count() > 0:
             return item
     except Exception:
         pass
 
     return None
-
 
 async def _handle_export_dialog(page) -> dict[str, Any]:
     dialog = None
@@ -249,8 +460,15 @@ async def _handle_export_dialog(page) -> dict[str, Any]:
         candidate = page.get_by_role("dialog").filter(
             has_text=re.compile(r"which data do you want to export", re.I)
         ).first
-        if await candidate.count() > 0 and await candidate.is_visible():
-            dialog = candidate
+        if await candidate.count() > 0:
+            try:
+                # Wait for the actual Power BI dialog state instead of relying
+                # on a fixed post-click sleep. Direct-export flows simply time
+                # out here and continue to the download event.
+                await candidate.wait_for(state="visible", timeout=2_000)
+                dialog = candidate
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -310,6 +528,8 @@ async def _export_visual(
 
     last_error = None
 
+    _attach_lifecycle_diagnostics(page)
+
     for attempt in range(1, MAX_EXPORT_RETRIES + 1):
         if not page or page.is_closed():
             logger.error("Target page closed before export attempt. Aborting.")
@@ -317,29 +537,55 @@ async def _export_visual(
             break
 
         try:
-            logger.info("Export attempt %s/%s | dashboard=%s | visual=%s", attempt, MAX_EXPORT_RETRIES, dashboard_name, visual["title"])
+            logger.info(
+                "Export attempt %s/%s | dashboard=%s | visual=%s",
+                attempt,
+                MAX_EXPORT_RETRIES,
+                dashboard_name,
+                visual["title"],
+            )
 
-            opened = await _open_more_options(page, visual)
-            if not opened:
+            menu = await _open_more_options(page, visual)
+
+            if menu is None:
                 last_error = "Could not open More options."
+                logger.warning(
+                    "_export_visual | attempt=%s | title=%r | %s",
+                    attempt, visual["title"], last_error,
+                )
                 continue
 
             item = await _find_export_data_item(page)
+
             if item is None:
                 last_error = "Export data menu item not found."
+                logger.warning(
+                    "_export_visual | attempt=%s | title=%r | %s",
+                    attempt, visual["title"], last_error,
+                )
                 await _close_open_overlays(page)
                 continue
-
             RAW_DIR.mkdir(parents=True, exist_ok=True)
 
             # REGISTER DOWNLOAD HANDLER BEFORE CLICKING EXPORT
+            logger.info(
+                "TABLE_EXPORT_LIFECYCLE | event=before_expect_download | visual=%r | state=%s",
+                visual["title"],
+                _page_state(page),
+            )
+
             async with page.expect_download(timeout=DOWNLOAD_TIMEOUT) as download_info:
                 try:
                     await item.click(timeout=5000)
                 except Exception:
                     await item.click(timeout=5000, force=True)
 
-                await page.wait_for_timeout(500)
+                logger.info(
+                    "TABLE_EXPORT_LIFECYCLE | event=export_data_clicked | visual=%r | state=%s",
+                    visual["title"],
+                    _page_state(page),
+                )
+
                 export_info = await _handle_export_dialog(page)
 
                 export_btn = export_info.get("export_button")
@@ -349,25 +595,35 @@ async def _export_visual(
                     except Exception:
                         await export_btn.click(timeout=5000, force=True)
 
+                    logger.info(
+                        "TABLE_EXPORT_LIFECYCLE | event=dialog_export_clicked | visual=%r | state=%s",
+                        visual["title"],
+                        _page_state(page),
+                    )
+
+            logger.info(
+                "TABLE_EXPORT_LIFECYCLE | event=download_event_received | visual=%r | state=%s",
+                visual["title"],
+                _page_state(page),
+            )
             download = await download_info.value
             suffix = Path(download.suggested_filename).suffix or ".csv"
             filename = f"{_safe_filename(dashboard_name, 'dashboard')}_{_safe_filename(visual['title'], 'table')}_{uuid.uuid4().hex[:8]}{suffix}"
             path = RAW_DIR / filename
 
             logger.info(
-                "Before save_as | page_closed=%s | context_closed=%s | browser_closed=%s",
-                page.is_closed(),
-                page.context.is_closed(),
-                page.context.browser.is_connected(),
+                "TABLE_EXPORT_LIFECYCLE | event=before_save_as | visual=%r | path=%s | state=%s",
+                visual["title"],
+                path,
+                _page_state(page),
             )
 
             await download.save_as(str(path))
 
             logger.info(
-                "After save_as | page_closed=%s | context_closed=%s | browser_connected=%s",
-                page.is_closed(),
-                page.context.is_closed(),
-                page.context.browser.is_connected(),
+                "TABLE_EXPORT_LIFECYCLE | event=after_save_as | visual=%r | state=%s",
+                visual["title"],
+                _page_state(page),
             )
             # Guard: Only wait if page is open
             if page and not page.is_closed():
@@ -389,9 +645,24 @@ async def _export_visual(
 
         except Exception as exc:
             last_error = str(exc)
-            logger.warning("Export attempt %s failed | visual=%s | error=%s", attempt, visual["title"], exc)
+            logger.warning(
+                "Export attempt %s failed | visual=%s | state=%s | error=%s",
+                attempt,
+                visual["title"],
+                _page_state(page),
+                exc,
+            )
 
-            if "TargetClosedError" in str(exc) or "browser has been closed" in str(exc):
+            if (
+                "TargetClosedError" in str(exc)
+                or "Target page, context or browser has been closed" in str(exc)
+                or "browser has been closed" in str(exc)
+            ):
+                logger.error(
+                    "TABLE_EXPORT_LIFECYCLE | event=terminal_close_during_export | visual=%r | state=%s",
+                    visual["title"],
+                    _page_state(page),
+                )
                 break
 
             try:

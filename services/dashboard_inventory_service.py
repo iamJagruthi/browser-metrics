@@ -53,17 +53,42 @@ def _kpi_key(name: str | None) -> str:
 
 
 def _classify_dom_visual(visual: dict[str, Any]) -> str:
+    logger.debug(
+        "inventory.classify.input | index=%r | title=%r | visual_type=%r | family=%r | flags=%s | data_shape=%s",
+        visual.get("index"),
+        visual.get("title"),
+        visual.get("visual_type"),
+        visual.get("family"),
+        {
+            "is_slicer": visual.get("is_slicer"),
+            "is_chart": visual.get("is_chart"),
+            "is_tabular": visual.get("is_tabular"),
+            "is_table": visual.get("is_table"),
+            "is_matrix": visual.get("is_matrix"),
+        },
+        {
+            "has_rows": bool((visual.get("data") or {}).get("rows")),
+            "has_columns": bool((visual.get("data") or {}).get("columns")),
+        },
+    )
+
     if visual.get("is_slicer"):
+        logger.debug("inventory.classify.result | index=%r | bucket=slicer", visual.get("index"))
         return "slicer"
     type_source = str(visual.get("visual_type", "")).casefold()
     if visual.get("is_matrix") or "matrix" in type_source or "pivot" in type_source:
+        logger.debug("inventory.classify.result | index=%r | bucket=matrix | reason=matrix_flag_or_type", visual.get("index"))
         return "matrix"
     if visual.get("is_table") or "table" in type_source:
+        logger.debug("inventory.classify.result | index=%r | bucket=table | reason=table_flag_or_type", visual.get("index"))
         return "table"
     data = visual.get("data") or {}
     if data.get("rows") or data.get("columns"):
+        logger.debug("inventory.classify.result | index=%r | bucket=table | reason=data_rows_or_columns", visual.get("index"))
         return "table"
-    return _normalize_chart_bucket(type_source)
+    bucket = _normalize_chart_bucket(type_source)
+    logger.debug("inventory.classify.result | index=%r | bucket=%s | reason=chart_type", visual.get("index"), bucket)
+    return bucket
 
 
 def _extract_table_comparisons_for_execution(
@@ -121,8 +146,22 @@ def _count_inventory_for_execution(execution: dict[str, Any]) -> dict[str, Any]:
     other = 0
     skipped = 0
 
+    logger.info(
+        "inventory.count.start | dashboard=%r | page=%r | visual_count=%d | table_visual_count=%d | kpi_count=%d | filter_count=%d",
+        (execution.get("dashboard") or {}).get("name"),
+        (execution.get("dashboard") or {}).get("page_name"),
+        len(visual_data.get("visuals", [])),
+        len(visual_data.get("table_visuals", []) or []),
+        len(visual_data.get("kpi_cards", []) or []),
+        len(visual_data.get("filters", []) or []),
+    )
+
     for visual in visual_data.get("visuals", []):
         if visual.get("is_loading_placeholder"):
+            logger.debug(
+                "inventory.count.skip_placeholder | index=%r | title=%r",
+                visual.get("index"), visual.get("title"),
+            )
             skipped += 1
             continue
         bucket = _classify_dom_visual(visual)
@@ -145,7 +184,20 @@ def _count_inventory_for_execution(execution: dict[str, Any]) -> dict[str, Any]:
             dom_charts += 1
 
     table_visuals = visual_data.get("table_visuals", []) or visual_data.get("table_exports", [])
+    logger.debug(
+        "inventory.table_visuals.input | count=%d | titles=%s",
+        len(table_visuals),
+        [item.get("title") for item in table_visuals],
+    )
     for table_vis in table_visuals:
+        logger.debug(
+            "inventory.table_visual.inspect | title=%r | index=%r | is_matrix=%r | visual_type=%r | status=%r",
+            table_vis.get("title"),
+            table_vis.get("index"),
+            table_vis.get("is_matrix"),
+            table_vis.get("visual_type"),
+            table_vis.get("status"),
+        )
         if table_vis.get("is_matrix"):
             matrices += 1
         else:
@@ -164,6 +216,14 @@ def _count_inventory_for_execution(execution: dict[str, Any]) -> dict[str, Any]:
     chart_count = sum(chart_types.values())
     filter_count = len(visual_data.get("filters", []))
     total_visuals = kpi_count + tables + matrices + chart_count + other
+
+    logger.info(
+        "inventory.count.result | dashboard=%r | page=%r | kpis=%d | tables=%d | matrices=%d | charts=%d | other=%d | slicers=%d | skipped=%d | total_visuals=%d | dom_visual_count=%d | chart_types=%s",
+        (execution.get("dashboard") or {}).get("name"),
+        (execution.get("dashboard") or {}).get("page_name"),
+        kpi_count, tables, matrices, chart_count, other, slicers, skipped,
+        total_visuals, len(visual_data.get("visuals", [])), chart_types,
+    )
 
     dashboard = execution.get("dashboard") or {}
     metadata = visual_data.get("metadata") or {}

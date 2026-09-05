@@ -23,6 +23,7 @@ from utils.config import (
     RENDER_WAIT,
     PROFILE_DIR,
 )
+from automation.canvas_diagnostics import measure_canvas, log_delta
 
 
 # Power BI paints empty visual shells first. Wait on both class and custom tags.
@@ -202,6 +203,9 @@ async def wait_for_dashboard(page, *, previous_snapshot: dict | None = None):
         logger.warning("Skipping wait_for_dashboard: Page target is closed or unavailable.")
         return
 
+    _diag_before = await measure_canvas(page)
+    _diag_label = "with_previous_snapshot" if previous_snapshot else "initial_wait"
+
     try:
         # Guard check before Playwright call
         if not page.is_closed():
@@ -279,6 +283,9 @@ async def wait_for_dashboard(page, *, previous_snapshot: dict | None = None):
             return
         logger.error(f"Error while waiting for dashboard to render: {e}")
         raise
+    finally:
+        _diag_after = await measure_canvas(page)
+        log_delta("browser.wait_for_dashboard", _diag_label, _diag_before, _diag_after)
 
 async def launch_browser():
     """
