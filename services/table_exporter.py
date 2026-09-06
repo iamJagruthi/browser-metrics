@@ -291,6 +291,48 @@ async def _handle_export_dialog(page) -> dict[str, Any]:
     raise RuntimeError("Neither 'Data with current layout' nor 'Summarized data' could be selected.")
 
 
+def _lifecycle_state(page) -> dict[str, Any]:
+    """Return page/context/browser lifecycle state using three genuinely
+    distinct, safe checks -- not the same underlying value repeated under
+    different labels.
+
+    - page_closed: Page.is_closed() (the only supported page-level check).
+    - context_closed: BrowserContext has no is_closed() method in
+      Playwright's Python API, so liveness is probed by actually touching
+      the context (reading .pages). If the context is gone, this raises;
+      if it's alive, it returns normally -- a real, independent signal,
+      not a duplicate of the browser check below.
+    - browser_connected: Browser.is_connected(), independent of the above.
+
+    Each check is isolated so a failure in one can never mask or distort
+    another, and this function itself can never raise.
+    """
+    state: dict[str, Any] = {
+        "page_closed": None,
+        "context_closed": None,
+        "browser_connected": None,
+    }
+
+    try:
+        state["page_closed"] = page.is_closed()
+    except Exception:
+        state["page_closed"] = True
+
+    try:
+        _ = page.context.pages
+        state["context_closed"] = False
+    except Exception:
+        state["context_closed"] = True
+
+    try:
+        browser = page.context.browser
+        state["browser_connected"] = browser.is_connected() if browser is not None else None
+    except Exception:
+        state["browser_connected"] = False
+
+    return state
+
+
 async def _export_visual(
     page,
     visual: dict[str, Any],
@@ -350,25 +392,71 @@ async def _export_visual(
                         await export_btn.click(timeout=5000, force=True)
 
             download = await download_info.value
+
+            logger.info(
+                "TABLE_EXPORT_LIFECYCLE | event=download_event_received | visual=%r | "
+                "suggested_filename=%r | state=%s",
+                visual["title"],
+                download.suggested_filename,
+                _lifecycle_state(page),
+            )
+
+            # download.failure() is read-only and cannot itself alter
+            # control flow. It reports Chromium's own view of whether the
+            # download succeeded (None) or failed (a reason string),
+            # independent of Playwright's page/context/browser connection.
+            try:
+                failure_reason = await download.failure()
+            except Exception as failure_exc:
+                failure_reason = f"<failure() raised: {failure_exc}>"
+            logger.info(
+                "TABLE_EXPORT_LIFECYCLE | event=download_failure_checked | visual=%r | "
+                "failure=%r | browser_connected=%s",
+                visual["title"],
+                failure_reason,
+                _lifecycle_state(page)["browser_connected"],
+            )
+
             suffix = Path(download.suggested_filename).suffix or ".csv"
             filename = f"{_safe_filename(dashboard_name, 'dashboard')}_{_safe_filename(visual['title'], 'table')}_{uuid.uuid4().hex[:8]}{suffix}"
             path = RAW_DIR / filename
 
             logger.info(
-                "Before save_as | page_closed=%s | context_closed=%s | browser_closed=%s",
-                page.is_closed(),
-                page.context.is_closed(),
-                page.context.browser.is_connected(),
+                "TABLE_EXPORT_LIFECYCLE | event=before_save_as | visual=%r | "
+                "destination_path=%s | state=%s",
+                visual["title"],
+                path,
+                _lifecycle_state(page),
             )
 
             await download.save_as(str(path))
 
+            # Filesystem existence check is independent of browser/page/context
+            # state -- it cannot raise for lifecycle reasons and cannot be
+            # affected by whatever closed the target. This is the actual
+            # ground truth of whether the export persisted, regardless of
+            # whether save_as() itself reported success.
+            file_exists = path.exists()
             logger.info(
-                "After save_as | page_closed=%s | context_closed=%s | browser_connected=%s",
-                page.is_closed(),
-                page.context.is_closed(),
-                page.context.browser.is_connected(),
+                "TABLE_EXPORT_LIFECYCLE | event=after_save_as | visual=%r | "
+                "destination_path=%s | file_exists=%s | state=%s",
+                visual["title"],
+                path,
+                file_exists,
+                _lifecycle_state(page),
             )
+
+            if not file_exists:
+                last_error = (
+                    f"save_as() returned without raising, but destination file "
+                    f"does not exist: {path}"
+                )
+                logger.error(
+                    "TABLE_EXPORT_LIFECYCLE | event=save_as_no_file | visual=%r | %s",
+                    visual["title"], last_error,
+                )
+                continue
+
             # Guard: Only wait if page is open
             if page and not page.is_closed():
                 await page.wait_for_timeout(1000)
