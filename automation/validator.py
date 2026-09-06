@@ -3,8 +3,22 @@
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
+
+# Diagnostic-only kill switch, off by default. When set, a dead
+# playwright/context/page is NOT silently recovered with a fresh
+# launch_browser() call -- the run fails immediately instead, so the
+# true underlying crash (page_close/context_close/browser_disconnected)
+# is visible in the API response and logs instead of being masked by
+# a second Edge instance quietly picking up where the first left off.
+# Enable for a single diagnostic run with:
+#   DISABLE_BROWSER_AUTO_RECOVERY=true
+# Leave unset for normal production behavior (auto-recovery stays on).
+DISABLE_BROWSER_AUTO_RECOVERY = (
+    os.getenv("DISABLE_BROWSER_AUTO_RECOVERY", "false").lower() == "true"
+)
 
 from .browser import capture_dashboard_snapshot, launch_browser, wait_for_dashboard
 from .network import clear, details, register, summary
@@ -312,6 +326,17 @@ class DashboardValidator:
                     is_context_dead = True
 
                 if is_context_dead:
+                    if DISABLE_BROWSER_AUTO_RECOVERY:
+                        logger.error(
+                            "Browser/context is dead before dashboard '%s' and "
+                            "DISABLE_BROWSER_AUTO_RECOVERY is set -- failing fast "
+                            "instead of silently launching a replacement browser.",
+                            dashboard.get("name"),
+                        )
+                        raise RuntimeError(
+                            "Playwright context is dead (page/context/browser closed) "
+                            "and auto-recovery is disabled for this diagnostic run."
+                        )
                     playwright, context, first_page = await launch_browser()
                     resources.append((playwright, context))
                     page = first_page
@@ -323,6 +348,15 @@ class DashboardValidator:
                             else await context.new_page()
                         )
                     except Exception as page_err:
+                        if DISABLE_BROWSER_AUTO_RECOVERY:
+                            logger.error(
+                                "context.new_page() failed before dashboard '%s' and "
+                                "DISABLE_BROWSER_AUTO_RECOVERY is set -- failing fast "
+                                "instead of silently launching a replacement browser. "
+                                "error=%s",
+                                dashboard.get("name"), page_err,
+                            )
+                            raise
                         playwright, context, first_page = await launch_browser()
                         resources.append((playwright, context))
                         page = first_page

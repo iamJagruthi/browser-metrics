@@ -10,6 +10,7 @@ from __future__ import annotations
 import csv
 import logging
 import re
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -24,7 +25,14 @@ logger = logging.getLogger(__name__)
 VISUAL_SELECTOR = ".visualContainer, [data-visual-container]"
 MAX_EXPORT_RETRIES = 3
 MENU_TIMEOUT = 15_000
-DOWNLOAD_TIMEOUT = 60_000
+# NOTE (diagnostic change): this was ALREADY 60_000 (60s) in production,
+# not 30_000 as assumed. Doubled to 120_000 purely to test whether more
+# time changes the outcome. Evidence so far (download_event_received
+# already fires successfully before the crash) suggests this timeout is
+# not actually being hit, since expect_download() already resolves in
+# every failing run -- but bumping it costs nothing and rules it out
+# conclusively either way.
+DOWNLOAD_TIMEOUT = 120_000
 
 EXPORT_DIR = OUTPUT_DIR / "table_exports"
 RAW_DIR = EXPORT_DIR / "raw"
@@ -567,23 +575,32 @@ async def _export_visual(
                 continue
             RAW_DIR.mkdir(parents=True, exist_ok=True)
 
+            # --- DIAGNOSTIC TIMING ONLY: monotonic clock, does not affect control flow ---
+            t_before_expect_download = time.monotonic()
+
             # REGISTER DOWNLOAD HANDLER BEFORE CLICKING EXPORT
             logger.info(
-                "TABLE_EXPORT_LIFECYCLE | event=before_expect_download | visual=%r | state=%s",
+                "TABLE_EXPORT_LIFECYCLE | event=before_expect_download | visual=%r | state=%s | t=%.3f",
                 visual["title"],
                 _page_state(page),
+                t_before_expect_download,
             )
 
             async with page.expect_download(timeout=DOWNLOAD_TIMEOUT) as download_info:
+                t_before_click_export = time.monotonic()
                 try:
                     await item.click(timeout=5000)
                 except Exception:
                     await item.click(timeout=5000, force=True)
 
+                t_export_data_clicked = time.monotonic()
                 logger.info(
-                    "TABLE_EXPORT_LIFECYCLE | event=export_data_clicked | visual=%r | state=%s",
+                    "TABLE_EXPORT_LIFECYCLE | event=export_data_clicked | visual=%r | state=%s | "
+                    "t=%.3f | elapsed_since_before_expect_download=%.3fs",
                     visual["title"],
                     _page_state(page),
+                    t_export_data_clicked,
+                    t_export_data_clicked - t_before_expect_download,
                 )
 
                 export_info = await _handle_export_dialog(page)
@@ -595,35 +612,106 @@ async def _export_visual(
                     except Exception:
                         await export_btn.click(timeout=5000, force=True)
 
+                    t_dialog_export_clicked = time.monotonic()
                     logger.info(
-                        "TABLE_EXPORT_LIFECYCLE | event=dialog_export_clicked | visual=%r | state=%s",
+                        "TABLE_EXPORT_LIFECYCLE | event=dialog_export_clicked | visual=%r | state=%s | "
+                        "t=%.3f | elapsed_since_export_data_clicked=%.3fs",
                         visual["title"],
                         _page_state(page),
+                        t_dialog_export_clicked,
+                        t_dialog_export_clicked - t_export_data_clicked,
                     )
 
+            t_download_event_received = time.monotonic()
             logger.info(
-                "TABLE_EXPORT_LIFECYCLE | event=download_event_received | visual=%r | state=%s",
+                "TABLE_EXPORT_LIFECYCLE | event=download_event_received | visual=%r | state=%s | "
+                "t=%.3f | elapsed_since_before_expect_download=%.3fs",
                 visual["title"],
                 _page_state(page),
+                t_download_event_received,
+                t_download_event_received - t_before_expect_download,
             )
             download = await download_info.value
             suffix = Path(download.suggested_filename).suffix or ".csv"
             filename = f"{_safe_filename(dashboard_name, 'dashboard')}_{_safe_filename(visual['title'], 'table')}_{uuid.uuid4().hex[:8]}{suffix}"
             path = RAW_DIR / filename
 
+            # --- Distinguish download-event-received vs download-actually-completed ---
+            # download.failure() resolves once Chromium's own download machinery
+            # finishes (successfully or not) -- it returns None on success, or a
+            # string reason (e.g. "network", "blocked", "server_bad_content") if
+            # Chromium itself failed the download, independent of Playwright's
+            # connection to the page/context/browser. This call cannot raise
+            # control-flow-affecting side effects and is read-only per
+            # Playwright's API; if it raises, that itself is signal (see except
+            # below) that the target was already gone before Chromium's
+            # download machinery ever reported back.
+            t_before_failure_check = time.monotonic()
+            try:
+                failure_reason = await download.failure()
+                failure_check_ok = True
+            except Exception as failure_exc:
+                failure_reason = f"<failure() raised: {failure_exc}>"
+                failure_check_ok = False
+            t_after_failure_check = time.monotonic()
             logger.info(
-                "TABLE_EXPORT_LIFECYCLE | event=before_save_as | visual=%r | path=%s | state=%s",
+                "TABLE_EXPORT_LIFECYCLE | event=download_failure_checked | visual=%r | "
+                "failure_reason=%r | check_succeeded=%s | t=%.3f | elapsed_since_download_event_received=%.3fs",
+                visual["title"],
+                failure_reason,
+                failure_check_ok,
+                t_after_failure_check,
+                t_after_failure_check - t_download_event_received,
+            )
+
+            # download.path() blocks until Chromium has finished writing the
+            # download to its own internal temp location (i.e. "download
+            # actually completed" from Chromium's perspective), as distinct
+            # from save_as() below, which additionally copies/moves that file
+            # to our target path. If path() itself raises "Target page,
+            # context or browser has been closed", that proves the browser
+            # was already gone before Chromium's own download-completion
+            # signal ever reached Playwright -- i.e. the download itself
+            # never finished, this was not a save_as()-specific failure.
+            t_before_path_check = time.monotonic()
+            try:
+                temp_path = await download.path()
+                path_check_ok = True
+            except Exception as path_exc:
+                temp_path = f"<path() raised: {path_exc}>"
+                path_check_ok = False
+            t_after_path_check = time.monotonic()
+            logger.info(
+                "TABLE_EXPORT_LIFECYCLE | event=download_path_checked | visual=%r | "
+                "temp_path=%r | check_succeeded=%s | t=%.3f | elapsed_since_failure_check=%.3fs",
+                visual["title"],
+                temp_path,
+                path_check_ok,
+                t_after_path_check,
+                t_after_path_check - t_after_failure_check,
+            )
+
+            t_before_save_as = time.monotonic()
+            logger.info(
+                "TABLE_EXPORT_LIFECYCLE | event=before_save_as | visual=%r | path=%s | state=%s | "
+                "t=%.3f | elapsed_since_download_event_received=%.3fs",
                 visual["title"],
                 path,
                 _page_state(page),
+                t_before_save_as,
+                t_before_save_as - t_download_event_received,
             )
 
             await download.save_as(str(path))
 
+            t_after_save_as = time.monotonic()
             logger.info(
-                "TABLE_EXPORT_LIFECYCLE | event=after_save_as | visual=%r | state=%s",
+                "TABLE_EXPORT_LIFECYCLE | event=after_save_as | visual=%r | state=%s | "
+                "t=%.3f | elapsed_since_before_save_as=%.3fs",
                 visual["title"],
                 _page_state(page),
+                t_after_save_as,
+                t_after_save_as - t_before_save_as,
             )
             # Guard: Only wait if page is open
             if page and not page.is_closed():
@@ -639,7 +727,13 @@ async def _export_visual(
                 validation_option=export_info.get("option"),
             )
 
-            logger.info("Export successful | dashboard=%s | visual=%s | rows=%d", dashboard_name, visual["title"], len(data.get("rows", [])))
+            t_export_successful = time.monotonic()
+            logger.info(
+                "Export successful | dashboard=%s | visual=%s | rows=%d | "
+                "t=%.3f | total_elapsed_since_before_expect_download=%.3fs",
+                dashboard_name, visual["title"], len(data.get("rows", [])),
+                t_export_successful, t_export_successful - t_before_expect_download,
+            )
             await _close_open_overlays(page)
             return result
 
