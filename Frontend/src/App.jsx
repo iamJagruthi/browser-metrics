@@ -2,7 +2,6 @@ import { useState } from 'react';
 import { API_URL } from './config';
 import { useTheme } from './hooks/useTheme.js';
 import { useApiHealth } from './hooks/useApiHealth.js';
-import { useReportPolling } from './hooks/useReportPolling.js';
 import { useMismatchFallback } from './hooks/useMismatchFallback.js';
 
 import { TopBar } from './components/layout/TopBar.jsx';
@@ -11,7 +10,8 @@ import { ValidationForm } from './components/form/ValidationForm.jsx';
 import { ErrorBanner } from './components/form/ErrorBanner.jsx';
 import { MetricsSection } from './components/metrics/MetricsSection.jsx';
 import { AppliedFiltersSection } from './components/comparison/AppliedFiltersSection.jsx';
-import { ReportsPanel } from './components/reports/ReportsPanel.jsx';
+import { TablesComparisonSection } from './components/comparison/TablesComparisonSection.jsx';
+import { VisualResultsSection } from './components/comparison/VisualResultsSection.jsx';
 
 import './App.css';
 
@@ -24,7 +24,6 @@ function App() {
 
   const [theme, toggleTheme] = useTheme();
   const apiStatus = useApiHealth();
-  const { reportStatus, polling: reportPolling } = useReportPolling(result?.run_id);
   useMismatchFallback(result, setResult);
 
   const handleSubmit = async (e) => {
@@ -54,8 +53,7 @@ function App() {
       }
 
       const data = await response.json();
-      console.log('APPLIED FILTER SELECTIONS:', data.applied_filter_selections);
-      console.log('MISMATCHES:', data.mismatches);
+      console.log('Validation result:', data);
       setResult(data);
     } catch (err) {
       setError(err.message || 'Something went wrong while validating.');
@@ -95,8 +93,16 @@ function App() {
               />
             )}
 
-            {result.run_id && (
-              <ReportsPanel runId={result.run_id} reportStatus={reportStatus} polling={reportPolling} />
+            {result.comparison?.tables && (
+              <TablesComparisonSection tables={result.comparison.tables} />
+            )}
+
+            {(result.visual_results || result.kpis) && (
+              <VisualResultsSection
+                visualResults={result.visual_results}
+                kpis={result.kpis}
+                comparisonVisuals={result.comparison?.visuals}
+              />
             )}
           </div>
         )}
