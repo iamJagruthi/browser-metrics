@@ -128,8 +128,31 @@ class DashboardValidator:
                 except Exception:
                     pass
 
+                # These four timers are only ever measured here in
+                # validator.py (browser launch, initial page.goto, and
+                # wait_for_dashboard all happen once, before the per-page
+                # loop). SlicerEngine's own per-page metrics dict does not
+                # include them, so without this merge they were captured
+                # but never reached the output.
+                browser_level_timings = {
+                    "browser_launch_seconds": self.timer.get("browser_launch"),
+                    "page_load_seconds": self.timer.get("page_load"),
+                    "dashboard_render_seconds": self.timer.get("dashboard_render"),
+                    "total_execution_seconds": self.timer.get("total_execution"),
+                }
+                for _execution in executions:
+                    _execution.setdefault("metrics", {})
+                    for _field, _value in browser_level_timings.items():
+                        _execution["metrics"][_field] = _value
+
                 return playwright, context, executions, page_filter_selections
 
+            # Single-page dashboards must receive the same slicer-baseline
+            # handling as multi-page dashboards. Reuse process_dashboard_page()
+            # (which already performs wait_for_dashboard -> establish_slicer_baseline
+            # -> baseline extraction -> filter scenarios) instead of extracting
+            # visuals directly. This avoids a second, duplicate slicer-clearing
+            # implementation living in validator.py.
             self.timer.start("screenshot")
             screenshot_path = (
                 SCREENSHOT_DIR
@@ -141,25 +164,23 @@ class DashboardValidator:
             )
             self.timer.stop("screenshot")
 
-            # automation/validator.py
-
             self.timer.start("visual_extraction")
             try:
-                visual_data = await extract_visual_data(
-                    page,
-                    download_directory=OUTPUT_DIR / "visual_exports",
-                    attempt_export=True,
+                predetermined = (filter_selections or {}).get("Default")
+
+                page_executions, _applied = await engine.process_dashboard_page(
+                    dashboard=dashboard,
+                    page=page,
+                    response=response,
+                    page_name="Default",
+                    predetermined_filters=predetermined,
                 )
-                
-                # Guard: Only wait if page is still open and active
-                if page and not page.is_closed():
-                    await page.wait_for_timeout(1500)
-                    
             except Exception as exc:
                 logger.exception(
                     "DOM visual extraction failed | dashboard=%s",
                     dashboard.get("name"),
                 )
+                page_executions = []
                 visual_data = {
                     "status": "failed",
                     "kpi_cards": [],
@@ -172,24 +193,52 @@ class DashboardValidator:
 
             self.timer.stop("total_execution")
 
-            metrics = await self._capture_metrics(
-                dashboard,
-                page,
-                response,
-                page_name="Default",
-                screenshot_path=screenshot_path,
-            )
-            metrics["extraction_status"] = extraction["status"]
-            if extraction.get("error"):
-                metrics["extraction_error"] = extraction["error"]
+            if not page_executions:
+                # process_dashboard_page() produced nothing (e.g. page closed
+                # mid-flight, or an exception was caught above). Preserve the
+                # existing failure-shaped single-page result contract.
+                metrics = await self._capture_metrics(
+                    dashboard,
+                    page,
+                    response,
+                    page_name="Default",
+                    screenshot_path=screenshot_path,
+                )
+                metrics["extraction_status"] = extraction["status"]
+                if extraction.get("error"):
+                    metrics["extraction_error"] = extraction["error"]
 
-            return playwright, context, {
-                "dashboard": dashboard,
-                "metrics": metrics,
-                "extraction": extraction,
-                "visual_data": visual_data,
-                "_page": page,
-            }, {}
+                return playwright, context, {
+                    "dashboard": dashboard,
+                    "metrics": metrics,
+                    "extraction": extraction,
+                    "visual_data": visual_data,
+                    "_page": page,
+                }, {}
+
+            # Only the baseline (Default View) entry is surfaced here, matching
+            # the pre-existing single-page contract: run_dashboard() has always
+            # returned one dict for a single-page dashboard, never a list. Any
+            # additional filter-scenario entries process_dashboard_page() produced
+            # internally are intentionally not forwarded, exactly as before this
+            # change (single-page filter-scenario comparison is handled separately
+            # by _run_slicer_scenarios() in run_links()).
+            baseline_execution = page_executions[0]
+            baseline_execution.setdefault("metrics", {})
+            baseline_execution["metrics"]["screenshot_path"] = str(screenshot_path)
+            baseline_execution["metrics"]["extraction_status"] = extraction["status"]
+            if extraction.get("error"):
+                baseline_execution["metrics"]["extraction_error"] = extraction["error"]
+
+            # Same gap as the multi-page path above: SlicerEngine's metrics
+            # dict for the baseline execution never included the timings
+            # measured directly in validator.py, so merge them in here.
+            baseline_execution["metrics"]["browser_launch_seconds"] = self.timer.get("browser_launch")
+            baseline_execution["metrics"]["page_load_seconds"] = self.timer.get("page_load")
+            baseline_execution["metrics"]["dashboard_render_seconds"] = self.timer.get("dashboard_render")
+            baseline_execution["metrics"]["total_execution_seconds"] = self.timer.get("total_execution")
+
+            return playwright, context, baseline_execution, {}
 
         except Exception:
             logger.exception(

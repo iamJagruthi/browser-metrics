@@ -140,10 +140,24 @@ _TYPE_CLASSIFIER_JS = r"""
                             { value: ariaRole, method: 'aria_roledescription', weight: 0.85 },
                         ];
 
+                        // Power BI's data-visual-type / aria-roledescription attributes are
+                        // frequently human-readable strings with spaces ("stacked bar chart",
+                        // "text box") rather than the camelCase DOM class token
+                        // ("stackedColumnChart"). PBI_TYPE_MAP's regexes are written as
+                        // contiguous compound words, so they only ever matched the
+                        // dom_class_token tier and silently failed on tiers 2/3, causing
+                        // real charts/text boxes to fall through to structural guessing.
+                        // Normalizing a single tier's own value (never the concatenated
+                        // typeSource) is safe: it cannot merge unrelated words from other
+                        // attributes into a false compound match.
+                        const normalizeTypeToken = value =>
+                            String(value || '').toLowerCase().replace(/[\s_-]+/g, '');
+
                         for (const tier of tiers) {
                             if (!tier.value) continue;
+                            const normalizedValue = normalizeTypeToken(tier.value);
                             for (const [regex, category, subtype, family] of PBI_TYPE_MAP) {
-                                if (regex.test(tier.value)) {
+                                if (regex.test(normalizedValue)) {
                                     return {
                                         category, subtype, family,
                                         detection_method: tier.method,
@@ -754,6 +768,26 @@ _VISUAL_INSPECTION_JS = r"""(node, { index, debug }) => {
 
                     const isNonDataElement = (isActionButton || isImage || isShape || isNavigationOrBookmarkText) && !isButtonSlicer;
 
+                    // Reliable non-tabular signal, computed here (using only `cls` and the
+                    // isImage/isShape/isNonDataElement flags already established above -
+                    // none of which depend on isTable/isMatrix/isChart) so it can gate the
+                    // generic classSource/typeSource "table"/"matrix" keyword evidence below
+                    // WITHOUT a circular dependency on isChart (which itself depends on
+                    // hasStrongTabularEvidence, which depends on isTable/isMatrix). Without
+                    // this guard, a stray hyphenated class name anywhere in a chart/image/
+                    // text box's DOM subtree (e.g. a "data-table-icon" accessibility toggle)
+                    // could flip is_table/is_matrix true via nothing but a \btable\b /
+                    // \bmatrix\b word-boundary match, bypassing every downstream guard.
+                    const reliableClsCategory =
+                        (cls && cls.detection_method !== 'keyword_match') ? cls.category : null;
+
+                    const isReliableNonTabularVisual =
+                        reliableClsCategory === 'chart' ||
+                        reliableClsCategory === 'map' ||
+                        reliableClsCategory === 'other' ||
+                        reliableClsCategory === 'kpi_card' ||
+                        isImage || isShape || isNonDataElement;
+
                     const isDropdown =
                         /dropdown/i.test(typeSource) ||
                         Boolean(node.querySelector('.dropdown, [class*="dropdown" i]'));
@@ -801,8 +835,24 @@ _VISUAL_INSPECTION_JS = r"""(node, { index, debug }) => {
                         )
                     );
 
-                    const isTable = visualType === 'table' || ariaRoleDescription === 'table' || /\btable\b/i.test(typeSource) || /\btable\b/i.test(classSource) || (cls && cls.family === 'table');
-                    const isMatrix = visualType === 'matrix' || ariaRoleDescription === 'matrix' || /\bmatrix\b/i.test(typeSource) || /\bmatrix\b/i.test(classSource) || (cls && cls.family === 'matrix');
+                    // Explicit signals (literal attribute equality, or a reliable
+                    // classifier-tier match) are trustworthy on their own and stay
+                    // ungated - this is the "proven working" evidence the project
+                    // relies on for genuine tables/matrices. Only the generic
+                    // classSource/typeSource keyword evidence (which can pick up an
+                    // unrelated hyphenated class anywhere in the DOM subtree) is gated
+                    // behind isReliableNonTabularVisual.
+                    const hasExplicitTableSignal =
+                        visualType === 'table' || ariaRoleDescription === 'table' || (cls && cls.family === 'table');
+                    const hasGenericTableSignal =
+                        /\btable\b/i.test(typeSource) || /\btable\b/i.test(classSource);
+                    const isTable = hasExplicitTableSignal || (hasGenericTableSignal && !isReliableNonTabularVisual);
+
+                    const hasExplicitMatrixSignal =
+                        visualType === 'matrix' || ariaRoleDescription === 'matrix' || (cls && cls.family === 'matrix');
+                    const hasGenericMatrixSignal =
+                        /\bmatrix\b/i.test(typeSource) || /\bmatrix\b/i.test(classSource);
+                    const isMatrix = hasExplicitMatrixSignal || (hasGenericMatrixSignal && !isReliableNonTabularVisual);
 
                     // IMPORTANT: this is the proven working table/matrix
                     // detection logic. Its selectors and evidence checks are kept
@@ -821,14 +871,29 @@ _VISUAL_INSPECTION_JS = r"""(node, { index, debug }) => {
                         hasPowerBITabularStructure ||
                         hasPowerBITabularClass;
 
+                    // reliableClsCategory / isReliableNonTabularVisual are computed
+                    // earlier (see above isTable/isMatrix) - reused here rather than
+                    // redeclared, since reliable explicit Power BI type evidence must
+                    // win over generic structural DOM evidence such as grid/table/
+                    // bodyCell class names, which can appear inside genuine charts
+                    // (e.g. accessible data-table views, axis gridlines) and inside
+                    // non-data visuals alike.
                     const isChart =
-                        (explicitChartFromClassifier || explicitChartFromKeywords)
+                        (
+                            reliableClsCategory === 'chart'
+                            || ((explicitChartFromClassifier || explicitChartFromKeywords) && !hasStrongTabularEvidence)
+                        )
                         && !isButton
-                        && !isSlicer
-                        && !hasStrongTabularEvidence;
+                        && !isSlicer;
 
                     const isKpiOrCard =
                         explicitKpiOrCard && !isChart;
+
+                    // A visual confidently identified as a chart, image, shape/text box,
+                    // or another non-data 'other' category must never be reclassified as
+                    // tabular merely because generic grid/table/bodyCell-style class names
+                    // are present somewhere in its DOM subtree.
+                    const isConfirmedNonTabular = isReliableNonTabularVisual || isChart;
 
                     const isTabular = Boolean(
                         isTable ||
@@ -836,6 +901,7 @@ _VISUAL_INSPECTION_JS = r"""(node, { index, debug }) => {
                         (
                             (hasGrid || hasTableElement || hasPowerBITabularStructure || hasPowerBITabularClass)
                             && !isSlicer && !isKpiOrCard && !isButton && !isDropdown
+                            && !isConfirmedNonTabular
                         )
                     );
 
@@ -1063,8 +1129,14 @@ class VisualDataExporter:
             method_counts[method] = method_counts.get(method, 0) + 1
         logger.info("DOM extraction detection summary | %s=%s", label, method_counts)
 
-    async def extract_dashboard_data(self) -> dict[str, Any]:
-        """Extract dashboard data using DOM inspection."""
+    async def extract_dashboard_data(self, attempt_export: bool = True) -> dict[str, Any]:
+        """Extract dashboard data using DOM inspection.
+
+        attempt_export controls whether identified table/matrix visuals are
+        exported as part of this call (populating result["table_exports"]).
+        Defaults to True so existing callers that rely on this method's own
+        export pass keep working unchanged.
+        """
         result: dict[str, Any] = {
             "status": "success",
             "extracted_at": datetime.now(timezone.utc).isoformat(),
@@ -1158,6 +1230,8 @@ class VisualDataExporter:
                     (visual.get("is_table") or visual.get("is_matrix") or visual.get("is_tabular"))
                     and not visual.get("is_button")
                     and not visual.get("is_non_data_element")
+                    and not visual.get("is_chart")
+                    and not visual.get("is_map")
                 )
 
                 if is_exportable_table:
@@ -1172,7 +1246,7 @@ class VisualDataExporter:
                 result["status"] = "partial"
                 result["errors"].append(f"Visual {index + 1}: {exc}")
 
-        if result["table_visuals"]:
+        if attempt_export and result["table_visuals"]:
             try:
                 result["table_exports"] = await export_table_visuals(
                     page=self.page,
@@ -1194,6 +1268,7 @@ class VisualDataExporter:
 async def extract_visual_data(page, **kwargs) -> dict[str, Any]:
     dashboard_name = kwargs.pop("dashboard_name", "Dashboard")
     debug_type_detection = kwargs.pop("debug_type_detection", False)
+    attempt_export = kwargs.pop("attempt_export", True)
     if kwargs:
         logger.debug("Ignoring unsupported extract_visual_data kwargs: %s", list(kwargs.keys()))
 
@@ -1202,4 +1277,4 @@ async def extract_visual_data(page, **kwargs) -> dict[str, Any]:
         dashboard_name=dashboard_name,
         debug_type_detection=debug_type_detection,
     )
-    return await exporter.extract_dashboard_data()
+    return await exporter.extract_dashboard_data(attempt_export=attempt_export)
