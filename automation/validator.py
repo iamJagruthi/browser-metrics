@@ -3,22 +3,8 @@
 import asyncio
 import json
 import logging
-import os
 import time
 import uuid
-
-# Diagnostic-only kill switch, off by default. When set, a dead
-# playwright/context/page is NOT silently recovered with a fresh
-# launch_browser() call -- the run fails immediately instead, so the
-# true underlying crash (page_close/context_close/browser_disconnected)
-# is visible in the API response and logs instead of being masked by
-# a second Edge instance quietly picking up where the first left off.
-# Enable for a single diagnostic run with:
-#   DISABLE_BROWSER_AUTO_RECOVERY=true
-# Leave unset for normal production behavior (auto-recovery stays on).
-DISABLE_BROWSER_AUTO_RECOVERY = (
-    os.getenv("DISABLE_BROWSER_AUTO_RECOVERY", "false").lower() == "true"
-)
 
 from .browser import capture_dashboard_snapshot, launch_browser, wait_for_dashboard
 from .network import clear, details, register, summary
@@ -142,6 +128,23 @@ class DashboardValidator:
                 except Exception:
                     pass
 
+                # These four timers are only ever measured here in
+                # validator.py (browser launch, initial page.goto, and
+                # wait_for_dashboard all happen once, before the per-page
+                # loop). SlicerEngine's own per-page metrics dict does not
+                # include them, so without this merge they were captured
+                # but never reached the output.
+                browser_level_timings = {
+                    "browser_launch_seconds": self.timer.get("browser_launch"),
+                    "page_load_seconds": self.timer.get("page_load"),
+                    "dashboard_render_seconds": self.timer.get("dashboard_render"),
+                    "total_execution_seconds": self.timer.get("total_execution"),
+                }
+                for _execution in executions:
+                    _execution.setdefault("metrics", {})
+                    for _field, _value in browser_level_timings.items():
+                        _execution["metrics"][_field] = _value
+
                 return playwright, context, executions, page_filter_selections
 
             # Single-page dashboards must receive the same slicer-baseline
@@ -226,6 +229,14 @@ class DashboardValidator:
             baseline_execution["metrics"]["extraction_status"] = extraction["status"]
             if extraction.get("error"):
                 baseline_execution["metrics"]["extraction_error"] = extraction["error"]
+
+            # Same gap as the multi-page path above: SlicerEngine's metrics
+            # dict for the baseline execution never included the timings
+            # measured directly in validator.py, so merge them in here.
+            baseline_execution["metrics"]["browser_launch_seconds"] = self.timer.get("browser_launch")
+            baseline_execution["metrics"]["page_load_seconds"] = self.timer.get("page_load")
+            baseline_execution["metrics"]["dashboard_render_seconds"] = self.timer.get("dashboard_render")
+            baseline_execution["metrics"]["total_execution_seconds"] = self.timer.get("total_execution")
 
             return playwright, context, baseline_execution, {}
 
@@ -326,17 +337,6 @@ class DashboardValidator:
                     is_context_dead = True
 
                 if is_context_dead:
-                    if DISABLE_BROWSER_AUTO_RECOVERY:
-                        logger.error(
-                            "Browser/context is dead before dashboard '%s' and "
-                            "DISABLE_BROWSER_AUTO_RECOVERY is set -- failing fast "
-                            "instead of silently launching a replacement browser.",
-                            dashboard.get("name"),
-                        )
-                        raise RuntimeError(
-                            "Playwright context is dead (page/context/browser closed) "
-                            "and auto-recovery is disabled for this diagnostic run."
-                        )
                     playwright, context, first_page = await launch_browser()
                     resources.append((playwright, context))
                     page = first_page
@@ -348,15 +348,6 @@ class DashboardValidator:
                             else await context.new_page()
                         )
                     except Exception as page_err:
-                        if DISABLE_BROWSER_AUTO_RECOVERY:
-                            logger.error(
-                                "context.new_page() failed before dashboard '%s' and "
-                                "DISABLE_BROWSER_AUTO_RECOVERY is set -- failing fast "
-                                "instead of silently launching a replacement browser. "
-                                "error=%s",
-                                dashboard.get("name"), page_err,
-                            )
-                            raise
                         playwright, context, first_page = await launch_browser()
                         resources.append((playwright, context))
                         page = first_page

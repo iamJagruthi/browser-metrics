@@ -155,7 +155,7 @@ async def launch_profile(profile_path):
             user_data_dir=profile_path,
             channel=BROWSER_CHANNEL,
             headless=HEADLESS,
-            slow_mo=300,
+            slow_mo=0,
             no_viewport=True,
             args=[
                 "--disable-dev-shm-usage",
