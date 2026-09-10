@@ -163,10 +163,10 @@ def log_delta(operation: str, target_name: str | None, before: dict, after: dict
     caller's return value."""
     try:
         if before.get("error") or after.get("error"):
-            logger.info(
-                "CANVAS_DIAG | op=%s | target=%r | measurement_error before=%s after=%s",
-                operation, target_name, before.get("error"), after.get("error"),
-            )
+            # logger.info(
+            #     "CANVAS_DIAG | op=%s | target=%r | measurement_error before=%s after=%s",
+            #     operation, target_name, before.get("error"), after.get("error"),
+            # )
             return
 
         rect_delta = _rect_delta(before, after)
@@ -187,23 +187,23 @@ def log_delta(operation: str, target_name: str | None, before: dict, after: dict
             )
         )
 
-        logger.info(
-            "CANVAS_DIAG | op=%s | target=%r | t_before=%.3f | t_after=%.3f | "
-            "landmark_found=%s | visual_count_before=%s | visual_count_after=%s | "
-            "rect_delta=%s | scroll_delta=%s | ancestor_delta=%s | "
-            "landmark_moved=%s | page_or_ancestor_scrolled=%s",
-            operation,
-            target_name,
-            before.get("timestamp", 0.0),
-            after.get("timestamp", 0.0),
-            before.get("landmarkFound"),
-            before.get("visualContainerCount"),
-            after.get("visualContainerCount"),
-            rect_delta,
-            scroll_delta,
-            ancestor_delta,
-            landmark_moved,
-            scrolled,
-        )
+        # logger.info(
+        #     "CANVAS_DIAG | op=%s | target=%r | t_before=%.3f | t_after=%.3f | "
+        #     "landmark_found=%s | visual_count_before=%s | visual_count_after=%s | "
+        #     "rect_delta=%s | scroll_delta=%s | ancestor_delta=%s | "
+        #     "landmark_moved=%s | page_or_ancestor_scrolled=%s",
+        #     operation,
+        #     target_name,
+        #     before.get("timestamp", 0.0),
+        #     after.get("timestamp", 0.0),
+        #     before.get("landmarkFound"),
+        #     before.get("visualContainerCount"),
+        #     after.get("visualContainerCount"),
+        #     rect_delta,
+        #     scroll_delta,
+        #     ancestor_delta,
+        #     landmark_moved,
+        #     scrolled,
+        # )
     except Exception as exc:
         logger.warning("CANVAS_DIAG | logging failed | op=%s | error=%s", operation, exc)
