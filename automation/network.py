@@ -8,7 +8,6 @@ Captures browser network activity:
 - Console Messages
 - JavaScript Errors
 """
-
 import logging
 
 
