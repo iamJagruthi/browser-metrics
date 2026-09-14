@@ -4,7 +4,6 @@ from playwright.async_api import Page
 import uuid
 
 from automation.browser import capture_dashboard_snapshot, wait_for_dashboard
-from automation.canvas_diagnostics import measure_canvas, log_delta
 from services.visual_data_exporter import extract_visual_data
 # NOTE: do NOT import DashboardValidator at module level here — validator.py
 # imports SlicerEngine at module level too, so a top-level import in both
@@ -102,10 +101,7 @@ class SlicerEngine:
             container = slicer_visual
 
             if await dropdown_btn.count() > 0:
-                _diag_before = await measure_canvas(self.page)
                 await dropdown_btn.click(force=True)
-                _diag_after = await measure_canvas(self.page)
-                log_delta("SlicerEngine.get_filter_options.dropdown_btn_click", filter_name, _diag_before, _diag_after)
                 popup = self.page.locator(".slicer-dropdown-popup:visible").first
                 try:
                     await popup.wait_for(state="visible", timeout=3000)
@@ -219,10 +215,7 @@ class SlicerEngine:
             container = slicer_visual
 
             if await dropdown_btn.count() > 0:
-                _diag_before = await measure_canvas(self.page)
                 await dropdown_btn.click(force=True)
-                _diag_after = await measure_canvas(self.page)
-                log_delta("SlicerEngine.apply_filter.dropdown_btn_click", filter_name, _diag_before, _diag_after)
                 popup = self.page.locator(".slicer-dropdown-popup:visible").first
                 try:
                     await popup.wait_for(state="visible", timeout=3000)
@@ -253,16 +246,8 @@ class SlicerEngine:
             # never toggling anything the caller didn't ask to change.
             previous_snapshot = await capture_dashboard_snapshot(self.page)
 
-            _diag_before = await measure_canvas(self.page)
             await target_el.scroll_into_view_if_needed()
-            _diag_after = await measure_canvas(self.page)
-            log_delta("SlicerEngine.apply_filter.target_el_scroll_into_view_if_needed", f"{filter_name}={option_value}", _diag_before, _diag_after)
-
-            _diag_before = await measure_canvas(self.page)
             await target_el.click(force=True)
-            _diag_after = await measure_canvas(self.page)
-            log_delta("SlicerEngine.apply_filter.target_el_click", f"{filter_name}={option_value}", _diag_before, _diag_after)
-
             logger.info(f"Clicked option '{option_value}' under '{filter_name}'; verifying result.")
 
             await self.page.keyboard.press("Escape")
@@ -456,10 +441,7 @@ class SlicerEngine:
             opened_popup = False
 
             if await dropdown_btn.count() > 0:
-                _diag_before = await measure_canvas(self.page)
                 await dropdown_btn.click(force=True)
-                _diag_after = await measure_canvas(self.page)
-                log_delta("SlicerEngine.get_slicer_state.dropdown_btn_click", filter_name, _diag_before, _diag_after)
                 popup = self.page.locator(".slicer-dropdown-popup:visible").first
                 try:
                     await popup.wait_for(state="visible", timeout=3000)
@@ -614,16 +596,8 @@ class SlicerEngine:
         click itself succeeded (not whether the clear was effective —
         that is verified separately by re-reading state)."""
         try:
-            _diag_before = await measure_canvas(self.page)
             await control.scroll_into_view_if_needed()
-            _diag_after = await measure_canvas(self.page)
-            log_delta("SlicerEngine._click_clear_control.scroll_into_view_if_needed", filter_name, _diag_before, _diag_after)
-
-            _diag_before = await measure_canvas(self.page)
             await control.click(force=True)
-            _diag_after = await measure_canvas(self.page)
-            log_delta("SlicerEngine._click_clear_control.click", filter_name, _diag_before, _diag_after)
-
             await self._close_any_open_popups()
             return True
         except Exception as e:
@@ -736,27 +710,111 @@ class SlicerEngine:
 
         return baseline
 
-    async def apply_random_valid_option(self, filter_name: str) -> str:
-        """Fetches options, filters out 'All', picks a random one, and applies it."""
-        options = await self.get_filter_options(filter_name)
-        
-        # Filter out UI noise and reset options
-        valid_options = [
-            opt for opt in options 
-            if opt.strip().lower() not in {"select all", "all", "(blank)", ""}
-        ]
-        print(f"Valid options for '{filter_name}': {valid_options}")
+    async def apply_random_valid_option(self, filter_name: str) -> str | None:
+        """Choose and apply a runtime-discovered slicer option.
 
-        if not valid_options:
-            logger.warning(f"No valid random options found for '{filter_name}'.")
+        The selected value is returned only when ``apply_filter`` verifies that
+        the value is actually selected. Already-selected values are excluded so
+        a new scenario is not created from a no-op click.
+        """
+        options = await self.get_filter_options(filter_name)
+
+        valid_options = [
+            opt for opt in options
+            if opt.strip().casefold() not in {"select all", "all", "(blank)", ""}
+        ]
+
+        try:
+            current_state = await self.get_slicer_state(filter_name)
+            current_values = {
+                self._normalize_value(value)
+                for value in current_state.get("selected_values", [])
+            } if current_state and not current_state.get("error") else set()
+        except Exception as exc:
+            logger.warning(
+                "Could not read current state before choosing an option for '%s': %s",
+                filter_name,
+                exc,
+            )
+            current_values = set()
+
+        candidates = [
+            option for option in valid_options
+            if self._normalize_value(option) not in current_values
+        ]
+
+        if not candidates:
+            logger.warning(
+                "No unselected valid options found for filter '%s'; "
+                "no scenario will be created for this filter.",
+                filter_name,
+            )
             return None
 
-        # Pick a random option
-        selected_option = random.choice(valid_options)
-        
-        # Apply it
-        await self.apply_filter(filter_name, selected_option)
+        selected_option = random.choice(candidates)
+        success = await self.apply_filter(filter_name, selected_option)
+        if not success:
+            logger.warning(
+                "Filter application was not verified | filter=%s | value=%s",
+                filter_name,
+                selected_option,
+            )
+            return None
+
         return selected_option
+
+    async def _verify_applied_filter_state(self, applied_filters: dict) -> tuple[bool, dict]:
+        """Verify that every expected filter is active on the current page.
+
+        This is intentionally data-driven: filter names and values come from
+        the accumulated runtime state. No dashboard-specific names or values
+        are assumed.
+        """
+        observed_states = {}
+
+        for filter_name, expected_value in applied_filters.items():
+            try:
+                state = await self.get_slicer_state(filter_name)
+            except Exception as exc:
+                logger.warning(
+                    "Could not verify slicer '%s': %s", filter_name, exc
+                )
+                return False, observed_states
+
+            observed_states[filter_name] = state
+
+            if state.get("error"):
+                logger.warning(
+                    "Slicer verification failed | filter=%s | error=%s",
+                    filter_name,
+                    state.get("error"),
+                )
+                return False, observed_states
+
+            actual_values = {
+                self._normalize_value(value)
+                for value in (state.get("selected_values") or [])
+            }
+
+            if isinstance(expected_value, (list, tuple, set)):
+                expected_values = {
+                    self._normalize_value(value) for value in expected_value
+                }
+                matches = expected_values.issubset(actual_values)
+            else:
+                matches = self._normalize_value(expected_value) in actual_values
+
+            if not matches:
+                logger.warning(
+                    "Cumulative slicer verification failed | filter=%s | "
+                    "expected=%s | actual=%s",
+                    filter_name,
+                    expected_value,
+                    state.get("selected_values"),
+                )
+                return False, observed_states
+
+        return True, observed_states
 
     async def process_dashboard_page(
             self,
@@ -835,6 +893,8 @@ class SlicerEngine:
                 },
                 "page_name": page_name,
                 "filter_applied": "Default View",
+                "applied_filters": {},
+                "filter_state_verified": True,
                 "extraction": {
                     "status": "not_used",
                     "data": None,
@@ -860,82 +920,103 @@ class SlicerEngine:
                 filters_to_apply = [(f_name, None) for f_name in (detected_filters or [])[:2]]
             for f_name, predetermined_value in filters_to_apply:
                 if page.is_closed():
-                    logger.warning("Page closed before applying filter '%s'. Skipping.", f_name)
+                    logger.warning(
+                        "Page closed before applying filter '%s'. Skipping.", f_name
+                    )
                     break
 
                 previous_snapshot = await capture_dashboard_snapshot(page)
 
                 if predetermined_value is not None:
-                    logger.info(f"Reproducing filter on target: {f_name} = '{predetermined_value}'")
-                    success = await self.apply_filter(f_name, predetermined_value)
-
-                    if not success:
-                        logger.warning(
-                            "Target could not reproduce source filter | page=%s filter=%s value=%s",
-                            page_name,
-                            f_name,
-                            predetermined_value,
-                        )
-                        executions.append({
-                            "dashboard": {
-                                **dashboard,
-                                "page_name": page_name,
-                                "filter_applied": f"{f_name} = '{predetermined_value}' (FAILED TO APPLY)",
-                            },
-                            "page_name": page_name,
-                            "filter_applied": f"{f_name} = '{predetermined_value}'",
-                            "extraction": {"status": "not_used", "data": None, "error": None},
-                            "visual_data": {
-                                "status": "failed",
-                                "kpi_cards": [],
-                                "visuals": [],
-                                "filters": [],
-                                "errors": [
-                                    f"Could not reproduce source's filter selection "
-                                    f"'{predetermined_value}' for '{f_name}' on target dashboard."
-                                ],
-                            },
-                            "_page": page,
-                        })
-                        continue
-
+                    logger.info(
+                        "Reproducing filter on target: %s = '%s'",
+                        f_name,
+                        predetermined_value,
+                    )
                     applied_option = predetermined_value
+                    success = await self.apply_filter(f_name, applied_option)
                 else:
-                    logger.info(f"Applying random option to filter: {f_name}")
+                    logger.info("Applying runtime-selected option to filter: %s", f_name)
                     applied_option = await self.apply_random_valid_option(f_name)
+                    success = applied_option is not None
 
-                    if not applied_option:
-                        continue
+                if not success or applied_option is None:
+                    logger.warning(
+                        "Filter scenario not recorded because application was not "
+                        "verified | page=%s | filter=%s | value=%s",
+                        page_name,
+                        f_name,
+                        applied_option,
+                    )
+                    break
 
+                # Update the cumulative state only after the individual filter
+                # application has been verified. Never mutate earlier snapshots.
                 applied_selection[f_name] = applied_option
-                filter_label = f"{f_name} = '{applied_option}'"
-                logger.info(
-                    "Filter applied | filter=%s | value=%s",
-                    f_name,
-                    applied_option,
+                scenario_filters = dict(applied_selection)
+
+                filter_label = ", ".join(
+                    f"{name} = '{value}'"
+                    for name, value in scenario_filters.items()
                 )
+
+                logger.info(
+                    "Cumulative filter state | page=%s | filters=%s",
+                    page_name,
+                    scenario_filters,
+                )
+
                 validator.timer.start("filter_dashboard_render")
                 logger.info("Waiting for Power BI visuals to recalculate...")
                 await wait_for_dashboard(page, previous_snapshot=previous_snapshot)
                 validator.timer.stop("filter_dashboard_render")
 
                 if page.is_closed():
+                    logger.warning(
+                        "Page closed after applying cumulative filters on '%s'.",
+                        page_name,
+                    )
                     break
 
-                # Same reuse as the baseline extraction above: avoid exporting
-                # the same filtered table/matrix visuals twice.
-                filtered_visual_data = await extract_visual_data(page, attempt_export=True)
+                # Verify the complete accumulated state, not only the most recent
+                # filter. This prevents a scenario from being recorded if a prior
+                # slicer selection was lost during recalculation.
+                state_verified, observed_states = await self._verify_applied_filter_state(
+                    scenario_filters
+                )
+
+                if not state_verified:
+                    logger.warning(
+                        "Cumulative filter state could not be verified; "
+                        "scenario will not be recorded | page=%s | filters=%s",
+                        page_name,
+                        scenario_filters,
+                    )
+                    break
+
+                # Reuse the current dashboard state exactly once after the full
+                # cumulative filter state has been verified.
+                filtered_visual_data = await extract_visual_data(
+                    page, attempt_export=False, scroll_export_fallback = True
+                )
                 filtered_tables = filtered_visual_data.get("table_exports", [])
 
                 executions.append({
                     "dashboard": {
                         **dashboard,
                         "page_name": page_name,
-                        "filter_applied": filter_label
+                        "filter_applied": filter_label,
                     },
                     "page_name": page_name,
                     "filter_applied": filter_label,
-                    "extraction": {"status": "not_used", "data": None, "error": None},
+                    "applied_filters": scenario_filters,
+                    "filter_state_verified": True,
+                    "slicer_states": observed_states,
+                    "extraction": {
+                        "status": "not_used",
+                        "data": None,
+                        "error": None,
+                    },
                     "visual_data": filtered_visual_data,
                     "tables": filtered_tables,
                     "metrics": await validator._capture_metrics(

@@ -1129,13 +1129,25 @@ class VisualDataExporter:
             method_counts[method] = method_counts.get(method, 0) + 1
         logger.info("DOM extraction detection summary | %s=%s", label, method_counts)
 
-    async def extract_dashboard_data(self, attempt_export: bool = True) -> dict[str, Any]:
+    async def extract_dashboard_data(
+        self,
+        attempt_export: bool = True,
+        scroll_export_fallback: bool = False,
+    ) -> dict[str, Any]:
         """Extract dashboard data using DOM inspection.
 
         attempt_export controls whether identified table/matrix visuals are
         exported as part of this call (populating result["table_exports"]).
         Defaults to True so existing callers that rely on this method's own
         export pass keep working unchanged.
+
+        scroll_export_fallback, when True (and attempt_export=False), disables
+        the blanket table export and instead exports ONLY those table/matrix
+        visuals that prove they contain more data than the DOM shows: any
+        visual detected as tabular AND having horizontal vertical scroll (or
+        both) is queued and exported via the table exporter. Non-scrollable
+        tables are fully visible in the DOM, so their accessible text is
+        already captured by _VISUAL_INSPECTION_JS and they are not exported.
         """
         result: dict[str, Any] = {
             "status": "success",
@@ -1151,6 +1163,7 @@ class VisualDataExporter:
 
         logger.info("Starting dashboard DOM extraction")
         VISUAL_SELECTOR = ".visualContainer, [data-visual-container]"
+        scrollable_tabular_visuals: list[dict[str, Any]] = []
 
         try:
             result["kpi_cards"] = await self._extract_kpi_cards()
@@ -1238,6 +1251,16 @@ class VisualDataExporter:
                     raw_title = str(visual.get("title") or "").lower()
                     if not ("click here to" in raw_title or "bookmark" in raw_title):
                         result["table_visuals"].append(visual)
+
+                        # Scroll-aware fallback: when blanket export is disabled,
+                        # only tables that can display more rows/columns than the
+                        # viewport (horizontal OR vertical scroll, or both) are
+                        # queued for live "Export Data" -- every other table's
+                        # visible content is already captured in the DOM text.
+                        if scroll_export_fallback and (
+                            visual.get("scrollable") or visual.get("horizontally_scrollable")
+                        ):
+                            scrollable_tabular_visuals.append(visual)
                     continue
 
                 result["visuals"].append(visual)
@@ -1246,7 +1269,21 @@ class VisualDataExporter:
                 result["status"] = "partial"
                 result["errors"].append(f"Visual {index + 1}: {exc}")
 
-        if attempt_export and result["table_visuals"]:
+        # Scroll-aware fallback export takes over when blanket export is off.
+        # Only scrollable table/matrix visuals are exported via the Power BI
+        # "Export Data" action (table_exporter's logic); non-scrollable tables
+        # stay as DOM text.
+        if scroll_export_fallback and scrollable_tabular_visuals:
+            try:
+                result["table_exports"] = await export_table_visuals(
+                    page=self.page,
+                    table_visuals=scrollable_tabular_visuals,
+                    dashboard_name=self.dashboard_name,
+                )
+            except Exception as exc:
+                result["status"] = "partial"
+                result["errors"].append(f"Scroll-aware table export failed: {exc}")
+        elif attempt_export and result["table_visuals"] and not scroll_export_fallback:
             try:
                 result["table_exports"] = await export_table_visuals(
                     page=self.page,
@@ -1264,11 +1301,11 @@ class VisualDataExporter:
 
         return result
 
-
 async def extract_visual_data(page, **kwargs) -> dict[str, Any]:
     dashboard_name = kwargs.pop("dashboard_name", "Dashboard")
     debug_type_detection = kwargs.pop("debug_type_detection", False)
     attempt_export = kwargs.pop("attempt_export", True)
+    scroll_export_fallback = kwargs.pop("scroll_export_fallback", False)
     if kwargs:
         logger.debug("Ignoring unsupported extract_visual_data kwargs: %s", list(kwargs.keys()))
 
@@ -1277,4 +1314,7 @@ async def extract_visual_data(page, **kwargs) -> dict[str, Any]:
         dashboard_name=dashboard_name,
         debug_type_detection=debug_type_detection,
     )
-    return await exporter.extract_dashboard_data(attempt_export=attempt_export)
+    return await exporter.extract_dashboard_data(
+        attempt_export=attempt_export,
+        scroll_export_fallback=scroll_export_fallback,
+    )
