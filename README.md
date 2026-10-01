@@ -6,12 +6,19 @@ The backend captures browser/network metrics, reads rendered Power BI visuals an
 
 ## Run
 
-1. Create `.env` with `GEMINI_API_KEY` and (optionally) `GEMINI_MODEL`.
-2. Install dependencies from `requirements.txt`.
-3. Start the API with `python run_server.py`.
-4. Start the React app in `Frontend` with `npm run dev`.
+1. Create `Backend/.env` with `GEMINI_API_KEY` and (optionally) `GEMINI_MODEL`.
+2. Install dependencies from `Backend/requirements.txt`.
+3. Start the API from the `Backend` folder with `python run_server.py`.
+4. Start the React app from the `Frontend` folder with `npm run dev`.
 
-The frontend calls `POST /api/validate` with `source_url` and `target_url`; `GET /api/health` confirms the service is running.
+The API flow is two-phase:
+
+1. `POST /api/browser-metrics` with `source_url` and `target_url` schedules the asynchronous browser capture and returns a `run_id` immediately.
+2. Poll `GET /api/runs/{run_id}/status` until the capture reaches `completed`/`partial`/`failed`.
+3. `POST /api/validate` with `{"run_id": "..."}` rebuilds the comparison from the captured artifacts (no second browser launch, no metric recalculation) and generates the Word report.
+4. Download the Word report with embedded screenshots from `GET /api/runs/{run_id}/report`.
+
+`GET /api/health` confirms the service is running. The frontend runs these steps automatically on submit.
 
 ## Git workflow (team)
 
@@ -47,12 +54,12 @@ git push origin dev
 
 ```powershell
 # Windows
-.\scripts\install-git-hooks.ps1
+.\Backend\scripts\install-git-hooks.ps1
 ```
 
 ```bash
 # macOS / Linux
-./scripts/install-git-hooks.sh
+./Backend/scripts/install-git-hooks.sh
 ```
 
 ### Protect `main` on GitHub (repo admin)
@@ -71,12 +78,12 @@ Optional API setup (repo admin PAT):
 
 ```powershell
 $env:GITHUB_TOKEN = "ghp_your_personal_access_token"
-.\scripts\setup-github-branch-protection.ps1
+.\Backend\scripts\setup-github-branch-protection.ps1
 ```
 
 ## Generated reports
 
-Each successful validation writes reports beneath `output/reports/`:
+Each successful validation writes reports beneath `Backend/output/reports/`:
 
 - Excel: side-by-side source/target KPI values, filter comparison, individual source/target table blocks on one sheet, and a complete cell-level comparison across all detected columns.
 - Word: concise match/mismatch counts for KPIs and visual/table data, browser metrics, and matched-slicer test results when a common slicer option can be applied safely.
