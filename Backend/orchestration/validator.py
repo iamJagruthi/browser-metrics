@@ -59,9 +59,10 @@ def _performance_summary(side: str, results: dict, artifacts: dict) -> dict:
     entry = results.get(side, {}) or {}
     return {
         "browser_launch_seconds": entry.get("browser_launch_seconds", 0.0),
+        # Time from opening the link to the dashboard fully rendered.
         "page_load_seconds": entry.get("page_load_seconds"),
-        "dashboard_render_seconds": entry.get("dashboard_render_seconds", 0.0),
-        "filter_dashboard_render_seconds": entry.get("filter_dashboard_render_seconds"),
+        # Time for the dashboard to re-render after a filter is applied.
+        "dashboard_render_seconds": entry.get("dashboard_render_seconds"),
         "filter_test": entry.get("filter_test"),
         "baseline_stable": bool(entry.get("baseline_stable", False)),
         "screenshot_captured": bool((artifacts.get(side) or {}).get("screenshot")),
@@ -112,24 +113,25 @@ class DashboardValidator:
             # starts only after the browser is ready (browser launch is measured
             # above and never included here) and immediately before navigating
             # to the dashboard URL, then stops once the dashboard reaches the
-            # existing stable condition. page_load remains a diagnostic
-            # sub-timing covering only the goto attempt until DOMContentLoaded;
-            # browser_launch_seconds is reported separately.
-            self.timer.start("dashboard_render")
+            # existing stable condition. browser_launch_seconds is reported
+            # separately.
+            #
+            # page_load_seconds is the whole user-perceived wait after opening
+            # the link: navigation plus the time Power BI needs to render every
+            # visual. It deliberately includes the render, so it is NOT the
+            # goto() call alone. dashboard_render_seconds is owned by the
+            # later filter-application measurement instead.
+            self.timer.start("page_load")
             try:
-                self.timer.start("page_load")
-                try:
-                    response = await page.goto(
-                        dashboard["url"],
-                        wait_until="domcontentloaded",
-                        timeout=PAGE_TIMEOUT,
-                    )
-                finally:
-                    self.timer.stop("page_load")
+                response = await page.goto(
+                    dashboard["url"],
+                    wait_until="domcontentloaded",
+                    timeout=PAGE_TIMEOUT,
+                )
 
                 await wait_for_dashboard(page)
             finally:
-                self.timer.stop("dashboard_render")
+                self.timer.stop("page_load")
 
             pages = await get_dashboard_pages(page)
 
@@ -187,10 +189,14 @@ class DashboardValidator:
                 # loop). SlicerEngine's own per-page metrics dict does not
                 # include them, so without this merge they were captured
                 # but never reached the output.
+                #
+                # page_load_seconds carries the full open-link-to-dashboard-rendered
+                # wait. dashboard_render_seconds is deliberately absent here: it
+                # is owned by the filter-application measurement, which runs
+                # later per side (see the filter_test handling below).
                 browser_level_timings = {
                     "browser_launch_seconds": self.timer.get("browser_launch"),
                     "page_load_seconds": self.timer.get("page_load"),
-                    "dashboard_render_seconds": self.timer.get("dashboard_render"),
                     "total_execution_seconds": self.timer.get("total_execution"),
                 }
                 for _execution in executions:
@@ -329,7 +335,6 @@ class DashboardValidator:
             # measured directly in validator.py, so merge them in here.
             baseline_execution["metrics"]["browser_launch_seconds"] = self.timer.get("browser_launch")
             baseline_execution["metrics"]["page_load_seconds"] = self.timer.get("page_load")
-            baseline_execution["metrics"]["dashboard_render_seconds"] = self.timer.get("dashboard_render")
             baseline_execution["metrics"]["total_execution_seconds"] = self.timer.get("total_execution")
 
             return playwright, context, baseline_execution, {}
@@ -422,7 +427,7 @@ class DashboardValidator:
         condition (wait_for_dashboard) reports a stable state -- never while
         visuals are still changing. A usable slicer is discovered dynamically
         at runtime (no hardcoded names/values). When no usable slicer exists,
-        filter_dashboard_render_seconds is reported as null with an explicit
+        dashboard_render_seconds is reported as null with an explicit
         filter_test.status, never a fake 0.
 
         Pages are reused in-place from the context rather than opening new tabs,
@@ -491,9 +496,11 @@ class DashboardValidator:
 
                 entry = {
                     "browser_launch_seconds": browser_launch_seconds,
+                    # Whole open-link-to-rendered wait, set below once the
+                    # dashboard reaches its stable state.
                     "page_load_seconds": None,
-                    "dashboard_render_seconds": 0.0,
-                    "filter_dashboard_render_seconds": None,
+                    # Filter-application render, set below from the filter test.
+                    "dashboard_render_seconds": None,
                     "status": "failed",
                     "error": None,
                     "filter_test": None,
@@ -516,7 +523,7 @@ class DashboardValidator:
                     await register(page)
                     page.set_default_timeout(PAGE_TIMEOUT)
 
-                    # Dashboard Load boundary (matches the manual stopwatch):
+# Dashboard Load boundary (matches the manual stopwatch):
                     # the timer starts only after the browser is ready --
                     # browser launch, profile detection, context creation,
                     # authentication, register()/set_default_timeout and all
@@ -525,34 +532,30 @@ class DashboardValidator:
                     # starts IMMEDIATELY before navigating to the dashboard
                     # URL and stops once the existing stable condition reports
                     # the dashboard fully loaded.
+                    #
+                    # page_load_seconds is the whole user-perceived wait after
+                    # opening the link: navigation plus the time Power BI needs
+                    # to render every visual. It deliberately includes the
+                    # render, so it is NOT the goto() call alone.
                     dashboard_stable = False
-                    self.timer.start("dashboard_render")
+                    self.timer.start("page_load")
                     try:
-                        self.timer.start("page_load")
-                        try:
-                            response = await page.goto(
-                                dashboard["url"],
-                                wait_until="domcontentloaded",
-                                timeout=PAGE_TIMEOUT,
-                            )
-                        finally:
-                            self.timer.stop("page_load")
-                            entry["page_load_seconds"] = self.timer.get("page_load")
-                        logger.info(
-                            "browser_metrics.%s.navigation.completed | run_id=%s",
-                            side,
-                            run_id,
+                        response = await page.goto(
+                            dashboard["url"],
+                            wait_until="domcontentloaded",
+                            timeout=PAGE_TIMEOUT,
                         )
-                        dashboard_stable = await wait_for_dashboard(page)
+
+                        await wait_for_dashboard(page)
                     finally:
-                        self.timer.stop("dashboard_render")
-                    entry["dashboard_render_seconds"] = self.timer.get("dashboard_render")
+                        self.timer.stop("page_load")
+                    entry["page_load_seconds"] = self.timer.get("page_load")
                     entry["baseline_stable"] = bool(dashboard_stable)
                     logger.info(
-                        "browser_metrics.%s.dashboard_render.completed | run_id=%s | seconds=%.3f | stable=%s",
+                        "browser_metrics.%s.page_load.completed | run_id=%s | seconds=%.3f | stable=%s",
                         side,
                         run_id,
-                        entry["dashboard_render_seconds"],
+                        entry["page_load_seconds"],
                         dashboard_stable,
                     )
 
@@ -636,8 +639,9 @@ class DashboardValidator:
                             run_id,
                         )
 
-                    # Measure a REAL filter interaction so that
-                    # filter_dashboard_render_seconds is meaningful. A usable
+                    # Measure a REAL filter interaction. This measurement IS
+                    # dashboard_render_seconds: the user-visible wait for the
+                    # dashboard to re-render after a filter is applied. A usable
                     # slicer is discovered dynamically from the live DOM and a
                     # valid option (preferring a value different from the current
                     # selection) is applied; the elapsed time until the dashboard
@@ -652,18 +656,18 @@ class DashboardValidator:
                     )
                     filter_test = await engine.run_filter_render_test()
                     entry["filter_test"] = filter_test
-                    entry["filter_dashboard_render_seconds"] = filter_test.get(
+                    entry["dashboard_render_seconds"] = filter_test.get(
                         "filter_dashboard_render_seconds"
                     )
                     logger.info(
                         "browser_metrics.%s.filter_test.result | run_id=%s | "
-                        "slicer=%s | value=%s | status=%s | seconds=%s",
+                        "slicer=%s | value=%s | status=%s | dashboard_render_seconds=%s",
                         side,
                         run_id,
                         filter_test.get("slicer"),
                         filter_test.get("value"),
                         filter_test.get("status"),
-                        filter_test.get("filter_dashboard_render_seconds"),
+                        entry["dashboard_render_seconds"],
                     )
 
                     # Explicitly mark this artifact as the baseline/AI screenshot

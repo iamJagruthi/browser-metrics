@@ -964,15 +964,12 @@ class SlicerEngine:
                option that is NOT currently selected, via the existing
                apply_random_valid_option() (which prefers values different from
                the current selection and verifies the click actually selected).
-            3. Time the interaction with the shared PerformanceTimer
-               (key: browser_metrics_filter_test) until the dashboard reaches its
-               existing stable/render state (wait_for_dashboard runs inside
-               apply_filter).
-
-               NOTE: the timer key intentionally differs from the validation
-               slicer-scenario key ("filter_dashboard_render" used by
-               process_dashboard_page). This keeps the dedicated browser-metrics
-               filter test distinguishable in the logs from scenario timings.
+            3. Time the interaction with the shared PerformanceTimer under the
+               dashboard_render key until the dashboard reaches its existing
+               stable/render state (wait_for_dashboard runs inside apply_filter).
+               dashboard_render_seconds IS this filter-application measurement;
+               page_load_seconds separately covers opening the link through to the
+               dashboard being fully rendered.
             4. Return an auditable dict. filter_dashboard_render_seconds is a
                real measured value or None -- never a fabricated 0.
 
@@ -1011,7 +1008,7 @@ class SlicerEngine:
             if self.page.is_closed():
                 break
 
-            validator.timer.start("browser_metrics_filter_test")
+            validator.timer.start("dashboard_render")
             try:
                 applied_value = await self.apply_random_valid_option(filter_name)
             except Exception as exc:
@@ -1023,19 +1020,29 @@ class SlicerEngine:
                 probe_errors.append(f"{filter_name}: {exc}")
                 applied_value = None
             finally:
-                validator.timer.stop("browser_metrics_filter_test")
+                validator.timer.stop("dashboard_render")
 
             if applied_value is not None:
+                # This is the dashboard_render figure the report shows: the
+                # wait for the dashboard to re-render once the filter is live.
+                filter_render_seconds = validator.timer.get("dashboard_render")
                 result.update({
                     "status": "applied",
                     "slicer": filter_name,
                     "value": applied_value,
                     "applied": True,
-                    "filter_dashboard_render_seconds": validator.timer.get(
-                        "browser_metrics_filter_test"
-                    ),
+                    "filter_dashboard_render_seconds": filter_render_seconds,
                     "error": None,
                 })
+                # Recorded on the shared timer too, so every consumer that reads
+                # dashboard_render (metrics, Excel, the payload above) sees the
+                # filter-application value instead of a stale page-load value.
+                validator.timer.set_elapsed("dashboard_render", filter_render_seconds)
+                logger.info(
+                    "Filter render measured | filter=%s | dashboard_render_seconds=%.3f",
+                    filter_name,
+                    filter_render_seconds,
+                )
                 return result
 
         result.update({
@@ -1352,7 +1359,15 @@ class SlicerEngine:
                 validator.timer.start("filter_dashboard_render")
                 logger.info("Waiting for Power BI visuals to recalculate...")
                 await wait_for_dashboard(page, previous_snapshot=previous_snapshot)
-                validator.timer.stop("filter_dashboard_render")
+                scenario_render_seconds = validator.timer.stop(
+                    "filter_dashboard_render"
+                )
+                # This scenario's re-render is a dashboard_render measurement too,
+                # so it updates the shared timer rather than being reported under
+                # a second, separate name.
+                validator.timer.set_elapsed(
+                    "dashboard_render", scenario_render_seconds
+                )
 
                 if page.is_closed():
                     logger.warning(
@@ -1447,6 +1462,8 @@ class SlicerEngine:
                     },
                     "visual_data": filtered_visual_data,
                     "tables": filtered_tables,
+                    # Re-render wait for this scenario's cumulative filters.
+                    "dashboard_render_seconds": scenario_render_seconds,
                     "metrics": await validator._capture_metrics(
                         dashboard,
                         page,

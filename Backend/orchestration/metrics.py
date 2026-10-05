@@ -13,11 +13,15 @@ import uuid
 
 logger = logging.getLogger(__name__)
 
+# page_load_seconds: time from opening the link to the dashboard fully rendered.
+# dashboard_render_seconds: time for the dashboard to re-render after a filter
+# is applied. There is deliberately no separate filter_render field: the filter
+# measurement writes into dashboard_render_seconds so the report shows one
+# render figure rather than printing the same value twice.
 _TIMER_FIELD_MAP = {
     "browser_launch": "browser_launch_seconds",
     "page_load": "page_load_seconds",
     "dashboard_render": "dashboard_render_seconds",
-    "filter_dashboard_render": "filter_dashboard_render_seconds",
     "screenshot": "screenshot_seconds",
     "ai": "gemini_extraction_seconds",
     "total_execution": "total_execution_seconds",
@@ -63,10 +67,12 @@ def build_metrics(
             "page_title": page_title,
             "final_url": final_url,
             "browser_launch_seconds": timers.get("browser_launch", 0.0),
+            # Full open-link-to-rendered wait, navigation included.
             "page_load_seconds": timers.get("page_load", 0.0),
-            "dashboard_render_seconds": timers.get("dashboard_render", 0.0),
+            # Filter-application re-render. Defaults to None rather than 0 so a
+            # run with no usable slicer cannot look like an instant render.
+            "dashboard_render_seconds": timers.get("dashboard_render"),
             "visual_extraction_seconds": timers.get("visual_extraction", 0.0),
-            "filter_dashboard_render_seconds": timers.get("filter_dashboard_render", 0.0),
             "screenshot_seconds": timers.get("screenshot", 0.0),
             "total_execution_seconds": timers.get("total_execution", 0.0),
             
