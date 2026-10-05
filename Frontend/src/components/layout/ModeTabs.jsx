@@ -1,35 +1,37 @@
 import { LayoutDashboard, FileSpreadsheet } from 'lucide-react';
 
+const TABS = [
+  { key: 'dashboard', label: 'Dashboard Validation', Icon: LayoutDashboard },
+  { key: 'excel', label: 'Excel Validation', Icon: FileSpreadsheet },
+];
+
 export function ModeTabs({ mode, onModeChange }) {
-  const base = 'inline-flex items-center gap-2 px-5 py-2.5 text-sm font-semibold rounded-xl transition-all duration-200';
   return (
     <div
-      className="inline-flex p-1 rounded-2xl mb-8"
-      style={{ background: 'var(--surface-alt)', border: '1px solid var(--border)' }}
+      className="inline-flex gap-4 sm:gap-8 mb-8 border-b"
+      style={{ borderColor: 'var(--border)' }}
       role="tablist"
     >
-      <button
-        type="button"
-        role="tab"
-        aria-selected={mode === 'dashboard'}
-        onClick={() => onModeChange('dashboard')}
-        className={`${base} ${mode === 'dashboard' ? 'dv-btn-primary' : ''}`}
-        style={mode !== 'dashboard' ? { color: 'var(--text-muted)' } : undefined}
-      >
-        <LayoutDashboard className="w-4 h-4" />
-        Dashboard Validation
-      </button>
-      <button
-        type="button"
-        role="tab"
-        aria-selected={mode === 'excel'}
-        onClick={() => onModeChange('excel')}
-        className={`${base} ${mode === 'excel' ? 'dv-btn-primary' : ''}`}
-        style={mode !== 'excel' ? { color: 'var(--text-muted)' } : undefined}
-      >
-        <FileSpreadsheet className="w-4 h-4" />
-        Excel Validation
-      </button>
+      {TABS.map(({ key, label, Icon }) => {
+        const active = mode === key;
+        return (
+          <button
+            key={key}
+            type="button"
+            role="tab"
+            aria-selected={active}
+            onClick={() => onModeChange(key)}
+            className="inline-flex items-center gap-2 px-1 pb-3 -mb-px text-sm font-semibold border-b-[3px] transition-colors duration-200"
+            style={{
+              color: active ? 'var(--text)' : 'var(--text-muted)',
+              borderColor: active ? 'var(--accent)' : 'transparent',
+            }}
+          >
+            <Icon className="w-4 h-4 hidden sm:block" />
+            {label}
+          </button>
+        );
+      })}
     </div>
   );
 }

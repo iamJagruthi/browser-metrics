@@ -7,7 +7,7 @@ export function StatusBadge({ status }) {
   const style = isMatch
     ? { background: 'var(--success-bg)', color: 'var(--success)', border: '1px solid var(--success-border)' }
     : isNearMatch
-    ? { background: 'var(--accent-bg)', color: 'var(--accent-text)', border: '1px solid var(--accent-border)' }
+    ? { background: 'var(--warn-bg)', color: 'var(--warn)', border: '1px solid var(--warn-border)' }
     : { background: 'var(--danger-bg)', color: 'var(--danger)', border: '1px solid var(--danger-border)' };
 
   return (

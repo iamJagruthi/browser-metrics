@@ -54,6 +54,13 @@ def _values_match(
 
 
 def _visual_key(visual: dict[str, Any]) -> str:
+    # A table the report gives no title of its own is displayed as
+    # "<dashboard>_table_<n>", which differs between source and target. Its
+    # comparison_key is the page-scoped ordinal that is identical on both
+    # dashboards, so pair on that and keep the display name for reporting.
+    comparison_key = str(visual.get("comparison_key") or "").strip()
+    if comparison_key:
+        return comparison_key.casefold()
     return " ".join(str(visual.get("title") or visual.get("id") or "").casefold().split())
 
 
@@ -737,9 +744,14 @@ def build_table_comparisons(visual_data: dict[str, Any] | None) -> dict[str, Any
         for source_visual, target_visual in paired_list:
             source_name = source_visual.get("title") if source_visual else "N/A"
             target_name = target_visual.get("title") if target_visual else "N/A"
+            # Identity that paired the two sides. Downstream reporting pairs on
+            # this rather than the display name, which is dashboard-specific for
+            # a table that has no title of its own.
+            pair_key = _visual_key(source_visual or target_visual or {})
 
             if not source_visual:
                 comparisons.append({
+                    "comparison_key": pair_key,
                     "source_table": "N/A",
                     "target_table": target_name,
                     "status": "TABLE_NOT_COMPARED",
@@ -758,6 +770,7 @@ def build_table_comparisons(visual_data: dict[str, Any] | None) -> dict[str, Any
 
             if not target_visual:
                 comparisons.append({
+                    "comparison_key": pair_key,
                     "source_table": source_name,
                     "target_table": "N/A",
                     "status": "TABLE_NOT_COMPARED",
@@ -797,6 +810,7 @@ def build_table_comparisons(visual_data: dict[str, Any] | None) -> dict[str, Any
                     })
 
             comparisons.append({
+                "comparison_key": pair_key,
                 "source_table": source_name,
                 "target_table": target_name,
                 "status": table_status,

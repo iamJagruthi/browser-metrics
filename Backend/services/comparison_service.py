@@ -253,6 +253,12 @@ def compare_browser_metrics(
 
 
 def _visual_key(item: dict[str, Any], fallback_index: int) -> str:
+    # A table with no title of its own is reported as "<dashboard>_table_<n>",
+    # so its display title differs between the two dashboards. Its
+    # comparison_key is identical on both sides and pairs correctly.
+    comparison_key = _normalise(item.get("comparison_key"))
+    if comparison_key:
+        return f"key:{comparison_key}"
     title = _normalise(item.get("title"))
     if title:
         return f"title:{title}"
@@ -807,9 +813,12 @@ def build_mismatch_payload(
         # Pull cell-level value diffs
         table_cells = _extract_table_cell_mismatches(table_comparison, max_cells=50)
 
+    # Timing is owned by the Performance API (/api/browser-metrics ->
+    # /api/runs/{id}/status). The validation capture runs in a separate
+    # browser session, so its timings are a second, unrelated measurement and
+    # are not data mismatches. Kept as an empty list so the response shape
+    # stays the same for existing callers.
     browser_metrics: list[dict[str, Any]] = []
-    if metrics and len(metrics) >= 2:
-        browser_metrics = compare_browser_metrics(metrics[0], metrics[1])
 
     total = (
         len(filters)

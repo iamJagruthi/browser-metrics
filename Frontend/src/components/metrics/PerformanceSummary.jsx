@@ -1,4 +1,4 @@
-import { Camera, Clock, Filter, Gauge } from 'lucide-react';
+import { Clock, Gauge } from 'lucide-react';
 
 function PerfRow({ label, icon, value, sub }) {
   const Icon = icon;
@@ -27,27 +27,8 @@ function formatSeconds(value) {
   return `${Number(value).toFixed(2)}s`;
 }
 
-function filterTestSummary(filterTest) {
-  if (!filterTest) return null;
-  if (filterTest.status === 'applied') {
-    const taken = filterTest.filter_dashboard_render_seconds;
-    return {
-      value: taken == null ? 'Applied' : `${Number(taken).toFixed(2)}s`,
-      sub: filterTest.slicer ? `${filterTest.slicer}: ${filterTest.value}` : filterTest.value,
-    };
-  }
-  if (filterTest.status === 'unavailable') {
-    return {
-      value: 'Not run',
-      sub: filterTest.slicer ? `${filterTest.slicer} — no usable option` : 'No slicers found',
-    };
-  }
-  return { value: filterTest.status, sub: filterTest.error || filterTest.slicer };
-}
-
 function SidePerformanceCard({ side, tagStyle, performance }) {
   const p = performance || {};
-  const filter = filterTestSummary(p.filter_test);
   const isSource = side === 'source';
 
   return (
@@ -72,20 +53,14 @@ function SidePerformanceCard({ side, tagStyle, performance }) {
       </div>
       <div className="px-2 py-2 space-y-1">
         <PerfRow
-          label="Browser Launch"
+          label="page_load_seconds"
           icon={Clock}
-          value={formatSeconds(p.browser_launch_seconds)}
+          value={formatSeconds(p.page_load_seconds)}
         />
         <PerfRow
-          label="Dashboard Render"
+          label="dashboard_render_seconds"
           icon={Gauge}
           value={formatSeconds(p.dashboard_render_seconds)}
-        />
-        <PerfRow label="Filter Probe" icon={Filter} value={filter?.value} sub={filter?.sub} />
-        <PerfRow
-          label="Baseline Screenshot"
-          icon={Camera}
-          value={p.baseline_stable ? 'Captured' : 'Skipped (not stable)'}
         />
       </div>
     </div>

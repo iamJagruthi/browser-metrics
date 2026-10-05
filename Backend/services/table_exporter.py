@@ -25,7 +25,18 @@ VISUAL_SELECTOR = ".visualContainer, [data-visual-container]"
 MAX_EXPORT_RETRIES = 3
 MENU_TIMEOUT = 8_000
 DOWNLOAD_TIMEOUT = 30_000
-CONTROL_WAIT_MS = 1_500  # conditional wait for hover-revealed controls / menu items
+CONTROL_WAIT_MS = 2_500  # conditional wait for hover-revealed controls / menu items
+EXPORT_ITEM_WAIT_MS = 4_000  # wait for the "Export data" item itself to render
+EXPORT_ENABLE_WAIT_MS = 3_000  # wait for a disabled "Export data" item to become enabled
+UNAVAILABLE_CONFIRMATIONS = 2  # consistent "not offered" verdicts needed before reporting unavailable
+
+# Hovering/clicking a visual is enough to reveal its More options (...) menu,
+# so the canvas is left exactly where the user sees it. Only when the control
+# cannot be reached that way -- typically because the visual sits outside the
+# viewport -- is the canvas panned into position, and even then the snapshot
+# taken at the start of the attempt is restored before returning.
+# 1-based: attempt 1 stays in place, later attempts may scroll as a fallback.
+SCROLL_FROM_ATTEMPT = 2
 
 # Structured export outcomes exposed additively on each result dict under
 # "export_outcome". "status" keeps its existing values ("downloaded"/"failed").
@@ -306,6 +317,12 @@ async def _get_visual_locator(page, visual: dict[str, Any]):
 
     original_index = visual.get("index")
     if original_index is not None and original_index < await visuals.count():
+        # Position-based match: if Power BI re-rendered or reordered visuals since
+        # extraction this can be a DIFFERENT visual (one with no Export data).
+        logger.warning(
+            "TABLE_EXPORT | event=visual_resolved_by_index | visual=%r | index=%s | aria_label=%r",
+            visual.get("title"), original_index, aria_label,
+        )
         return visuals.nth(original_index)
 
     return None
@@ -343,6 +360,56 @@ _MORE_OPTIONS_SELECTOR = (
 )
 
 
+# Playwright's locator.hover()/click() scroll the target into view first, which
+# pans Power BI's canvas (the "dancing" report). When the target is already fully
+# inside the viewport and nothing covers it, the same real mouse events can be sent
+# with page.mouse, which never scrolls anything. Off-screen targets still fall back
+# to the locator action (the canvas scroll snapshot/restore then undoes the pan).
+_HIT_TEST_JS = """(el, pt) => {
+    const t = document.elementFromPoint(pt[0], pt[1]);
+    return !!t && (t === el || el.contains(t));
+}"""
+
+
+async def _viewport_point(page, locator, rel=None):
+    """Absolute (x, y) of a point on `locator` when it is fully on-screen and
+    actually hit-testable there; otherwise None (caller falls back to Playwright)."""
+    try:
+        box = await locator.bounding_box()
+        size = page.viewport_size or await page.evaluate(
+            "() => ({width: window.innerWidth, height: window.innerHeight})"
+        )
+        if not box or not size:
+            return None
+        if rel is not None:
+            x, y = box["x"] + rel["x"], box["y"] + rel["y"]
+        else:
+            x, y = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+        if not (0 <= x <= size["width"] and 0 <= y <= size["height"]):
+            return None
+        if not await locator.evaluate(_HIT_TEST_JS, [x, y]):
+            return None
+        return x, y
+    except Exception:
+        return None
+
+
+async def _focus_visual_no_scroll(locator) -> bool:
+    """Focus the visual (reveals its header controls like keyboard navigation does)
+    without clicking data and without scrolling."""
+    try:
+        return bool(await locator.evaluate(
+            """(node) => {
+                const t = node.matches('[tabindex]') ? node : node.querySelector('[tabindex]');
+                if (!t) return false;
+                t.focus({ preventScroll: true });
+                return true;
+            }"""
+        ))
+    except Exception:
+        return False
+
+
 async def _safe_hover_point(locator):
     """Return {'x','y'} of a non-value point inside the visual, or None."""
     try:
@@ -354,9 +421,18 @@ async def _safe_hover_point(locator):
     return None
 
 
-async def _hover_visual(locator, point) -> str:
-    """Hover a safe area when one exists; otherwise fall back to the previous
-    behaviour (element center, then forced)."""
+async def _hover_visual(locator, point, page=None) -> str:
+    """Hover a safe area when one exists; otherwise the element center. On-screen
+    targets use page.mouse (no canvas scroll); off-screen ones fall back to the
+    Playwright locator hover (scrolls, restored later)."""
+    if page is not None:
+        pos = await _viewport_point(page, locator, point)
+        if pos:
+            try:
+                await page.mouse.move(pos[0], pos[1])
+                return "mouse_safe_area" if point else "mouse_center"
+            except Exception:
+                pass
     if point:
         try:
             await locator.hover(position=point, timeout=3000)
@@ -429,13 +505,58 @@ async def _pick_nearest(candidates, anchor_box):
     return best if best is not None else candidates[-1]
 
 
+_MARK_STALE_MENUS_JS = """() => {
+    document.querySelectorAll('[role="menu"]').forEach((m) => {
+        const r = m.getBoundingClientRect();
+        const cs = window.getComputedStyle(m);
+        if (r.width > 0 && r.height > 0 && cs.visibility !== 'hidden') {
+            m.setAttribute('data-dv-stale', '1');
+        }
+    });
+}"""
+
+_CLEAR_STALE_MENUS_JS = """() => {
+    document.querySelectorAll('[data-dv-stale]').forEach((m) => m.removeAttribute('data-dv-stale'));
+}"""
+
+
+async def _tag_menu(page, menu):
+    """Tag the exact menu element so later lookups cannot drift to a different
+    menu when the DOM order of role=menu elements changes (nth(i) is positional)."""
+    token = uuid.uuid4().hex[:10]
+    try:
+        await menu.evaluate("(el, t) => el.setAttribute('data-dv-menu', t)", token)
+        return page.locator('[data-dv-menu="%s"]' % token).first
+    except Exception:
+        return menu
+
+
 async def _resolve_open_menu(page, button, anchor_box):
     """Identify the menu that the just-clicked More options button opened.
 
-    Order: the button's own aria-controls target (if the DOM provides one),
-    then the visible role=menu overlays (nearest to the button when several).
-    Returns a locator, or None when no menu could be confirmed.
+    Order: a NEWLY opened menu (not one that was already open before the click),
+    polled until it renders; then the button's aria-controls target; then any
+    visible role=menu nearest the button. The chosen menu is tagged so later
+    lookups stay bound to it. Returns a locator, or None when none could be confirmed.
     """
+    fresh = page.locator('[role="menu"]:not([data-dv-stale])')
+    waited = 0
+    while waited <= MENU_TIMEOUT:
+        visible = []
+        try:
+            for i in range(await fresh.count()):
+                candidate = fresh.nth(i)
+                if await candidate.is_visible():
+                    visible.append(candidate)
+        except Exception:
+            visible = []
+        if visible:
+            picked = await _pick_nearest(visible, anchor_box)
+            if picked is not None:
+                return await _tag_menu(page, picked)
+        await page.wait_for_timeout(200)
+        waited += 200
+
     try:
         controls = await button.get_attribute("aria-controls", timeout=1000)
     except Exception:
@@ -444,7 +565,7 @@ async def _resolve_open_menu(page, button, anchor_box):
         scoped = page.locator('[id="%s"]' % controls.replace('"', ""))
         try:
             if await scoped.count() == 1 and await scoped.first.is_visible():
-                return scoped.first
+                return await _tag_menu(page, scoped.first)
         except Exception:
             pass
 
@@ -457,7 +578,8 @@ async def _resolve_open_menu(page, button, anchor_box):
                 visible.append(menu)
     except Exception:
         return None
-    return await _pick_nearest(visible, anchor_box)
+    picked = await _pick_nearest(visible, anchor_box)
+    return await _tag_menu(page, picked) if picked is not None else None
 
 
 async def _open_more_options(page, visual: dict[str, Any], state: dict[str, Any] | None = None) -> bool:
@@ -488,15 +610,21 @@ async def _open_more_options(page, visual: dict[str, Any], state: dict[str, Any]
 
             try:
                 _diag_before = await measure_scroll_chain(page, locator)
-                await _scroll_visual_into_canvas_view(page, locator)
-                _diag_after_scroll = await measure_scroll_chain(page, locator)
-                log_scroll_delta(
-                    "table_export.open_more_options.scroll",
-                    visual.get("title"),
-                    _diag_before,
-                    _diag_after_scroll,
-                    "after_scroll",
-                )
+                if attempt >= SCROLL_FROM_ATTEMPT:
+                    await _scroll_visual_into_canvas_view(page, locator)
+                    _diag_after_scroll = await measure_scroll_chain(page, locator)
+                    log_scroll_delta(
+                        "table_export.open_more_options.scroll",
+                        visual.get("title"),
+                        _diag_before,
+                        _diag_after_scroll,
+                        "after_scroll",
+                    )
+                else:
+                    logger.info(
+                        "TABLE_EXPORT | event=operate_in_place | visual=%r | attempt=%s",
+                        title, attempt,
+                    )
             except Exception:
                 pass
 
@@ -507,7 +635,7 @@ async def _open_more_options(page, visual: dict[str, Any], state: dict[str, Any]
                 continue
 
             safe_point = await _safe_hover_point(locator)
-            hover_mode = await _hover_visual(locator, safe_point)
+            hover_mode = await _hover_visual(locator, safe_point, page)
             logger.info(
                 "TABLE_EXPORT | event=hover_visual | visual=%r | attempt=%s | target=%s",
                 title, attempt, hover_mode,
@@ -519,6 +647,12 @@ async def _open_more_options(page, visual: dict[str, Any], state: dict[str, Any]
                 continue
 
             button, present = await _find_more_options(locator)
+
+            if button is None:
+                # Keyboard-style reveal: focus the visual (no click on data, no scroll).
+                if await _focus_visual_no_scroll(locator):
+                    logger.info("TABLE_EXPORT | event=more_options_focus_reveal | visual=%r", title)
+                    button, present = await _find_more_options(locator)
 
             if button is None and safe_point:
                 # Control missing or not actionable after hover: focus/select the
@@ -547,19 +681,37 @@ async def _open_more_options(page, visual: dict[str, Any], state: dict[str, Any]
             except Exception:
                 state["anchor_box"] = None
 
+            # Mark menus that are ALREADY open so the one this click opens can be
+            # told apart from a stale one (the old code waited for "any first menu").
             try:
-                await button.click(timeout=3000)
+                await page.evaluate(_MARK_STALE_MENUS_JS)
             except Exception:
-                await button.click(timeout=3000, force=True)
-            logger.info("TABLE_EXPORT | event=more_options_activated | visual=%r", title)
+                pass
 
-            try:
-                await page.get_by_role("menu").first.wait_for(state="visible", timeout=MENU_TIMEOUT)
-            except Exception:
-                await page.wait_for_timeout(500)
+            clicked = False
+            click_pos = await _viewport_point(page, button)
+            if click_pos:
+                try:
+                    await page.mouse.click(click_pos[0], click_pos[1])
+                    clicked = True
+                except Exception:
+                    clicked = False
+            if not clicked:
+                try:
+                    await button.click(timeout=3000)
+                except Exception:
+                    await button.click(timeout=3000, force=True)
+            logger.info(
+                "TABLE_EXPORT | event=more_options_activated | visual=%r | via=%s",
+                title, "mouse" if clicked else "locator",
+            )
 
             # Bind to the menu this click opened (before any scroll restore).
             state["menu"] = await _resolve_open_menu(page, button, state["anchor_box"])
+            try:
+                await page.evaluate(_CLEAR_STALE_MENUS_JS)
+            except Exception:
+                pass
             if state["menu"] is None:
                 logger.warning(
                     "TABLE_EXPORT | event=menu_not_confirmed | visual=%r | note=falling back to visible-item lookup",
@@ -647,23 +799,41 @@ async def _find_export_data_item(page, scope=None, anchor_box=None, diag: dict[s
 
     matches = await visible_matches()
     if not matches and scope is not None:
-        # Menu items can populate a moment after the menu shell appears.
+        # Menu items render progressively. Wait for the "Export data" item ITSELF,
+        # not just the first menu item of any kind (the old code could conclude
+        # "not offered" while the item had simply not rendered yet).
         try:
-            await scope.get_by_role("menuitem").first.wait_for(state="visible", timeout=CONTROL_WAIT_MS)
+            await scope.get_by_role("menuitem", name=name).first.wait_for(
+                state="visible", timeout=EXPORT_ITEM_WAIT_MS
+            )
         except Exception:
             pass
         matches = await visible_matches()
 
+    scoped_empty = not matches
+    if not matches and scope is not None:
+        # Last resort before declaring it absent: the scoped menu may be the wrong
+        # one. Look page-wide and take the visible item nearest the clicked button.
+        root = page
+        matches = await visible_matches()
+        if matches:
+            logger.info("TABLE_EXPORT | event=export_item_found_outside_scoped_menu")
+
     if matches:
-        item = await _pick_nearest(matches, anchor_box) if scope is None else matches[0]
-        try:
-            if (await item.get_attribute("aria-disabled", timeout=1000) or "").lower() == "true":
-                diag["reason"] = "disabled"
-                return None
-        except Exception:
-            pass
-        diag["reason"] = "found"
-        return item
+        item = await _pick_nearest(matches, anchor_box) if (scope is None or scoped_empty) else matches[0]
+        waited = 0
+        while waited <= EXPORT_ENABLE_WAIT_MS:
+            try:
+                disabled = (await item.get_attribute("aria-disabled", timeout=1000) or "").lower() == "true"
+            except Exception:
+                disabled = False
+            if not disabled:
+                diag["reason"] = "found"
+                return item
+            await page.wait_for_timeout(250)
+            waited += 250
+        diag["reason"] = "disabled"
+        return None
 
     if scope is not None:
         try:
@@ -771,6 +941,10 @@ async def _export_visual(
 ) -> dict[str, Any]:
     result = {
         "title": visual["title"],
+        # Carried through so an export can be paired with its counterpart on
+        # the other dashboard even when the display name is generated.
+        "comparison_key": visual.get("comparison_key"),
+        "page_name": visual.get("page_name"),
         "visual_index": visual.get("index"),
         "status": "failed",
         "file_path": None,
@@ -789,6 +963,7 @@ async def _export_visual(
 
     last_error = None
     outcome = OUTCOME_INTERACTION_FAILED
+    unavailable_hits = 0
 
     for attempt in range(1, MAX_EXPORT_RETRIES + 1):
         if not page or page.is_closed():
@@ -816,17 +991,22 @@ async def _export_visual(
                 reason = lookup.get("reason")
                 await _close_open_overlays(page)
                 if reason in ("not_in_menu", "disabled"):
-                    # Menu was opened for this visual and Export data is not
-                    # offered: a deterministic property of the visual, not a
-                    # transient error, so it is reported and not retried.
+                    # "Not offered" is only reported after it is seen on
+                    # UNAVAILABLE_CONFIRMATIONS separate, freshly opened menus.
+                    # One verdict can be a half-rendered menu, a stale menu, or an
+                    # export still busy from an earlier attempt.
+                    unavailable_hits += 1
                     result["export_option_found"] = False
                     outcome = OUTCOME_UNAVAILABLE
                     last_error = EXPORT_UNAVAILABLE_MESSAGE
                     logger.info(
-                        "TABLE_EXPORT | event=export_unavailable | visual=%r | reason=%s",
-                        visual["title"], reason,
+                        "TABLE_EXPORT | event=export_unavailable_verdict | visual=%r | reason=%s | hit=%s/%s | attempt=%s",
+                        visual["title"], reason, unavailable_hits, UNAVAILABLE_CONFIRMATIONS, attempt,
                     )
-                    break
+                    if unavailable_hits >= UNAVAILABLE_CONFIRMATIONS or attempt >= MAX_EXPORT_RETRIES:
+                        break
+                    await page.wait_for_timeout(750)
+                    continue
                 last_error = "Export data menu item not found; could not confirm the More options menu for this visual."
                 outcome = OUTCOME_INTERACTION_FAILED
                 logger.warning(
@@ -836,6 +1016,7 @@ async def _export_visual(
                 continue
 
             result["export_option_found"] = True
+            unavailable_hits = 0
             outcome = OUTCOME_EXPORT_FAILED  # until a file is actually saved
             logger.info("TABLE_EXPORT | event=export_item_found | visual=%r", visual["title"])
             RAW_DIR.mkdir(parents=True, exist_ok=True)
@@ -971,6 +1152,44 @@ async def _export_visual(
     return result
 
 
+def _attach_lifecycle_listeners(page, tracker: dict[str, Any]):
+    """Log WHICH of crash / page close / context close / browser disconnect fires,
+    and which table was being exported at that moment. Returns a detach callable."""
+    handlers = []
+
+    def _make(label):
+        def _handler(*_args):
+            logger.error(
+                "TABLE_EXPORT_LIFECYCLE | event=%s | current_visual=%r | dashboard=%s",
+                label, tracker.get("current"), tracker.get("dashboard"),
+            )
+        return _handler
+
+    try:
+        for target, event_name, label in (
+            (page, "crash", "page_crash"),
+            (page, "close", "page_close"),
+            (page.context, "close", "context_close"),
+            (page.context.browser, "disconnected", "browser_disconnected"),
+        ):
+            if target is None:
+                continue
+            handler = _make(label)
+            target.on(event_name, handler)
+            handlers.append((target, event_name, handler))
+    except Exception:
+        pass
+
+    def _detach():
+        for target, event_name, handler in handlers:
+            try:
+                target.remove_listener(event_name, handler)
+            except Exception:
+                pass
+
+    return _detach
+
+
 async def export_table_visuals(
     page,
     table_visuals: list[dict[str, Any]],
@@ -981,6 +1200,9 @@ async def export_table_visuals(
     if not table_visuals:
         return exported_tables
 
+    _tracker: dict[str, Any] = {"current": None, "dashboard": dashboard_name}
+    _detach_listeners = _attach_lifecycle_listeners(page, _tracker)
+
     try:
         canvas_anchor = page.locator(VISUAL_SELECTOR).first
         _diag_batch_before = await measure_scroll_chain(page, canvas_anchor)
@@ -990,6 +1212,7 @@ async def export_table_visuals(
         _diag_batch_snapshot = None
 
     for table_number, table_visual in enumerate(table_visuals, start=1):
+        _tracker["current"] = table_visual.get("title")
         try:
             result = await _export_visual(page, table_visual, dashboard_name)
             exported_tables.append(result)
@@ -1035,5 +1258,7 @@ async def export_table_visuals(
         )
     except Exception:
         pass
+
+    _detach_listeners()
 
     return exported_tables

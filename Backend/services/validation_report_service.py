@@ -614,11 +614,11 @@ def _build_visual_and_export_rows(
 
         comparison_by_table: dict[str, dict] = {}
         for item in comparisons:
-            for title in (
-                item.get("source_table"),
-                item.get("target_table"),
+            for key in (
+                _table_pairing_key(item),
+                _normalise_table_title(item.get("source_table")),
+                _normalise_table_title(item.get("target_table")),
             ):
-                key = _normalise_table_title(title)
                 if key and key != "n/a":
                     comparison_by_table.setdefault(key, item)
 
@@ -637,20 +637,21 @@ def _build_visual_and_export_rows(
             (page.target.get("visual_data") or {}).get("table_visuals", []) or []
         )
 
-        export_by_title: dict[str, dict] = {}
+        # Pair on _table_pairing_key, but keep the dashboard-specific display
+        # title for the "Page / Table" column.
+        display_title_by_key: dict[str, str] = {}
+        dom_detected_keys: set[str] = set()
+        for visual in [*source_table_visuals, *target_table_visuals]:
+            key = _table_pairing_key(visual)
+            if key:
+                dom_detected_keys.add(key)
+                display_title_by_key.setdefault(key, _safe(visual.get("title")))
         for export in [*source_exports, *target_exports]:
-            title = export.get("title")
-            if title:
-                export_by_title.setdefault(_normalise_table_title(title), export)
+            key = _table_pairing_key(export)
+            if key:
+                display_title_by_key.setdefault(key, _safe(export.get("title")))
 
-        dom_titles = {
-            _normalise_table_title(visual.get("title")) or title
-            for visual in [
-                *source_table_visuals,
-                *target_table_visuals,
-            ]
-            for title in [visual.get("title") or ""]
-        } | set(export_by_title)
+        dom_titles = sorted(display_title_by_key, key=str.casefold)
 
         if not dom_titles:
             export_id += 1
@@ -667,12 +668,12 @@ def _build_visual_and_export_rows(
             )
             continue
 
-        for title in sorted(dom_titles, key=str.casefold):
+        for title in dom_titles:
             source_export = next(
                 (
                     export
                     for export in source_exports
-                    if _normalise_table_title(export.get("title")) == title
+                    if _table_pairing_key(export) == title
                 ),
                 None,
             )
@@ -680,19 +681,16 @@ def _build_visual_and_export_rows(
                 (
                     export
                     for export in target_exports
-                    if _normalise_table_title(export.get("title")) == title
+                    if _table_pairing_key(export) == title
                 ),
                 None,
             )
             comparison_entry = comparison_by_table.get(title)
-            dom_detected = title in {
-                _normalise_table_title(visual.get("title"))
-                for visual in [*source_table_visuals, *target_table_visuals]
-            }
+            dom_detected = title in dom_detected_keys
             export_id += 1
             name = _safe(
                 (source_export or target_export or {}).get("title"),
-            )
+            ) or display_title_by_key.get(title) or title
             export_rows.append(
                 [
                     f"{export_id:02d}",
@@ -716,6 +714,20 @@ def _normalise_table_title(title) -> str:
     return " ".join(str(title or "").casefold().split())
 
 
+def _table_pairing_key(record: dict) -> str:
+    """Identity used to pair a table across the two dashboards.
+
+    A table the report gives no caption of its own is displayed as
+    ``<dashboard>_table_<n>``, so its display name is dashboard-specific and
+    cannot pair anything. ``comparison_key`` is the page-scoped ordinal that is
+    identical on both dashboards, so it wins whenever present.
+    """
+    comparison_key = str((record or {}).get("comparison_key") or "").strip()
+    if comparison_key:
+        return comparison_key.casefold()
+    return _normalise_table_title((record or {}).get("title"))
+
+
 def _export_reference(export: dict | None) -> str:
     if not export:
         return _NOT_AVAILABLE
@@ -732,6 +744,23 @@ def _export_reference(export: dict | None) -> str:
     if isinstance(rows, list):
         reference = f"{reference} ({len(rows)} rows)"
     return reference
+
+
+def _is_browser_gone_error(error: str) -> bool:
+    """True when a failure was caused by the browser closing, not by the visual.
+
+    These read as "Export data is not available for this visual" in a report even
+    though the export option was found and clicked, so they must be labelled
+    separately or a working export looks permanently unsupported.
+    """
+    text = str(error or "").casefold()
+    return (
+        "has been closed" in text
+        or "targetclosederror" in text
+        or "target page closed" in text
+        or "browser has been closed" in text
+        or "connection closed" in text
+    )
 
 
 def _export_remarks(
@@ -758,12 +787,30 @@ def _export_remarks(
     )
 
     if not source_ok and not target_ok:
+        # "Export data is not available for this visual" means Power BI's menu
+        # genuinely offered no export for that visual. A browser that died
+        # mid-save is a completely different fact and must not be reported as a
+        # property of the visual, or a working export looks permanently broken.
         errors: list[str] = []
+        unavailable: list[str] = []
         for export in (source_export, target_export):
             error = (export or {}).get("error")
-            if error:
-                errors.append(_safe(error))
-        suffix = f": {' | '.join(errors)}" if errors else ""
+            outcome = (export or {}).get("export_outcome")
+            if outcome == "browser_closed" or (
+                error and _is_browser_gone_error(error)
+            ):
+                errors.append(
+                    _safe(error, "the browser closed before the export file was saved")
+                )
+            elif error:
+                unavailable.append(_safe(error))
+        if errors:
+            return (
+                "Case C: Not compared - the browser closed while saving the "
+                f"export file (the visual does offer Export data): "
+                f"{' | '.join(errors)}"
+            )
+        suffix = f": {' | '.join(unavailable)}" if unavailable else ""
         return f"Case C: Not compared - both exports failed{suffix}"
     if not (source_ok and target_ok):
         failed_side = "Target" if source_ok else "Source"

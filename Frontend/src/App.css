@@ -1,4 +1,4 @@
-@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Archivo:wght@600;700;800&family=Public+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
 
 /* Override Vite's default template styles (body { display:flex; place-items:center },
    #root { max-width: 1280px; margin: 0 auto }) which otherwise squeeze the app into
@@ -15,34 +15,39 @@ html, body, #root {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Design system — black & yellow. Yellow carries every interactive   */
-/*  and brand moment; black anchors structure. Match/near-match/       */
-/*  mismatch keep green/yellow/red so results still read at a glance.  */
+/*  Design system: red and white.                                      */
+/*  Red is the brand: top bar, buttons, active tab, focus rings.       */
+/*  Mismatch = red, Near match = amber, Match = green so results       */
+/*  still read at a glance.                                            */
 /* ------------------------------------------------------------------ */
 .dv-app {
   width: 100%;
   min-height: 100vh;
-  --bg: #FAFAF7;
+  --bg: #F8F8F8;
   --surface: #FFFFFF;
-  --surface-alt: #F2F2ED;
-  --border: #E3E3DB;
-  --text: #0A0A0A;
-  --text-muted: #5C5C53;
-  --ink: #0A0A0A;
-  --accent: #F5C518;
-  --accent-text: #7A5F00;
-  --accent-bg: #FFF6D8;
-  --accent-border: #EBD583;
-  --success: #3F8F4A;
+  --surface-alt: #F2F2F2;
+  --border: #E2E2E2;
+  --text: #1A1A1A;
+  --text-muted: #5E5E5E;
+  --ink: #1A1A1A;
+  --topbar: #A01028;
+  --accent: #B8112D;
+  --accent-text: #9B0E25;
+  --accent-bg: #FDECEE;
+  --accent-border: #F0B4BC;
+  --warn: #9A5B00;
+  --warn-bg: #FFF3DC;
+  --warn-border: #EBCB8B;
+  --success: #2F8A3F;
   --success-bg: #E8F5EA;
   --success-border: #BEE0C4;
   --danger: #C23B34;
   --danger-bg: #FBEAE8;
   --danger-border: #EFC0BB;
-  --shadow-sm: 0 1px 2px rgba(10,10,10,0.06);
-  --shadow-md: 0 10px 30px rgba(10,10,10,0.10);
-  --font-display: 'Space Grotesk', sans-serif;
-  --font-body: 'Inter', sans-serif;
+  --shadow-sm: 0 1px 2px rgba(26,26,26,0.06);
+  --shadow-md: 0 8px 24px rgba(26,26,26,0.10);
+  --font-display: 'Archivo', sans-serif;
+  --font-body: 'Public Sans', sans-serif;
   --font-mono: 'IBM Plex Mono', monospace;
   background: var(--bg);
   color: var(--text);
@@ -52,17 +57,21 @@ html, body, #root {
 }
 
 .dv-app[data-theme='dark'] {
-  --bg: #0A0A0A;
-  --surface: #141414;
-  --surface-alt: #1B1B1B;
-  --border: #2A2A2A;
-  --text: #F5F5F0;
-  --text-muted: #9C9C93;
-  --ink: #F5F5F0;
-  --accent: #F5C518;
-  --accent-text: #F5C518;
-  --accent-bg: rgba(245,197,24,0.12);
-  --accent-border: rgba(245,197,24,0.32);
+  --bg: #0E0E0E;
+  --surface: #171717;
+  --surface-alt: #1F1F1F;
+  --border: #2C2C2C;
+  --text: #F5F5F5;
+  --text-muted: #A0A0A0;
+  --ink: #F5F5F5;
+  --topbar: #6B0F1F;
+  --accent: #BC1B31;
+  --accent-text: #F0707C;
+  --accent-bg: rgba(188,27,49,0.16);
+  --accent-border: rgba(188,27,49,0.40);
+  --warn: #F2B84B;
+  --warn-bg: rgba(242,184,75,0.13);
+  --warn-border: rgba(242,184,75,0.32);
   --success: #5FBE6B;
   --success-bg: rgba(95,190,107,0.14);
   --success-border: rgba(95,190,107,0.32);
@@ -77,9 +86,20 @@ html, body, #root {
 .dv-font-display { font-family: var(--font-display); letter-spacing: -0.01em; }
 .dv-font-mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
 
+/* Squarer corners than the previous design: cards 12px, inputs and
+   buttons 8px. Pills (rounded-full) are left alone. */
+.dv-app [class*='rounded-3xl'],
+.dv-app [class*='rounded-2xl'] { border-radius: 12px; }
+.dv-app [class*='rounded-xl'] { border-radius: 8px; }
+
+/* Visible keyboard focus everywhere */
+.dv-app :focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 .dv-topbar {
-  background: linear-gradient(135deg, #141414 0%, #000000 100%);
-  border-bottom: 3px solid var(--accent);
+  background: var(--topbar);
 }
 
 .dv-surface {
@@ -104,11 +124,11 @@ html, body, #root {
 
 .dv-btn-primary {
   background: var(--accent);
-  color: #0A0A0A;
+  color: #FFFFFF;
   box-shadow: var(--shadow-sm);
 }
 .dv-btn-primary:hover:not(:disabled) {
-  filter: brightness(1.06);
+  filter: brightness(1.08);
   box-shadow: var(--shadow-md);
 }
 .dv-btn-primary:disabled { opacity: 0.55; cursor: not-allowed; }
@@ -122,11 +142,11 @@ html, body, #root {
 .dv-btn-outline:disabled { opacity: 0.5; cursor: not-allowed; }
 
 .dv-toggle {
-  background: rgba(255,255,255,0.08);
-  border: 1px solid rgba(255,255,255,0.18);
+  background: rgba(255,255,255,0.12);
+  border: 1px solid rgba(255,255,255,0.30);
   color: #fff;
 }
-.dv-toggle:hover { background: rgba(255,255,255,0.16); }
+.dv-toggle:hover { background: rgba(255,255,255,0.22); }
 
 .dv-row:nth-child(even) { background: var(--surface-alt); }
 .dv-row:hover { background: var(--accent-bg); }
@@ -135,7 +155,7 @@ html, body, #root {
 .dv-stripe-target { border-top: 4px solid var(--accent); }
 
 .dv-diff-row-match { border-left: 4px solid var(--success); }
-.dv-diff-row-near { border-left: 4px solid var(--accent); }
+.dv-diff-row-near { border-left: 4px solid var(--warn); }
 .dv-diff-row-mismatch { border-left: 4px solid var(--danger); }
 
 .dv-pulse { animation: dv-pulse-anim 1.6s ease-in-out infinite; }

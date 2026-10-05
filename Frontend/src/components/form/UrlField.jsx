@@ -1,9 +1,12 @@
 export function UrlField({ tag, tagStyle, value, onChange, placeholder }) {
+  // "SOURCE" -> "Source"
+  const tagText = tag ? tag.charAt(0) + tag.slice(1).toLowerCase() : '';
+
   return (
     <div className="space-y-2">
       <label className="flex items-center gap-2 text-sm font-semibold ml-1">
-        <span className="dv-font-mono text-[10px] font-bold px-1.5 py-0.5 rounded" style={tagStyle}>
-          {tag}
+        <span className="text-xs font-bold px-2 py-0.5 rounded" style={tagStyle}>
+          {tagText}
         </span>
         Dashboard URL
       </label>

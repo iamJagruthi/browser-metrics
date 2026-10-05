@@ -86,6 +86,59 @@ class SlicerEngine:
             logger.error(f"Error extracting DOM filter titles: {e}")
             return filter_names
 
+    async def read_filter_state(self, filter_names: list[str]) -> list[dict]:
+        """Read the current selection state of each slicer from the live DOM.
+
+        This is the single place that turns on-page slicers into the
+        ``{name, selected_values, visible_values}`` records every consumer
+        already expects: the filter comparison (``normalize_dom_filter``) and
+        the cross-dashboard slicer scenarios both read exactly these keys.
+        Slicers that cannot be read are skipped rather than reported as empty,
+        so an unreadable slicer is never mistaken for "nothing selected".
+        """
+        filters: list[dict] = []
+        for filter_name in filter_names or []:
+            try:
+                options = await self.get_filter_options_with_selection(filter_name)
+            except Exception as e:
+                logger.warning(
+                    "Could not read options for slicer '%s': %s", filter_name, e
+                )
+                continue
+            if not options:
+                continue
+
+            selected: list[str] = []
+            visible: list[str] = []
+            for item in options:
+                text = str(item.get("text") or "").strip()
+                if not text:
+                    continue
+                visible.append(text)
+                if item.get("selected"):
+                    selected.append(text)
+
+            filters.append(
+                {
+                    "name": filter_name,
+                    "selected_values": selected,
+                    "visible_values": visible,
+                }
+            )
+            logger.info(
+                "Slicer state read | slicer=%r | selected=%d | visible=%d",
+                filter_name,
+                len(selected),
+                len(visible),
+            )
+
+        logger.info(
+            "Slicer state summary | readable=%d | requested=%d",
+            len(filters),
+            len(filter_names or []),
+        )
+        return filters
+
     async def _close_any_open_popups(self):
         """Guarantees all floating dropdown overlays are closed and hidden."""
         try:
@@ -1170,12 +1223,32 @@ class SlicerEngine:
             # time, which previously re-triggered a live Export Data action on
             # the same visuals and produced duplicate exports.
             logger.info("default.visual_extraction.begin | page=%s", page_name)
-            default_visual_data = await extract_visual_data(page, attempt_export=True)
+            default_visual_data = await extract_visual_data(
+                page,
+                attempt_export=True,
+                dashboard_title=str(dashboard.get("name") or "") or None,
+                page_name=page_name,
+            )
             default_tables = default_visual_data.get("table_exports", [])
             logger.info(
                 "default.visual_extraction.completed | page=%s | exports=%d",
                 page_name,
                 len(default_tables),
+            )
+
+            # Publish the slicers this page actually shows, read from the live
+            # DOM. The filter comparison and the cross-dashboard slicer
+            # scenarios both key off visual_data["filters"], so without this the
+            # report would claim "no filters" and no shared slicer could ever be
+            # applied to both dashboards.
+            detected_filter_names = await self.extract_filters_from_dom()
+            default_visual_data["filters"] = await self.read_filter_state(
+                detected_filter_names
+            )
+            logger.info(
+                "default.filter_state.published | page=%s | filters=%d",
+                page_name,
+                len(default_visual_data["filters"]),
             )
 
             default_metrics = await validator._capture_metrics(
@@ -1343,7 +1416,11 @@ class SlicerEngine:
                     scenario_filters,
                 )
                 filtered_visual_data = await extract_visual_data(
-                    page, attempt_export=False, scroll_export_fallback = True
+                    page,
+                    attempt_export=False,
+                    scroll_export_fallback=True,
+                    dashboard_title=str(dashboard.get("name") or "") or None,
+                    page_name=page_name,
                 )
                 filtered_tables = filtered_visual_data.get("table_exports", [])
                 logger.info(

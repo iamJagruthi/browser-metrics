@@ -13,6 +13,7 @@ Responsibilities:
 
 from __future__ import annotations
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -20,6 +21,63 @@ from services.table_exporter import export_table_visuals
 
 
 logger = logging.getLogger(__name__)
+
+
+# Power BI marks a visual that has no caption of its own with a
+# ``noVisualTitle`` class, so there is nothing in the DOM to read and the
+# inspection falls back to a positional "Visual N" label. That label is an
+# artefact of DOM order, not a name, and it is what surfaces in the Word
+# report, so a captionless visual is renamed to a numbered
+# ``<dashboard>_<kind>_<n>`` label instead.
+_PLACEHOLDER_VISUAL_TITLE_RE = re.compile(
+    r"^(?:visual|chart|graph|table|kpi|card|map|shape|shapeContainer|textbox)\s*\d+$",
+    re.IGNORECASE,
+)
+
+
+def _visual_family(visual: dict[str, Any]) -> str:
+    """Best available name for what kind of visual this is, for a report label."""
+    if visual.get("is_table") or visual.get("is_matrix") or visual.get("is_tabular"):
+        return "table"
+    if visual.get("is_kpi_or_card"):
+        return "kpi"
+    if visual.get("is_map"):
+        return "map"
+    if visual.get("is_chart"):
+        return "chart"
+
+    visual_type = str(visual.get("visual_type") or "").strip().casefold()
+    visual_type = re.sub(r"[^a-z0-9]+", "_", visual_type).strip("_")
+    if visual_type in {"unknown", "none", "n_a", "na", ""}:
+        return "visual"
+    return visual_type
+
+
+def _apply_display_title(
+    visual: dict[str, Any],
+    dashboard_title: str,
+    page_name: str,
+    ordinals: dict[str, int],
+    label_prefix: str,
+) -> None:
+    """Give a visual a reportable name when Power BI renders no caption for it.
+
+    The Word report is written from visual titles, so a bare "Visual N" label
+    leaks DOM order into navigation, functionality and data-export sections. A
+    caption that Power BI actually renders is always left untouched. A generated
+    name is dashboard-specific, so a ``comparison_key`` that is identical on both
+    dashboards is recorded alongside it for cross-dashboard pairing.
+    """
+    title = str(visual.get("title") or "").strip()
+    if title and not _PLACEHOLDER_VISUAL_TITLE_RE.match(title):
+        return
+
+    family = _visual_family(visual)
+    stem = f"{label_prefix}_{family}" if family != label_prefix else label_prefix
+    ordinal = ordinals[stem] = ordinals.get(stem, 0) + 1
+    visual["title"] = f"{dashboard_title}_{stem}_{ordinal}"
+    visual["comparison_key"] = f"{stem}_{ordinal}"
+    visual["page_name"] = page_name
 
 
 # ============================================================================
@@ -1133,6 +1191,8 @@ class VisualDataExporter:
         self,
         attempt_export: bool = True,
         scroll_export_fallback: bool = False,
+        dashboard_title: str | None = None,
+        page_name: str | None = None,
     ) -> dict[str, Any]:
         """Extract dashboard data using DOM inspection.
 
@@ -1148,6 +1208,12 @@ class VisualDataExporter:
         both) is queued and exported via the table exporter. Non-scrollable
         tables are fully visible in the DOM, so their accessible text is
         already captured by _VISUAL_INSPECTION_JS and they are not exported.
+
+        dashboard_title and page_name only affect naming: a table the report
+        gives no caption of its own is reported/exported as
+        ``<dashboard_title>_table_<n>`` rather than the positional "Visual N"
+        placeholder, and page_name is recorded so the report can attribute the
+        table to the page it was found on.
         """
         result: dict[str, Any] = {
             "status": "success",
@@ -1164,6 +1230,13 @@ class VisualDataExporter:
         logger.info("Starting dashboard DOM extraction")
         VISUAL_SELECTOR = ".visualContainer, [data-visual-container]"
         scrollable_tabular_visuals: list[dict[str, Any]] = []
+        resolved_dashboard_title = str(
+            dashboard_title or self.dashboard_name or "Dashboard"
+        ).strip() or "Dashboard"
+        resolved_page_name = str(page_name or "").strip() or None
+        # Per-page counters behind the generated "<dashboard>_<kind>_<n>" names.
+        table_ordinals: dict[str, int] = {}
+        other_ordinals: dict[str, int] = {}
 
         try:
             result["kpi_cards"] = await self._extract_kpi_cards()
@@ -1250,6 +1323,16 @@ class VisualDataExporter:
                 if is_exportable_table:
                     raw_title = str(visual.get("title") or "").lower()
                     if not ("click here to" in raw_title or "bookmark" in raw_title):
+                        # Name the table before it reaches the exporter and the
+                        # report, so an untitled table is reported as
+                        # <dashboard>_table_<n> instead of "Visual N".
+                        _apply_display_title(
+                            visual,
+                            resolved_dashboard_title,
+                            resolved_page_name,
+                            table_ordinals,
+                            "table",
+                        )
                         result["table_visuals"].append(visual)
 
                         # Scroll-aware fallback: when blanket export is disabled,
@@ -1263,6 +1346,13 @@ class VisualDataExporter:
                             scrollable_tabular_visuals.append(visual)
                     continue
 
+                _apply_display_title(
+                    visual,
+                    resolved_dashboard_title,
+                    resolved_page_name,
+                    other_ordinals,
+                    "visual",
+                )
                 result["visuals"].append(visual)
 
             except Exception as exc:
@@ -1306,6 +1396,8 @@ async def extract_visual_data(page, **kwargs) -> dict[str, Any]:
     debug_type_detection = kwargs.pop("debug_type_detection", False)
     attempt_export = kwargs.pop("attempt_export", True)
     scroll_export_fallback = kwargs.pop("scroll_export_fallback", False)
+    dashboard_title = kwargs.pop("dashboard_title", None)
+    page_name = kwargs.pop("page_name", None)
     if kwargs:
         logger.debug("Ignoring unsupported extract_visual_data kwargs: %s", list(kwargs.keys()))
 
@@ -1317,4 +1409,6 @@ async def extract_visual_data(page, **kwargs) -> dict[str, Any]:
     return await exporter.extract_dashboard_data(
         attempt_export=attempt_export,
         scroll_export_fallback=scroll_export_fallback,
+        dashboard_title=dashboard_title,
+        page_name=page_name,
     )

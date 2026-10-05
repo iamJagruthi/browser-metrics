@@ -59,6 +59,7 @@ def _performance_summary(side: str, results: dict, artifacts: dict) -> dict:
     entry = results.get(side, {}) or {}
     return {
         "browser_launch_seconds": entry.get("browser_launch_seconds", 0.0),
+        "page_load_seconds": entry.get("page_load_seconds"),
         "dashboard_render_seconds": entry.get("dashboard_render_seconds", 0.0),
         "filter_dashboard_render_seconds": entry.get("filter_dashboard_render_seconds"),
         "filter_test": entry.get("filter_test"),
@@ -490,6 +491,7 @@ class DashboardValidator:
 
                 entry = {
                     "browser_launch_seconds": browser_launch_seconds,
+                    "page_load_seconds": None,
                     "dashboard_render_seconds": 0.0,
                     "filter_dashboard_render_seconds": None,
                     "status": "failed",
@@ -526,11 +528,16 @@ class DashboardValidator:
                     dashboard_stable = False
                     self.timer.start("dashboard_render")
                     try:
-                        response = await page.goto(
-                            dashboard["url"],
-                            wait_until="domcontentloaded",
-                            timeout=PAGE_TIMEOUT,
-                        )
+                        self.timer.start("page_load")
+                        try:
+                            response = await page.goto(
+                                dashboard["url"],
+                                wait_until="domcontentloaded",
+                                timeout=PAGE_TIMEOUT,
+                            )
+                        finally:
+                            self.timer.stop("page_load")
+                            entry["page_load_seconds"] = self.timer.get("page_load")
                         logger.info(
                             "browser_metrics.%s.navigation.completed | run_id=%s",
                             side,
@@ -1618,6 +1625,13 @@ class DashboardValidator:
                 "value": value,
                 "source_applied": applied_source,
                 "target_applied": applied_target,
+                # Resolved up front: the single-page path produces the
+                # scenario without a page_name, and the extraction below needs
+                # it to label the tables it finds on the right page.
+                "page_name": (
+                    (source.get("dashboard") or {}).get("page_name")
+                    or "Default"
+                ),
             }
 
             if applied_source and applied_target:
@@ -1676,28 +1690,34 @@ class DashboardValidator:
                 )
                 source_visual = await extract_visual_data(
                     source["_page"],
-                    download_directory=OUTPUT_DIR / "visual_exports",
+                    dashboard_title=str(
+                        (source.get("dashboard") or {}).get("name") or ""
+                    ) or None,
+                    page_name=scenario.get("page_name"),
                 )
 
                 target_visual = await extract_visual_data(
                     target["_page"],
-                    download_directory=OUTPUT_DIR / "visual_exports",
+                    dashboard_title=str(
+                        (target.get("dashboard") or {}).get("name") or ""
+                    ) or None,
+                    page_name=scenario.get("page_name"),
+                )
+
+                # Keep the post-filter extraction. Both dashboards now carry the
+                # SAME verified filter applied, so this is the filtered
+                # source-vs-target pair the scenario exists to produce; dropping
+                # it threw away two full extractions.
+                scenario["source_visual_data"] = source_visual
+                scenario["target_visual_data"] = target_visual
+                logger.info(
+                    "slicer_scenario.visual_extraction.completed | slicer=%s | value=%s",
+                    slicer_name,
+                    value,
                 )
 
             else:
                 scenario["status"] = "not_run"
-
-            # Persist the originating page so the report's Filter Validation
-            # Log can group/relative the scenario even when the single-page
-            # path produced it (multi-page scenarios already carry their own
-            # page_name).
-            scenario.setdefault(
-                "page_name",
-                (
-                    (source.get("dashboard") or {}).get("page_name")
-                    or "Default"
-                ),
-            )
 
             return [scenario]
 
