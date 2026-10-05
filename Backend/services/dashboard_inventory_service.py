@@ -1,0 +1,413 @@
+"""Dashboard inventory service for API consumers — filters, visual counts, and table comparisons.
+
+Pure DOM Extraction Mode — No Gemini/AI dependencies.
+Provides lightweight API JSON payloads for frontend and Postman consumers.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from pathlib import Path
+from typing import Any
+
+from services.comparison_service import (
+    build_dashboard_filters_payload,
+)
+
+logger = logging.getLogger(__name__)
+
+_CHART_TYPE_ALIASES = {
+    "bar": ("bar", "column", "clustered", "stacked bar"),
+    "line": ("line", "area line"),
+    "area": ("area", "stacked area"),
+    "pie": ("pie", "donut", "doughnut"),
+    "scatter": ("scatter", "bubble"),
+    "map": ("map", "filled map", "shape map"),
+    "card": ("card", "multi-row card"),
+    "gauge": ("gauge", "kpi indicator"),
+    "table": ("table", "grid"),
+    "matrix": ("matrix", "pivot"),
+    "treemap": ("treemap", "tree map"),
+    "funnel": ("funnel",),
+    "waterfall": ("waterfall",),
+}
+
+
+def _normalize_chart_bucket(chart_type: str | None) -> str:
+    text = " ".join(str(chart_type or "").casefold().split())
+    if not text:
+        return "other"
+    for bucket, tokens in _CHART_TYPE_ALIASES.items():
+        if any(token in text for token in tokens):
+            return bucket
+    return "other"
+
+
+def _empty_chart_types() -> dict[str, int]:
+    return {bucket: 0 for bucket in _CHART_TYPE_ALIASES} | {"other": 0}
+
+
+def _kpi_key(name: str | None) -> str:
+    return " ".join(str(name or "").casefold().split())
+
+
+def _classify_dom_visual(visual: dict[str, Any]) -> str:
+    logger.debug(
+        "inventory.classify.input | index=%r | title=%r | visual_type=%r | family=%r | flags=%s | data_shape=%s",
+        visual.get("index"),
+        visual.get("title"),
+        visual.get("visual_type"),
+        visual.get("family"),
+        {
+            "is_slicer": visual.get("is_slicer"),
+            "is_chart": visual.get("is_chart"),
+            "is_tabular": visual.get("is_tabular"),
+            "is_table": visual.get("is_table"),
+            "is_matrix": visual.get("is_matrix"),
+        },
+        {
+            "has_rows": bool((visual.get("data") or {}).get("rows")),
+            "has_columns": bool((visual.get("data") or {}).get("columns")),
+        },
+    )
+
+    if visual.get("is_slicer"):
+        logger.debug("inventory.classify.result | index=%r | bucket=slicer", visual.get("index"))
+        return "slicer"
+    type_source = str(visual.get("visual_type", "")).casefold()
+    if visual.get("is_matrix") or "matrix" in type_source or "pivot" in type_source:
+        logger.debug("inventory.classify.result | index=%r | bucket=matrix | reason=matrix_flag_or_type", visual.get("index"))
+        return "matrix"
+    if visual.get("is_table") or "table" in type_source:
+        logger.debug("inventory.classify.result | index=%r | bucket=table | reason=table_flag_or_type", visual.get("index"))
+        return "table"
+    data = visual.get("data") or {}
+    if data.get("rows") or data.get("columns"):
+        logger.debug("inventory.classify.result | index=%r | bucket=table | reason=data_rows_or_columns", visual.get("index"))
+        return "table"
+    bucket = _normalize_chart_bucket(type_source)
+    logger.debug("inventory.classify.result | index=%r | bucket=%s | reason=chart_type", visual.get("index"), bucket)
+    return bucket
+
+
+def _extract_table_comparisons_for_execution(
+    execution: dict[str, Any], 
+    top_level_comparison: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    visual_data = execution.get("visual_data") or {}
+    table_comp = (
+        visual_data.get("table_comparisons") 
+        or execution.get("table_comparisons") 
+        or (top_level_comparison.get("tables") if top_level_comparison else {})
+        or {}
+    )
+    
+    raw_tables = table_comp.get("tables", table_comp)
+    
+    if isinstance(raw_tables, dict):
+        comparisons = raw_tables.get("comparisons", [])
+        overall_status = raw_tables.get("overall_status", "NOT_COMPARED")
+        table_count = raw_tables.get("source_table_count", len(comparisons))
+        match_count = raw_tables.get("match_count", 0)
+        mismatch_count = raw_tables.get("mismatch_count", 0)
+    elif isinstance(raw_tables, list):
+        comparisons = raw_tables
+        overall_status = table_comp.get("summary", {}).get("overall_status", "NOT_COMPARED")
+        table_count = len(comparisons)
+        match_count = sum(1 for t in comparisons if t.get("status") in ("Match", "TABLE_MATCHED"))
+        mismatch_count = table_count - match_count
+    else:
+        return {
+            "overall_status": "NOT_COMPARED",
+            "table_count": 0,
+            "match_count": 0,
+            "mismatched_count": 0,
+            "compared_count": 0,
+        }
+
+    return {
+        "overall_status": overall_status,
+        "table_count": table_count,
+        "match_count": match_count,
+        "mismatched_count": mismatch_count,
+        "compared_count": len(comparisons),
+    }
+
+
+def _count_inventory_for_execution(execution: dict[str, Any]) -> dict[str, Any]:
+    visual_data = execution.get("visual_data") or {}
+
+    chart_types = _empty_chart_types()
+    tables = 0
+    matrices = 0
+    slicers = 0
+    dom_charts = 0
+    other = 0
+    skipped = 0
+
+    logger.info(
+        "inventory.count.start | dashboard=%r | page=%r | visual_count=%d | table_visual_count=%d | kpi_count=%d | filter_count=%d",
+        (execution.get("dashboard") or {}).get("name"),
+        (execution.get("dashboard") or {}).get("page_name"),
+        len(visual_data.get("visuals", [])),
+        len(visual_data.get("table_visuals", []) or []),
+        len(visual_data.get("kpi_cards", []) or []),
+        len(visual_data.get("filters", []) or []),
+    )
+
+    for visual in visual_data.get("visuals", []):
+        if visual.get("is_loading_placeholder"):
+            logger.debug(
+                "inventory.count.skip_placeholder | index=%r | title=%r",
+                visual.get("index"), visual.get("title"),
+            )
+            skipped += 1
+            continue
+        bucket = _classify_dom_visual(visual)
+        if bucket == "slicer":
+            slicers += 1
+            continue
+        if bucket == "table":
+            tables += 1
+            continue
+        if bucket == "matrix":
+            matrices += 1
+            continue
+        if bucket in chart_types:
+            chart_types[bucket] += 1
+            dom_charts += 1
+        elif bucket == "other":
+            other += 1
+        else:
+            chart_types[bucket] += 1
+            dom_charts += 1
+
+    table_visuals = visual_data.get("table_visuals", []) or visual_data.get("table_exports", [])
+    logger.debug(
+        "inventory.table_visuals.input | count=%d | titles=%s",
+        len(table_visuals),
+        [item.get("title") for item in table_visuals],
+    )
+    for table_vis in table_visuals:
+        logger.debug(
+            "inventory.table_visual.inspect | title=%r | index=%r | is_matrix=%r | visual_type=%r | status=%r",
+            table_vis.get("title"),
+            table_vis.get("index"),
+            table_vis.get("is_matrix"),
+            table_vis.get("visual_type"),
+            table_vis.get("status"),
+        )
+        if table_vis.get("is_matrix"):
+            matrices += 1
+        else:
+            tables += 1
+
+    skipped += len(visual_data.get("skipped_visuals", []))
+
+    dom_kpis = visual_data.get("kpi_cards", []) or []
+    kpi_names = {
+        _kpi_key(item.get("name"))
+        for item in dom_kpis
+        if item.get("name")
+    }
+    kpi_count = len(kpi_names)
+
+    chart_count = sum(chart_types.values())
+    filter_count = len(visual_data.get("filters", []))
+    total_visuals = kpi_count + tables + matrices + chart_count + other
+
+    logger.info(
+        "inventory.count.result | dashboard=%r | page=%r | kpis=%d | tables=%d | matrices=%d | charts=%d | other=%d | slicers=%d | skipped=%d | total_visuals=%d | dom_visual_count=%d | chart_types=%s",
+        (execution.get("dashboard") or {}).get("name"),
+        (execution.get("dashboard") or {}).get("page_name"),
+        kpi_count, tables, matrices, chart_count, other, slicers, skipped,
+        total_visuals, len(visual_data.get("visuals", [])), chart_types,
+    )
+
+    dashboard = execution.get("dashboard") or {}
+    metadata = visual_data.get("metadata") or {}
+
+    return {
+        "filter_count": filter_count,
+        "kpi_count": kpi_count,
+        "table_count": tables,
+        "matrix_count": matrices,
+        "chart_count": chart_count,
+        "chart_types": chart_types,
+        "slicer_visual_count": slicers,
+        "other_visual_count": other,
+        "total_visuals": total_visuals,
+        "dom_visual_count": len(visual_data.get("visuals", [])),
+        "skipped_visual_count": skipped,
+        "page_name": dashboard.get("page_name") or metadata.get("page_name"),
+        "page_number": metadata.get("page_number"),
+        "refresh_date": metadata.get("data_refresh_date"),
+        "dashboard_title": dashboard.get("name") or metadata.get("dashboard_title"),
+    }
+
+
+def _list_kpis_for_execution(execution: dict[str, Any]) -> list[dict[str, Any]]:
+    visual_data = execution.get("visual_data") or {}
+    seen: set[str] = set()
+    kpis: list[dict[str, Any]] = []
+
+    dom_kpis = visual_data.get("kpi_cards", []) or []
+
+    for item in dom_kpis:
+        name = item.get("name")
+        key = _kpi_key(name)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        kpis.append(
+            {
+                "name": name,
+                "value": item.get("value"),
+                "previous_value": item.get("previous_value"),
+                "variance": item.get("variance"),
+                "extraction_source": "dom",
+            }
+        )
+    return kpis
+
+
+def build_page_showcase_entry(execution: dict[str, Any]) -> dict[str, Any]:
+    dashboard = execution.get("dashboard") or {}
+    filters_section = build_dashboard_filters_payload(execution)
+    inventory = _count_inventory_for_execution(execution)
+    table_comparisons_data = _extract_table_comparisons_for_execution(execution)
+
+    return {
+        "page_name": dashboard.get("page_name") or inventory.get("page_name") or "Default",
+        "filter_count": filters_section["filter_count"],
+        "inventory": inventory,
+        "kpis": _list_kpis_for_execution(execution),
+        "table_comparisons": table_comparisons_data,
+        "extraction_status": filters_section.get("extraction_status"),
+        "visual_extraction_status": filters_section.get("visual_extraction_status"),
+    }
+
+
+def build_pages_showcase_payload(
+    executions: list[dict[str, Any]],
+    *,
+    executions_by_dashboard: list[list[dict[str, Any]]] | None = None,
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    try:
+        grouped = executions_by_dashboard or []
+        if not grouped and executions:
+            grouped = [executions]
+
+        multi_page_mode = any(len(items) > 1 for items in grouped)
+        dashboards: list[dict[str, Any]] = []
+
+        for dashboard_executions in grouped:
+            if not dashboard_executions:
+                continue
+            first = dashboard_executions[0]
+            dashboard_info = first.get("dashboard") or {}
+            pages = [build_page_showcase_entry(item) for item in dashboard_executions]
+            dashboards.append(
+                {
+                    "dashboard_name": dashboard_info.get("name"),
+                    "dashboard_url": dashboard_info.get("url"),
+                    "page_count": len(pages),
+                    "pages": pages,
+                }
+            )
+
+        return {
+            "run_id": run_id,
+            "multi_page_mode": multi_page_mode,
+            "dashboards": dashboards,
+            "pages_download_url": f"/api/reports/{run_id}/pages" if run_id else None,
+        }
+    except Exception:
+        logger.exception("Failed to build pages showcase payload")
+        raise
+
+
+def build_dashboard_inventory_payload(execution: dict[str, Any]) -> dict[str, Any]:
+    filters_section = build_dashboard_filters_payload(execution)
+    inventory = _count_inventory_for_execution(execution)
+    inventory["filter_count"] = filters_section["filter_count"]
+    table_comparisons_data = _extract_table_comparisons_for_execution(execution)
+
+    return {
+        "dashboard_name": filters_section.get("dashboard_name"),
+        "dashboard_url": filters_section.get("dashboard_url"),
+        "extraction_status": filters_section.get("extraction_status"),
+        "visual_extraction_status": filters_section.get("visual_extraction_status"),
+        "filter_count": filters_section["filter_count"],
+        "inventory": inventory,
+        "kpis": _list_kpis_for_execution(execution),
+        "table_comparisons": table_comparisons_data,
+    }
+
+
+def build_inventory_api_payload(
+    executions: list[dict[str, Any]],
+    *,
+    run_id: str | None = None,
+    comparison: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    try:
+        dashboards = []
+        table_comp_data = (comparison or {}).get("tables", {})
+
+        for item in executions:
+            dash_payload = build_dashboard_inventory_payload(item)
+            if table_comp_data and isinstance(table_comp_data, dict):
+                dash_payload["table_comparisons"] = {
+                    "overall_status": table_comp_data.get("overall_status", "NOT_COMPARED"),
+                    "source_table_count": table_comp_data.get("source_table_count", 0),
+                    "target_table_count": table_comp_data.get("target_table_count", 0),
+                    "paired_table_count": table_comp_data.get("paired_table_count", 0),
+                    "compared_table_count": table_comp_data.get("compared_table_count", 0),
+                    "match_count": table_comp_data.get("match_count", 0),
+                    "mismatch_count": table_comp_data.get("mismatch_count", 0),
+                }
+            dashboards.append(dash_payload)
+
+        return {
+            "run_id": run_id,
+            "dashboards": dashboards,
+            "inventory_download_url": f"/api/reports/{run_id}/inventory" if run_id else None,
+            "filters_download_url": f"/api/reports/{run_id}/filters" if run_id else None,
+        }
+    except Exception:
+        logger.exception("Failed to build inventory API payload")
+        raise
+
+
+ 
+def save_pages_snapshot(
+    run_id: str,
+    payload: dict[str, Any],
+    output_directory: Path,
+) -> Path:
+    try:
+        output_directory.mkdir(parents=True, exist_ok=True)
+        path = output_directory / f"{run_id}_pages.json"
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return path
+    except Exception:
+        logger.exception("Failed to save pages snapshot | run_id=%s", run_id)
+        raise
+
+
+def save_inventory_snapshot(
+    run_id: str,
+    payload: dict[str, Any],
+    output_directory: Path,
+) -> Path:
+    try:
+        output_directory.mkdir(parents=True, exist_ok=True)
+        path = output_directory / f"{run_id}_inventory.json"
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return path
+    except Exception:
+        logger.exception("Failed to save inventory snapshot | run_id=%s", run_id)
+        raise
