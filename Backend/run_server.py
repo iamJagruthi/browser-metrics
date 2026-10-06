@@ -26,6 +26,7 @@ and wrap this script's call in a `watchfiles.run_process(...)` call.
 
 import asyncio
 import logging
+import os
 import sys
 
 import uvicorn
@@ -41,12 +42,12 @@ async def run():
     setup_logging()
     config = uvicorn.Config(
         app,
-        host="127.0.0.1",
-        port=8000,
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", "8000")),
         log_level="info",
     )
     server = uvicorn.Server(config)
-    logger.info("Starting Browser Metrics Validator API on http://127.0.0.1:8000")
+    logger.info("Starting Browser Metrics Validator API")
     await server.serve()
 
 
