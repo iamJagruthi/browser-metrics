@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 
 from api.logging_config import setup_logging
 from api.routes import (
+    agent_jobs_router,
     agent_ws_router,
     browser_metrics_router,
     excel_validation_router,
@@ -54,6 +55,7 @@ def create_app() -> FastAPI:
     application.include_router(excel_validation_router)
     application.include_router(runs_router)
     application.include_router(validation_router)
+    application.include_router(agent_jobs_router)
     application.include_router(agent_ws_router)
 
     # Serve production React build if present
