@@ -1,6 +1,6 @@
 """FastAPI application factory.
 
-Jagruthi — production layout: routers grouped by domain (health, validation).
+Jagruthi ΓÇö production layout: routers grouped by domain (health, validation).
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 
 from api.logging_config import setup_logging
 from api.routes import (
+    agent_ws_router,
     browser_metrics_router,
     excel_validation_router,
     health_router,
@@ -53,6 +54,7 @@ def create_app() -> FastAPI:
     application.include_router(excel_validation_router)
     application.include_router(runs_router)
     application.include_router(validation_router)
+    application.include_router(agent_ws_router)
 
     # Serve production React build if present
     try:
