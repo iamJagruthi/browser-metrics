@@ -54,7 +54,7 @@ async def agent_websocket(websocket: WebSocket) -> None:
         logger.info('agent websocket connection cleared')
 
 
-async def send_validation_job(job_id: str, timeout: float = 5.0) -> Dict[str, Any]:
+async def send_validation_job(job_id: str, links: Optional[Any] = None, timeout: float = 5.0) -> Dict[str, Any]:
     global _connected_websocket, _job_ack_event, _last_ack
     async with _connection_lock:
         websocket = _connected_websocket
@@ -63,7 +63,10 @@ async def send_validation_job(job_id: str, timeout: float = 5.0) -> Dict[str, An
         _last_ack = None
     if websocket is None:
         raise RuntimeError('no agent connected')
-    await websocket.send_json({'type': 'validation_job', 'job_id': job_id})
+    if links is not None:
+        await websocket.send_json({'type': 'validation_job', 'job_id': job_id, 'links': links})
+    else:
+        await websocket.send_json({'type': 'validation_job', 'job_id': job_id})
     try:
         await asyncio.wait_for(event.wait(), timeout=timeout)
     except asyncio.TimeoutError:

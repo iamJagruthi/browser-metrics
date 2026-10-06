@@ -13,11 +13,14 @@ router = APIRouter()
 
 @router.post('/api/agent/test-job')
 async def test_job(payload: dict) -> dict:
-    job_id = payload.get('job_id') if isinstance(payload, dict) else None
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail='payload must be dict')
+    job_id = payload.get('job_id')
     if not job_id or not isinstance(job_id, str):
         raise HTTPException(status_code=400, detail='job_id is required')
+    links = payload.get('links')
     try:
-        ack = await send_validation_job(job_id)
+        ack = await send_validation_job(job_id, links=links)
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
     except (TimeoutError, ValueError) as e:
