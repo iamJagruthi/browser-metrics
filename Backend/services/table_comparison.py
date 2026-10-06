@@ -12,6 +12,9 @@ from __future__ import annotations
 
 import logging
 import re
+from decimal import Decimal, InvalidOperation
+from collections import Counter
+from itertools import combinations
 from typing import Any
 
 import pandas as pd
@@ -20,26 +23,63 @@ from utils.config import TABLE_COMPARE_KEY_COLUMNS, TABLE_COMPARE_KEY_STRATEGY
 
 logger = logging.getLogger(__name__)
 
+# Plain decimal numbers only, e.g. "112502.0", "-37.26697".
+# Values with currency symbols, commas, leading-zero IDs without a decimal
+# point (e.g. "061"), dates or text do NOT match and stay strictly compared.
+_PLAIN_NUMBER = re.compile(r"[+-]?\d+\.\d+")
+
+# NumPy 2 repr of a scalar, e.g. "np.float64(112502.0)" or "np.int64(5)".
+_NUMPY_WRAPPED = re.compile(r"np\.(?:float|int|uint)\d*\(([^()]*)\)")
+
+# Float representation noise (e.g. 112502.00000000001) is removed by rounding
+# to this many decimal places before comparing.
+_DECIMAL_QUANTUM = Decimal("0.000000001")
+
+
 def _display_value(value: Any) -> str:
     """
-    Preserve the exact displayed value for strict validation.
+    Strict rendered-value comparison, except for float representation noise.
 
-    No:
-    - numeric normalization
-    - currency removal
-    - comma removal
-    - case normalization
-    - whitespace collapsing
-
-    Only Python/Pandas missing values are represented as an empty string.
+    - Python/Pandas missing values -> ""
+    - Plain decimal numbers (e.g. "112502.0", "112502.00000000001") are
+      rounded to 9 decimal places and trailing zeros are stripped, so
+      "112502.0" and "112502.00000000001" both become "112502".
+    - Everything else (IDs like "061", "$1,200", "April 2024", text) is
+      compared exactly as displayed:
+        - no currency removal
+        - no comma removal
+        - no case normalization
+        - no whitespace collapsing
     """
     if value is None:
         return ""
 
-    if isinstance(value, float) and pd.isna(value):
-        return ""
+    if isinstance(value, float):
+        if pd.isna(value):
+            return ""
+        # float() strips the numpy type, so repr gives "112502.0" and not
+        # "np.float64(112502.0)" (NumPy 2 repr).
+        text = repr(float(value))
+    else:
+        text = str(value)
 
-    return str(value)
+    # Some upstream steps stringify numpy scalars with repr, which leaves text
+    # like "np.float64(112502.0)". Unwrap it to the bare number.
+    wrapped = _NUMPY_WRAPPED.fullmatch(text.strip())
+    if wrapped:
+        text = wrapped.group(1)
+
+    if _PLAIN_NUMBER.fullmatch(text):
+        try:
+            rounded = Decimal(text).quantize(_DECIMAL_QUANTUM)
+            text = format(rounded.normalize(), "f")
+        except InvalidOperation:
+            # Too large to quantize or otherwise not representable:
+            # fall back to the exact displayed text.
+            pass
+
+    return text
+
 
 def _values_match(
     source_value: Any,
@@ -48,7 +88,8 @@ def _values_match(
     """
     Strict rendered-value comparison.
 
-    Formatting differences are intentional mismatches.
+    Formatting differences are intentional mismatches, except for pure
+    float representation noise handled in _display_value.
     """
     return _display_value(source_value) == _display_value(target_value)
 
@@ -126,6 +167,7 @@ def is_tabular_visual(visual: dict[str, Any]) -> bool:
         )
         return False
 
+
 def _has_exported_data(visual: dict[str, Any]) -> bool:
     """
     Return True only when a successful export contains actual
@@ -157,6 +199,7 @@ def _has_exported_data(visual: dict[str, Any]) -> bool:
         return False
 
     return True
+
 
 def visual_to_dataframe(visual: dict[str, Any]) -> pd.DataFrame:
     try:
@@ -223,6 +266,88 @@ def _columns_are_unique_key(
     return not normalized.duplicated(keep=False).any()
 
 
+# A key column does not have to be perfect. Real exports often contain a
+# blank "Total" row or a few repeated values, so a column is accepted when at
+# least this share of rows has a non-blank value that appears only once, and
+# at least this share of its distinct values exist on both sides.
+_MIN_KEY_UNIQUENESS = 0.9
+_MIN_KEY_OVERLAP = 0.5
+_MAX_COMPOSITE_COLUMNS = 30
+
+
+def _key_profile(df: pd.DataFrame, keys: list[str]) -> tuple[float, set[tuple[str, ...]]]:
+    """Return (share of rows with a clean unique key, set of non-blank key values)."""
+    tuples = [
+        tuple(_display_value(value) for value in row)
+        for row in df[keys].itertuples(index=False, name=None)
+    ]
+    if not tuples:
+        return 0.0, set()
+    counts = Counter(tuples)
+    clean = sum(1 for item in tuples if all(item) and counts[item] == 1)
+    return clean / len(tuples), {item for item in tuples if all(item)}
+
+
+def _score_key(source_df: pd.DataFrame, target_df: pd.DataFrame, keys: list[str]) -> tuple[float, float]:
+    """Return (worst-side uniqueness, value overlap between the two tables)."""
+    source_uniqueness, source_values = _key_profile(source_df, keys)
+    target_uniqueness, target_values = _key_profile(target_df, keys)
+    union = source_values | target_values
+    overlap = len(source_values & target_values) / len(union) if union else 0.0
+    return min(source_uniqueness, target_uniqueness), overlap
+
+
+def _key_overlap(source_df: pd.DataFrame, target_df: pd.DataFrame, keys: list[str]) -> float:
+    return _score_key(source_df, target_df, keys)[1]
+
+
+def _find_best_key(source_df: pd.DataFrame, target_df: pd.DataFrame) -> tuple[list[str], str | None]:
+    """
+    Find the column (or pair of columns) that identifies a row on both sides.
+
+    Returns (keys, note). When no key is found, keys is empty and note lists
+    the closest candidates so the failure can be diagnosed.
+    """
+    common = [str(column) for column in source_df.columns if column in target_df.columns]
+
+    def best_of(candidates: list[list[str]]) -> tuple[list[str], float] | None:
+        best: tuple[float, list[str], float] | None = None
+        for keys in candidates:
+            uniqueness, overlap = _score_key(source_df, target_df, keys)
+            if uniqueness < _MIN_KEY_UNIQUENESS or overlap < _MIN_KEY_OVERLAP:
+                continue
+            score = uniqueness * overlap
+            if best is None or score > best[0]:
+                best = (score, keys, uniqueness)
+        return (best[1], best[2]) if best else None
+
+    found = best_of([[column] for column in common])
+    if found is None:
+        pool = common[:_MAX_COMPOSITE_COLUMNS]
+        found = best_of([list(pair) for pair in combinations(pool, 2)])
+
+    if found is not None:
+        keys, uniqueness = found
+        note = None
+        if uniqueness < 1.0:
+            note = (
+                f"Key {keys} has blank or repeated values in "
+                f"{round((1 - uniqueness) * 100)}% of rows; repeats are paired in order."
+            )
+        return keys, note
+
+    scored = []
+    for column in common:
+        uniqueness, overlap = _score_key(source_df, target_df, [column])
+        scored.append((uniqueness * overlap, column, uniqueness, overlap))
+    scored.sort(reverse=True)
+    closest = ", ".join(
+        f"{column} (unique {uniqueness:.0%}, shared {overlap:.0%})"
+        for _, column, uniqueness, overlap in scored[:3]
+    )
+    return [], f"Closest key candidates: {closest or 'none'}"
+
+
 def determine_key_strategy(
     source_df: pd.DataFrame,
     target_df: pd.DataFrame,
@@ -235,28 +360,27 @@ def determine_key_strategy(
         keys = [column for column in TABLE_COMPARE_KEY_COLUMNS if column in source_df.columns and column in target_df.columns]
         if keys and _columns_are_unique_key(source_df, keys) and _columns_are_unique_key(target_df, keys):
             return keys, "configured", True, None
-        warning = "Configured key columns are missing or not unique in both tables."
-        return keys or list(TABLE_COMPARE_KEY_COLUMNS), "configured", False, warning
+        logger.warning("Configured key columns are missing or not unique in both tables; detecting a key automatically.")
 
-    if strategy == "first_column":
+    elif strategy == "first_column":
         if len(source_df.columns) and source_df.columns[0] in target_df.columns:
             keys = [source_df.columns[0]]
-            reliable = _columns_are_unique_key(source_df, keys) and _columns_are_unique_key(target_df, keys)
-            if not reliable:
-                warning = "First column is not a unique key in both tables."
-            return keys, "first_column", reliable, warning
+            if _columns_are_unique_key(source_df, keys) and _columns_are_unique_key(target_df, keys):
+                return keys, "first_column", True, None
+        logger.warning("First column is not a unique key in both tables; detecting a key automatically.")
 
-    if strategy == "all_columns":
+    elif strategy == "all_columns":
         keys = [str(column) for column in source_df.columns if column in target_df.columns]
-        reliable = keys and _columns_are_unique_key(source_df, keys) and _columns_are_unique_key(target_df, keys)
-        if not reliable:
-            warning = "All common columns do not form a unique key in both tables."
-        return keys, "all_columns", bool(reliable), warning
+        if keys and _columns_are_unique_key(source_df, keys) and _columns_are_unique_key(target_df, keys):
+            return keys, "all_columns", True, None
+        # Do not fall back to row position just because a blank cell or a
+        # repeated row stops the full-row key from being unique.
+        logger.warning("All common columns do not form a unique key in both tables; detecting a key automatically.")
 
-    if strategy == "row_index":
+    elif strategy == "row_index":
         return [], "row_index", False, "Row index matching was explicitly configured; keys are not reliable."
 
-    # Auto strategy
+    # Auto detection (also the fallback for an unusable configured / first_column key)
     if TABLE_COMPARE_KEY_COLUMNS:
         keys = [column for column in TABLE_COMPARE_KEY_COLUMNS if column in source_df.columns and column in target_df.columns]
         if keys and _columns_are_unique_key(source_df, keys) and _columns_are_unique_key(target_df, keys):
@@ -264,15 +388,32 @@ def determine_key_strategy(
 
     if len(source_df.columns) and source_df.columns[0] in target_df.columns:
         keys = [source_df.columns[0]]
-        if _columns_are_unique_key(source_df, keys) and _columns_are_unique_key(target_df, keys):
+        if (
+            _columns_are_unique_key(source_df, keys)
+            and _columns_are_unique_key(target_df, keys)
+            and _key_overlap(source_df, target_df, keys) >= _MIN_KEY_OVERLAP
+        ):
             return keys, "first_column", True, None
+
+    keys, key_note = _find_best_key(source_df, target_df)
+    if keys:
+        logger.info("Auto-detected row key | columns=%s | note=%s", keys, key_note)
+        return keys, "auto_detected", True, key_note
 
     keys = [str(column) for column in source_df.columns if column in target_df.columns]
     if keys and _columns_are_unique_key(source_df, keys) and _columns_are_unique_key(target_df, keys):
         return keys, "all_columns", True, None
 
-    warning = "No reliable unique key could be determined; comparison uses row position."
+    warning = f"No reliable unique key could be determined; comparison uses row position. {key_note}"
     return [], "row_index", False, warning
+
+
+def _cell(row: pd.Series, name: str) -> str:
+    """String value of a merged-row cell; a side missing from an outer merge is ""."""
+    value = row.get(name, "")
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    return str(value)
 
 
 def _record_key_values(row: pd.Series, key_columns: list[str], row_number: int) -> dict[str, str]:
@@ -291,7 +432,7 @@ def compare_dataframes(
         key_columns, key_strategy, key_reliable, key_warning = determine_key_strategy(source_df, target_df)
         source_only_columns = [str(column) for column in source_df.columns if column not in target_df.columns]
         target_only_columns = [str(column) for column in target_df.columns if column not in source_df.columns]
-        
+
         column_differences = [
             {"visual": visual_title, "column": column, "presence": "Source only"}
             for column in source_only_columns
@@ -309,30 +450,42 @@ def compare_dataframes(
             common_value_columns = [
                 str(column)
                 for column in source_df.columns
-                if column in target_df.columns and column not in key_columns
+                if column in target_df.columns and str(column) not in key_columns
             ]
-            source_named = source_df.copy()
-            target_named = target_df.copy()
-            for column in common_value_columns:
-                source_named = source_named.rename(columns={column: f"{column}__src"})
-                target_named = target_named.rename(columns={column: f"{column}__tgt"})
 
-            merged = source_named.merge(
-                target_named,
-                on=key_columns,
+            # Merge on the *normalized* key so "112502.0" and "112502.00000000001"
+            # still pair; every original column is kept with a __src/__tgt suffix.
+            key_merge_columns = [f"__key{i}" for i in range(len(key_columns))]
+
+            def _prepare(df: pd.DataFrame, suffix: str) -> pd.DataFrame:
+                prepared = df.copy()
+                for i, column in enumerate(key_columns):
+                    prepared[key_merge_columns[i]] = prepared[column].map(_display_value)
+                # Repeated or blank keys are paired nth-with-nth so the merge
+                # never multiplies rows.
+                prepared["__occ"] = prepared.groupby(key_merge_columns).cumcount()
+                return prepared.rename(columns={column: f"{column}{suffix}" for column in df.columns})
+
+            merged = _prepare(source_df, "__src").merge(
+                _prepare(target_df, "__tgt"),
+                on=[*key_merge_columns, "__occ"],
                 how="outer",
                 indicator=True,
             )
 
             for _, row in merged.iterrows():
-                key_values = _record_key_values(row, key_columns, 0)
+                if row["_merge"] == "right_only":
+                    key_values = {column: _cell(row, f"{column}__tgt") for column in key_columns}
+                else:
+                    key_values = {column: _cell(row, f"{column}__src") for column in key_columns}
+
                 if row["_merge"] == "left_only":
                     missing_in_target.append(
                         {
                             "visual": visual_title,
                             "key_strategy": key_strategy,
                             "keys": key_values,
-                            "row": {column: str(row.get(column, "")) for column in source_df.columns},
+                            "row": {str(column): _cell(row, f"{column}__src") for column in source_df.columns},
                         }
                     )
                     continue
@@ -342,20 +495,15 @@ def compare_dataframes(
                             "visual": visual_title,
                             "key_strategy": key_strategy,
                             "keys": key_values,
-                            "row": {column: str(row.get(column, "")) for column in target_df.columns},
+                            "row": {str(column): _cell(row, f"{column}__tgt") for column in target_df.columns},
                         }
                     )
                     continue
 
                 cell_diffs = []
                 for column in common_value_columns:
-                    source_value = _display_value(
-                        row.get(f"{column}__src", "")
-                    )
-
-                    target_value = _display_value(
-                        row.get(f"{column}__tgt", "")
-                    )
+                    source_value = _display_value(_cell(row, f"{column}__src"))
+                    target_value = _display_value(_cell(row, f"{column}__tgt"))
 
                     if not _values_match(source_value, target_value):
                         cell_diffs.append(
@@ -370,14 +518,8 @@ def compare_dataframes(
                     "visual": visual_title,
                     "key_strategy": key_strategy,
                     "keys": key_values,
-                    "source_row": {
-                        column: str(row.get(column if column in key_columns else f"{column}__src", ""))
-                        for column in source_df.columns
-                    },
-                    "target_row": {
-                        column: str(row.get(column if column in key_columns else f"{column}__tgt", ""))
-                        for column in target_df.columns
-                    },
+                    "source_row": {str(column): _cell(row, f"{column}__src") for column in source_df.columns},
+                    "target_row": {str(column): _cell(row, f"{column}__tgt") for column in target_df.columns},
                 }
                 if cell_diffs:
                     mismatched_records.append({**record, "differences": cell_diffs})
@@ -399,7 +541,7 @@ def compare_dataframes(
 
             max_rows = max(len(source_df), len(target_df))
             shared_columns = [str(column) for column in source_df.columns if column in target_df.columns]
-            
+
             for row_number in range(max_rows):
                 has_source = row_number < len(source_df)
                 has_target = row_number < len(target_df)
@@ -628,6 +770,8 @@ def _get_export_data(dash_dict: dict[str, Any]) -> list[dict[str, Any]]:
         merged.append(item)
 
     return merged
+
+
 def _get_visual_index(visual: dict[str, Any]) -> Any:
     """
     Return the visual index without treating 0 as a missing value.
@@ -636,6 +780,7 @@ def _get_visual_index(visual: dict[str, Any]) -> Any:
         return visual.get("visual_index")
 
     return visual.get("index")
+
 
 def pair_source_and_target_tables(
     source_exports: list[dict[str, Any]],
@@ -814,9 +959,18 @@ def build_table_comparisons(visual_data: dict[str, Any] | None) -> dict[str, Any
                 "source_table": source_name,
                 "target_table": target_name,
                 "status": table_status,
+                "key_strategy": diff_res.get("key_strategy"),
+                "key_columns": diff_res.get("key_columns", []),
+                "key_reliable": diff_res.get("key_reliable"),
+                "key_warning": diff_res.get("key_warning"),
                 "source_row_count": len(source_df),
                 "target_row_count": len(target_df),
                 "matched_row_count": diff_res.get("summary", {}).get("matched_rows", 0),
+                # Which rows were paired on: "row_index" means row position, so a
+                # shifted row shows up as many false mismatches.
+                "key_strategy": diff_res.get("key_strategy"),
+                "key_columns": diff_res.get("key_columns", []),
+                "key_warning": diff_res.get("key_warning"),
                 "missing_columns_in_target": diff_res.get("source_only_columns", []),
                 "extra_columns_in_target": diff_res.get("target_only_columns", []),
                 "missing_rows_in_target": [
