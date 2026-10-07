@@ -356,8 +356,24 @@ class DashboardValidator:
     def _build_comparison_payload(execution: dict) -> dict:
         visual_data = execution.get("visual_data") or {}
 
+        # DOM filter records carry ``name``/``selected_values``/
+        # ``visible_values`` (slicer_engine.read_filter_state), while
+        # compare_filters pairs them by ``filter_name``. Normalize here so
+        # the filter comparison (and the report's 4.2 section) receives the
+        # shape it expects instead of silently matching zero rows.
+        from services.comparison_service import normalize_dom_filter
+
+        raw_filters = visual_data.get("filters", []) or []
+        filters = [
+            normalized
+            for normalized in (
+                normalize_dom_filter(item) for item in raw_filters
+            )
+            if normalized
+        ]
+
         return {
-            "filters": visual_data.get("filters", []),
+            "filters": filters,
             "kpi_cards": visual_data.get("kpi_cards", []),
             "visuals": visual_data.get("visuals", []),
             "button_groups": visual_data.get("button_groups", []),
@@ -1614,12 +1630,20 @@ class DashboardValidator:
             source_engine = SlicerEngine(source["_page"])
             target_engine = SlicerEngine(target["_page"])
 
-            applied_source = await source_engine.apply_filter(
+            (
+                applied_source,
+                source_render_stable,
+                source_render_seconds,
+            ) = await source_engine.apply_filter(
                 slicer_name,
                 value,
             )
 
-            applied_target = await target_engine.apply_filter(
+            (
+                applied_target,
+                target_render_stable,
+                target_render_seconds,
+            ) = await target_engine.apply_filter(
                 slicer_name,
                 value,
             )
@@ -1629,6 +1653,15 @@ class DashboardValidator:
                 "value": value,
                 "source_applied": applied_source,
                 "target_applied": applied_target,
+                # Post-filter render confirmation, anchored on the
+                # previous_snapshot taken inside apply_filter(): True only
+                # when wait_for_dashboard() observed a stable re-render after
+                # the click, False when it timed out / the page closed, and
+                # None when no interaction happened (value already selected).
+                "source_render_stable": source_render_stable,
+                "target_render_stable": target_render_stable,
+                "source_dashboard_render_seconds": source_render_seconds,
+                "target_dashboard_render_seconds": target_render_seconds,
                 # Resolved up front: the single-page path produces the
                 # scenario without a page_name, and the extraction below needs
                 # it to label the tables it finds on the right page.

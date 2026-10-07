@@ -1,6 +1,7 @@
 import logging
 import random
 import re
+import time
 from playwright.async_api import Page
 import uuid
 
@@ -227,9 +228,13 @@ class SlicerEngine:
                 logger.warning(f"Slicer visual '{filter_name}' not found in DOM.")
                 return items, False
 
-            container, is_dropdown = await self._open_dropdown_items(
+            result = await self._open_dropdown_items(
                 slicer_visual
             )
+            if len(result) == 3:
+                container, is_dropdown, _ = result
+            else:
+                container, is_dropdown = result  # type: ignore[assignment]
 
             option_nodes = container.locator(_FILTER_ITEMS_SELECTOR)
             try:
@@ -291,7 +296,9 @@ class SlicerEngine:
         requested option value against selected_values read from the DOM."""
         return " ".join(str(value).strip().casefold().split())
 
-    async def apply_filter(self, filter_name: str, option_value: str) -> bool:
+    async def apply_filter(
+        self, filter_name: str, option_value: str
+    ) -> tuple[bool, bool | None, float | None]:
         """Ensures `option_value` ends up selected on `filter_name`, without
         assuming click == select.
 
@@ -302,9 +309,23 @@ class SlicerEngine:
         (Task 1) both before acting (to detect "already selected, don't
         touch it") and after acting (to confirm the click actually produced
         the requested state before reporting success).
+
+        Returns ``(selected, render_stable, render_seconds)``:
+            selected       -- requested value verified in the slicer's final
+                              selected-values state (unchanged behaviour).
+            render_stable  -- True when the existing
+                              ``wait_for_dashboard(previous_snapshot=...)``
+                              call observed a stable post-interaction render,
+                              False when that wait timed out / the page closed,
+                              None when no interaction took place (value was
+                              already selected) so there was no new render to
+                              confirm.
+            render_seconds -- wall-clock duration of that same wait, or None.
         """
         logger.info(f"Applying filter: [{filter_name} = '{option_value}']")
         requested_norm = self._normalize_value(option_value)
+        render_stable: bool | None = None
+        render_seconds: float | None = None
 
         try:
             current_state = await self.get_slicer_state(filter_name)
@@ -314,7 +335,7 @@ class SlicerEngine:
 
         if current_state and current_state.get("error") == "slicer_not_found":
             logger.warning(f"Slicer visual '{filter_name}' not found.")
-            return False
+            return False, None, None
 
         current_values = {
             self._normalize_value(v)
@@ -329,7 +350,9 @@ class SlicerEngine:
                 f"'{option_value}' is already selected on '{filter_name}'; "
                 f"skipping click to avoid toggling it off."
             )
-            return True
+            # No interaction: nothing new to render, so render_stable stays
+            # None (not False -- no wait was run and none was needed).
+            return True, None, None
 
         try:
             await self._close_any_open_popups()
@@ -344,7 +367,7 @@ class SlicerEngine:
 
             if await slicer_visual.count() == 0:
                 logger.warning(f"Slicer visual '{filter_name}' not found.")
-                return False
+                return False, None, None
 
             dropdown_btn = slicer_visual.locator(
                 ".slicer-dropdown-menu, .slicer-rest-item, [role='combobox']"
@@ -360,7 +383,7 @@ class SlicerEngine:
                     container = popup
                 except Exception:
                     logger.warning(f"Popup failed to open for '{filter_name}'.")
-                    return False
+                    return False, None, None
 
             target_el = container.locator(
                 f".slicerText:text-is('{option_value}'), "
@@ -377,7 +400,7 @@ class SlicerEngine:
             if await target_el.count() == 0:
                 logger.warning(f"Option '{option_value}' not found in '{filter_name}'.")
                 await self.page.keyboard.press("Escape")
-                return False
+                return False, None, None
 
             # Requested value is confirmed absent from selected_values, so a
             # single click here is the minimum action needed to select it —
@@ -399,10 +422,17 @@ class SlicerEngine:
 
             await self.page.keyboard.press("Escape")
 
+            render_started = time.monotonic()
             try:
-                await wait_for_dashboard(self.page, previous_snapshot=previous_snapshot)
+                render_stable = bool(
+                    await wait_for_dashboard(
+                        self.page, previous_snapshot=previous_snapshot
+                    )
+                )
             except Exception as e:
                 logger.warning(f"Wait for dashboard after clicking '{filter_name}' failed: {e}")
+                render_stable = False
+            render_seconds = round(time.monotonic() - render_started, 3)
 
             _diag_after_done = await measure_scroll_chain(self.page)
             log_scroll_delta(
@@ -431,12 +461,22 @@ class SlicerEngine:
                     f"Not reporting success."
                 )
 
-            return success
+            if success and not render_stable:
+                logger.warning(
+                    "Filter selection verified but post-filter dashboard render "
+                    "was not confirmed stable | filter=%s | value=%s | "
+                    "render_seconds=%s",
+                    filter_name,
+                    option_value,
+                    render_seconds,
+                )
+
+            return success, render_stable, render_seconds
 
         except Exception as e:
             logger.error(f"Error applying filter '{filter_name}' = '{option_value}': {e}")
             await self._close_any_open_popups()
-            return False
+            return False, render_stable, render_seconds
 
     async def extract_kpi_cards(self, max_retries: int = 2) -> dict:
         """Extracts KPI card values, retrying automatically if visuals return empty or N/A."""
@@ -944,7 +984,9 @@ class SlicerEngine:
             return None
 
         selected_option = random.choice([item["text"] for item in candidates])
-        success = await self.apply_filter(filter_name, selected_option)
+        success, _render_stable, _render_seconds = await self.apply_filter(
+            filter_name, selected_option
+        )
         if not success:
             logger.warning(
                 "Filter application was not verified | filter=%s | value=%s",
@@ -1324,7 +1366,9 @@ class SlicerEngine:
                         predetermined_value,
                     )
                     applied_option = predetermined_value
-                    success = await self.apply_filter(f_name, applied_option)
+                    success, _render_stable, _render_seconds = (
+                        await self.apply_filter(f_name, applied_option)
+                    )
                 else:
                     logger.info("Applying runtime-selected option to filter: %s", f_name)
                     applied_option = await self.apply_random_valid_option(f_name)
