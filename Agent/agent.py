@@ -26,7 +26,7 @@ except Exception as _e:
     _IMPORT_ERROR = _e
     # Try relative to parent (when running from repo root)
     try:
-        import orchestration.validator as _m1
+        import Backend.orchestration.validator as _m1
         DashboardValidator = _m1.DashboardValidator  # type: ignore
         _IMPORT_ERROR = None
     except Exception:
