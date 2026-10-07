@@ -1,7 +1,7 @@
 // Central place for backend endpoints. Change BASE_URL here (or better,
 // swap it for an env var like import.meta.env.VITE_API_BASE_URL) rather
 // than hunting through components.
-export const BASE_URL = 'http://localhost:8000';
+export const BASE_URL = import.meta.env.VITE_API_BASE_URL || '';
 
 // "Performance" API - schedules the asynchronous browser capture; replies
 // immediately with { run_id }. Browser/performance metrics for source +
